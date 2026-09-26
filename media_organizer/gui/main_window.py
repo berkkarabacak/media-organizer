@@ -337,15 +337,26 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().setVisible(False)
         layout.addWidget(self.table, 1)
 
-        # Progress area
+        # Progress area: a large dedicated panel, always visible while working
+        self.progress_panel = QFrame()
+        self.progress_panel.setObjectName("card")
+        pp = QVBoxLayout(self.progress_panel)
+        pp.setContentsMargins(16, 14, 16, 14)
+        pp.setSpacing(8)
+        self.progress_title = QLabel("Working…")
+        self.progress_title.setObjectName("cardQuestion")
+        pp.addWidget(self.progress_title)
         self.progress = QProgressBar()
-        self.progress.setVisible(False)
         self.progress.setTextVisible(True)
-        layout.addWidget(self.progress)
+        self.progress.setMinimumHeight(28)
+        pp.addWidget(self.progress)
+        self.progress_status = QLabel("")
+        pp.addWidget(self.progress_status)
         self.progress_detail = QLabel("")
         self.progress_detail.setObjectName("muted")
-        self.progress_detail.setVisible(False)
-        layout.addWidget(self.progress_detail)
+        pp.addWidget(self.progress_detail)
+        self.progress_panel.setVisible(False)
+        layout.addWidget(self.progress_panel)
 
         actions = QHBoxLayout()
         self.organize_btn = QPushButton("✔  Organize now")
@@ -478,20 +489,34 @@ class MainWindow(QMainWindow):
             self._goto_step(0)
             return
         self._set_busy(True, "Looking at your photos…")
-        self.progress.setRange(0, 0)
-        self.progress.setVisible(True)
+        self._show_progress_panel("Scanning files…", indeterminate=True)
+        self.progress_status.setText("Reading your photos and videos…")
+        self.progress_detail.setText("")
         self.plan_summary.setText("Building the plan…")
         self.scan_worker = ScanWorker(options, self)
         self.scan_worker.progress.connect(
-            lambda i, name: self.status_label.setText(f"Reading: {name}"))
+            lambda i, name: self.progress_status.setText(
+                f"Scanning files… {name}"))
         self.scan_worker.finished_plan.connect(self._on_plan_ready)
         self.scan_worker.failed.connect(self._on_worker_failed)
         self.scan_worker.start()
 
+    def _show_progress_panel(self, title: str, indeterminate: bool = False):
+        self.progress_title.setText(title)
+        if indeterminate:
+            self.progress.setRange(0, 0)  # busy-pulse style
+        else:
+            self.progress.setRange(0, 100)
+            self.progress.setValue(0)
+        self.progress_panel.setVisible(True)
+
+    def _hide_progress_panel(self):
+        self.progress_panel.setVisible(False)
+
     def _on_plan_ready(self, plan: list):
         self.plan = plan
         self._set_busy(False)
-        self.progress.setVisible(False)
+        self._hide_progress_panel()
         self._populate_table(plan)
         dupes = sum(1 for p in plan if p.is_duplicate)
         undated = sum(1 for p in plan if not p.capture.found and not p.is_duplicate)
@@ -565,10 +590,9 @@ class MainWindow(QMainWindow):
             return
         self._set_busy(True, "Organizing…")
         self._throughput.reset()
-        self.progress.setVisible(True)
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress_detail.setVisible(True)
+        self._show_progress_panel("Organizing your photos…", indeterminate=False)
+        self.progress_status.setText("Getting ready…")
+        self.progress_detail.setText("")
         self.org_worker = OrganizeWorker(self.plan, options, self)
         self.org_worker.progress.connect(self._on_org_progress)
         self.org_worker.finished_run.connect(self._on_run_finished)
@@ -577,23 +601,28 @@ class MainWindow(QMainWindow):
 
     def _on_org_progress(self, i: int, total: int, name: str,
                          bytes_done: int, total_bytes: int):
-        percent = int(100 * bytes_done / total_bytes) if total_bytes else (
-            int(100 * i / total) if total else 0)
-        self.progress.setValue(min(percent, 100))
+        bytes_done = int(bytes_done)
+        total_bytes = int(total_bytes)
+        if total_bytes > 0:
+            percent = int(100 * bytes_done / total_bytes)
+        else:
+            percent = int(100 * i / total) if total else 0
+        percent = max(0, min(percent, 100))
+        self.progress.setValue(percent)
         self._throughput.add(bytes_done)
         rate = self._throughput.rate()
         eta = self._throughput.eta_seconds(max(0, total_bytes - bytes_done))
-        current = f" · {name}" if name else ""
-        self.status_label.setText(
-            f"Organizing {min(i + 1, total)} of {total}{current}")
+        current = f"  ·  {name}" if name else ""
+        self.progress_status.setText(
+            f"{min(i + 1, total):,} of {total:,} files{current}")
         self.progress_detail.setText(
-            f"{percent}%  ·  {i} of {total} files  ·  "
-            f"{format_rate(rate)}  ·  {format_eta(eta)} left")
+            f"{percent}%  ·  {format_rate(rate)}  ·  {format_eta(eta)} left")
+        self.status_label.setText(
+            f"Organizing {min(i + 1, total):,} of {total:,}{current}")
 
     def _on_run_finished(self, log, summary: dict):
         self._set_busy(False)
-        self.progress.setVisible(False)
-        self.progress_detail.setVisible(False)
+        self._hide_progress_panel()
         self.plan = []
         self.organize_btn.setEnabled(False)
         dest_dir = self.dest_card.edit.text().strip()
@@ -681,6 +710,5 @@ class MainWindow(QMainWindow):
 
     def _on_worker_failed(self, message: str):
         self._set_busy(False)
-        self.progress.setVisible(False)
-        self.progress_detail.setVisible(False)
+        self._hide_progress_panel()
         QMessageBox.critical(self, APP_NAME, f"Something went wrong:\n{message}")

@@ -96,15 +96,16 @@ QTableWidget::item:selected, QTableView::item:selected {
 QProgressBar {
     background: #12151a;
     border: 1px solid #333a45;
-    border-radius: 6px;
+    border-radius: 8px;
     text-align: center;
     color: #d7dce3;
-    height: 18px;
+    font-weight: 600;
+    min-height: 26px;
 }
 QProgressBar::chunk {
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
                                 stop:0 #2f6fed, stop:1 #57a0ff);
-    border-radius: 5px;
+    border-radius: 7px;
 }
 QMenuBar {
     background: #16191f;
