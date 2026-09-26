@@ -30,6 +30,33 @@ def make_jpeg_with_exif(path: Path, dt: datetime | None) -> Path:
     return path
 
 
+def _to_dms(value: float) -> tuple[float, float, float]:
+    """Decimal degrees -> (deg, min, sec) floats for EXIF GPS rationals."""
+    value = abs(value)
+    deg = int(value)
+    minutes = int((value - deg) * 60)
+    seconds = round(((value - deg) * 60 - minutes) * 60, 4)
+    return (float(deg), float(minutes), float(seconds))
+
+
+def make_jpeg_with_gps(path: Path, dt: datetime | None,
+                       lat: float, lon: float) -> Path:
+    """Create a real JPEG with EXIF GPS coordinates (and optional date)."""
+    img = Image.new("RGB", (8, 8), (40, 90, 160))
+    exif = img.getexif()
+    if dt is not None:
+        stamp = dt.strftime("%Y:%m:%d %H:%M:%S")
+        exif.get_ifd(0x8769)
+        exif[0x9003] = stamp
+    gps = exif.get_ifd(0x8825)
+    gps[1] = "S" if lat < 0 else "N"
+    gps[2] = _to_dms(lat)
+    gps[3] = "W" if lon < 0 else "E"
+    gps[4] = _to_dms(lon)
+    img.save(path, "JPEG", exif=exif)
+    return path
+
+
 def make_png_with_text(path: Path, key: str, value: str) -> Path:
     from PIL.PngImagePlugin import PngInfo
 

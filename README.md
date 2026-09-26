@@ -1,14 +1,43 @@
 # Media Organizer
 
-**Version 1.0.0** — a Windows desktop app that sorts photos and videos into
-date-based folders using their **real capture date** (embedded metadata), not
-the unreliable filesystem copy dates.
+**Version 1.1.0** — a Windows desktop app that sorts photos and videos into
+tidy folders using their **real capture date** (embedded metadata), not the
+unreliable filesystem copy dates — or by **where they were taken** (GPS).
 
 ## What it does
 
 Folders of photos/videos copied from phones and cameras over the years often
-have wrong file dates. Media Organizer reads the actual capture date and
-sorts everything into tidy folders like `2024/01 (January)/` or `2024/Q1/`.
+have wrong file dates. Media Organizer reads the actual capture date (or the
+GPS location) and sorts everything into folders like `2024/07 July/`,
+`2024/Q3/`, or `Istanbul, Turkey/`.
+
+The app guides you through three steps:
+
+1. **Choose your folders** — where the messy photos are, and where the
+   organized copies should go (suggested automatically).
+2. **How should we sort them?** — pick a folder structure (see below).
+   Advanced options (copy vs move, subfolders, duplicates, media types) are
+   tucked away under *Advanced options*.
+3. **Check the plan** — review every file's destination in a preview table,
+   then press **Organize now**. A progress bar shows percent, files done,
+   current file, speed, and estimated time left. The completion dialog offers
+   **Undo** and **Open folder**.
+
+## Folder structures
+
+| Strategy | Result |
+|---|---|
+| Year only | `2024/IMG_1234.jpg` |
+| Year → Month *(default)* | `2024/07 July/IMG_1234.jpg` |
+| Year → Quarter | `2024/Q3/IMG_1234.jpg` |
+| Year → Quarter → Month (nested) | `2024/Q3/07 July/IMG_1234.jpg` |
+| Monthly, single level (flat) | `2024-07 July/IMG_1234.jpg` |
+| By location (GPS) | `Istanbul, Turkey/IMG_1234.jpg` |
+| Location → Year | `Istanbul, Turkey/2024/IMG_1234.jpg` |
+
+Files without a date go to `_undated/`; GPS files too far from any known place
+go to `_unknown-location/`. Location matching is fully offline via a bundled
+list of world cities (`core/geodata.py`).
 
 Date detection fallback chain:
 
@@ -23,23 +52,26 @@ Date detection fallback chain:
 
 ## Safety guarantees
 
-- **Copy is the default.** Move mode requires explicit opt-in.
+- **Copy is the default.** Move mode requires explicit opt-in and a confirmation.
 - **Never overwrites.** Name collisions get `_1`, `_2`, … suffixes.
 - **Dry-run preview first.** You review a sortable/filterable table of every
-  file, its detected date, confidence badge, and destination before anything
-  is touched.
-- **Undo.** Every run writes an operation log; *File → Undo last run* restores it.
+  file, its detected date, and its new location before anything is touched.
+- **Exact duplicates (same content).** Duplicate detection compares SHA-256
+  content hashes only — never file names.
+- **Undo.** Every run writes an operation log; *File → Undo last run* or the
+  completion dialog's **Undo** button restores it.
 - Corrupt/unreadable files are logged and skipped — the run never crashes.
 
-## Using the app
+## What's new in 1.1.0
 
-1. Choose the **source folder** (enable *Include subfolders* for recursion).
-2. Choose the **destination folder**.
-3. Pick options: copy vs move, folder pattern (year/month, **year/quarter**,
-   or year/month/quarter), skip exact duplicates, media types.
-4. Press **Scan & Preview** and review the table.
-5. Press **Organize**. A summary reports copied/moved, duplicates skipped,
-   and undated files (placed in an `Undated` folder).
+- Friendly 3-step guided flow with plain language and bigger controls.
+- Seven folder structures, including flat monthly and GPS-location grouping
+  (offline city lookup, ~580 cities bundled).
+- Progress bar with percent, files done/total, throughput, and ETA.
+- Fixed the destination column showing only `C:\...`: it now shows the path
+  relative to the destination folder, with the full path as a tooltip.
+- Duplicate skipping is on by default and labelled "exact duplicates
+  (same content)".
 
 ## Running from source (developers)
 
@@ -55,10 +87,12 @@ Requires Python 3.10+, PySide6, Pillow.
 .venv\Scripts\python.exe -m pytest tests -q
 ```
 
-The suite covers EXIF extraction (real JPEGs written via Pillow's Exif class),
-hand-built synthetic MP4 files (mvhd v0 and v1), every filename pattern,
-fallback ordering, quarter computation, collision handling, duplicate
-detection, and undo-log round-trips. Core logic has no Qt imports.
+The suite covers EXIF extraction (real JPEGs written via Pillow's Exif class,
+including GPS), hand-built synthetic MP4 files (mvhd v0 and v1), every
+filename pattern, fallback ordering, every folder strategy (incl. quarter
+math and flat monthly), the nearest-city mapper, content-hash duplicate
+detection with renamed files, the ETA estimator, display helpers, collision
+handling, and undo-log round-trips. Core logic has no Qt imports.
 
 ### Project layout
 
@@ -66,7 +100,8 @@ detection, and undo-log round-trips. Core logic has no Qt imports.
 main.py                     entry point
 media_organizer/
   core/                     pure logic (no Qt): metadata, organizer,
-                            duplicates, executor, plan (undo log)
+                            strategies, geodata, duplicates, executor,
+                            eta, display, plan (undo log)
   gui/                      PySide6 UI: main window, workers, theme
 tests/                      pytest suite for all core logic
 installer/
@@ -84,4 +119,4 @@ iscc installer\setup.iss
 ```
 
 Produces `dist\MediaOrganizer\MediaOrganizer.exe` and
-`installer\dist\MediaOrganizer-Setup-1.0.0.exe`.
+`installer\dist\MediaOrganizer-Setup-1.1.0.exe`.

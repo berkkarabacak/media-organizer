@@ -1,18 +1,20 @@
 """Plan building: scan, classify, and compute destination paths.
 
-Patterns support the tokens YYYY, MM, MonthName, Q (quarter number).
-Quarter = (month - 1) // 3 + 1.
+Destination folders come from the strategies in strategies.py; GPS-based
+strategies resolve coordinates through geodata.py. Pure logic, no Qt.
 """
 
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
-from datetime import datetime
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
-from .metadata import CaptureDate, extract_capture_date
+from .geodata import location_label
+from .metadata import CaptureDate, extract_capture_date, extract_gps
+from .strategies import (DEFAULT_STRATEGY_KEY, STRATEGIES, UNDATED_FOLDER,
+                         UNKNOWN_LOCATION_FOLDER, get_strategy, quarter_of)
 
 IMAGE_EXTENSIONS = frozenset(
     {"jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "heic", "heif"}
@@ -22,38 +24,12 @@ VIDEO_EXTENSIONS = frozenset(
 )
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
-MONTH_NAMES = (
-    "January", "February", "March", "April", "May", "June",
-    "July", "August", "September", "October", "November", "December",
-)
-
-# Built-in destination patterns (relative subfolder templates)
-PATTERNS = {
-    "year_month": "YYYY/MM (MonthName)",
-    "year_quarter": "YYYY/Q#",
-    "year_month_quarter": "YYYY/MM/Q#",
-}
-DEFAULT_PATTERN = PATTERNS["year_month"]
-
-UNDATED_FOLDER = "Undated"
-
-
-def quarter_of(month: int) -> int:
-    if not 1 <= month <= 12:
-        raise ValueError(f"month out of range: {month}")
-    return (month - 1) // 3 + 1
-
-
-def render_pattern(pattern: str, dt: datetime) -> str:
-    """Expand pattern tokens for a date. Always uses safe path segments."""
-    q = quarter_of(dt.month)
-    out = pattern
-    out = out.replace("YYYY", f"{dt.year:04d}")
-    out = out.replace("MonthName", MONTH_NAMES[dt.month - 1])
-    out = out.replace("MM", f"{dt.month:02d}")
-    out = out.replace("Q#", f"Q{q}")
-    # Normalise separators for the host OS
-    return out.replace("/", os.sep)
+__all__ = [
+    "IMAGE_EXTENSIONS", "VIDEO_EXTENSIONS", "MEDIA_EXTENSIONS",
+    "STRATEGIES", "UNDATED_FOLDER", "UNKNOWN_LOCATION_FOLDER",
+    "DEFAULT_STRATEGY_KEY", "get_strategy", "quarter_of",
+    "PlannedFile", "OrganizeOptions", "scan_media_files", "build_plan",
+]
 
 
 @dataclass
@@ -64,6 +40,7 @@ class PlannedFile:
     capture: CaptureDate
     kind: str  # "image" | "video"
     is_duplicate: bool = False
+    location: Optional[str] = None  # resolved place label, e.g. "Istanbul, Turkey"
     error: str = ""
 
 
@@ -72,9 +49,9 @@ class OrganizeOptions:
     source_dir: Path
     dest_dir: Path
     recursive: bool = True
-    pattern: str = DEFAULT_PATTERN
+    strategy: str = DEFAULT_STRATEGY_KEY
     copy_mode: bool = True  # copy by default; move is explicit opt-in
-    skip_duplicates: bool = False
+    skip_duplicates: bool = True
     include_images: bool = True
     include_videos: bool = True
     extensions: Optional[frozenset] = None  # explicit override
@@ -130,6 +107,17 @@ def _unique_destination(dest_dir: Path, filename: str, taken: set[str]) -> Path:
     return candidate
 
 
+def _location_for(src: Path, cache: dict[tuple[float, float], Optional[str]]
+                  ) -> Optional[str]:
+    """Resolve a file's GPS coordinates to a place label (cached)."""
+    coords = extract_gps(src)
+    if coords is None:
+        return None
+    if coords not in cache:
+        cache[coords] = location_label(*coords)
+    return cache[coords]
+
+
 def build_plan(
     options: OrganizeOptions,
     duplicates: Optional[set[Path]] = None,
@@ -140,6 +128,8 @@ def build_plan(
     duplicates = duplicates or set()
     plan: list[PlannedFile] = []
     taken: set[str] = set()
+    strategy = get_strategy(options.strategy)
+    geo_cache: dict[tuple[float, float], Optional[str]] = {}
 
     for i, src in enumerate(scan_media_files(options)):
         if cancel and cancel():
@@ -158,16 +148,16 @@ def build_plan(
         capture = extract_capture_date(src)
 
         if src in duplicates and options.skip_duplicates:
-            plan.append(PlannedFile(src, None, size, capture, kind, is_duplicate=True))
+            plan.append(PlannedFile(src, None, size, capture, kind,
+                                    is_duplicate=True))
             continue
 
-        if capture.found:
-            sub = render_pattern(options.pattern, capture.date)
-            dest_dir = Path(options.dest_dir) / sub
-        else:
-            dest_dir = Path(options.dest_dir) / UNDATED_FOLDER
+        location = _location_for(src, geo_cache) if strategy.uses_location else None
+        rel = strategy.relative_path(capture, location)
+        dest_dir = Path(options.dest_dir).joinpath(*rel.split("/"))
 
         dest = _unique_destination(dest_dir, src.name, taken)
-        plan.append(PlannedFile(src, dest, size, capture, kind))
+        plan.append(PlannedFile(src, dest, size, capture, kind,
+                                location=location))
 
     return plan

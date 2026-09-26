@@ -53,7 +53,7 @@ class ScanWorker(QThread):
 class OrganizeWorker(QThread):
     """Executes the plan off the UI thread."""
 
-    progress = Signal(int, int, str)
+    progress = Signal(int, int, str, int, int)  # i, total, name, bytes_done, total_bytes
     finished_run = Signal(object, dict)   # (RunLog, summary)
     failed = Signal(str)
 
@@ -71,7 +71,7 @@ class OrganizeWorker(QThread):
             log, summary = execute_plan(
                 self.plan,
                 self.options,
-                progress=lambda i, t, n: self.progress.emit(i, t, n),
+                progress=lambda i, t, n, bd, tb: self.progress.emit(i, t, n, bd, tb),
                 cancel=lambda: self._cancelled,
             )
             self.finished_run.emit(log, summary)

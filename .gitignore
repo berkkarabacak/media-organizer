@@ -9,3 +9,4 @@ __pycache__/
 .pytest_cache/
 website/node_modules/
 website/dist/
+FastDelete/

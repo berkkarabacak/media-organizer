@@ -210,15 +210,15 @@ export const researchConfig: ResearchConfig = {
   sectionLabel: "And Everything Else",
   projects: [
     {
-      title: "Year / Quarter / Month Folders",
-      year: "Auto",
+      title: "7 Folder Strategies",
+      year: "New",
       discipline: "Folder Structure",
       image: "images/research-1.jpg",
     },
     {
-      title: "Copy or Move Modes",
-      year: "2 modes",
-      discipline: "File Safety",
+      title: "Sort by Location (GPS)",
+      year: "New",
+      discipline: "Geotagging",
       image: "images/research-2.jpg",
     },
     {
@@ -234,14 +234,14 @@ export const researchConfig: ResearchConfig = {
       image: "images/research-4.jpg",
     },
     {
-      title: "Live Progress Tracking",
+      title: "Progress Bar + ETA",
       year: "Real-time",
       discipline: "Feedback",
       image: "images/research-1.jpg",
     },
     {
-      title: "Dark, Modern Interface",
-      year: "Native",
+      title: "Guided 3-Step Flow",
+      year: "Simple",
       discipline: "Design",
       image: "images/research-2.jpg",
     },

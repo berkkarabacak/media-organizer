@@ -3,7 +3,7 @@
 DARK_QSS = """
 * {
     font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
-    font-size: 13px;
+    font-size: 14px;
 }
 QMainWindow, QDialog {
     background: #1b1e24;
@@ -28,8 +28,8 @@ QGroupBox::title {
 QPushButton {
     background: #2b313b;
     border: 1px solid #3d4552;
-    border-radius: 6px;
-    padding: 7px 16px;
+    border-radius: 8px;
+    padding: 10px 22px;
     color: #e6ebf2;
 }
 QPushButton:hover { background: #363e4b; border-color: #4d5869; }
@@ -39,6 +39,7 @@ QPushButton#primaryButton {
     background: #2f6fed;
     border-color: #2f6fed;
     font-weight: 700;
+    font-size: 15px;
 }
 QPushButton#primaryButton:hover { background: #4480f5; }
 QPushButton#primaryButton:pressed { background: #2659c4; }
@@ -118,11 +119,40 @@ QMenu::item { padding: 6px 24px; }
 QMenu::item:selected { background: #2f6fed; }
 QStatusBar { background: #16191f; border-top: 1px solid #2a3039; }
 QLabel#heading {
-    font-size: 18px;
+    font-size: 22px;
     font-weight: 700;
     color: #f0f4f9;
 }
+QLabel#stepLabel {
+    font-size: 16px;
+    font-weight: 600;
+    color: #8ab4ff;
+}
 QLabel#muted { color: #7c8794; }
+QFrame#card {
+    background: #21262e;
+    border: 1px solid #333a45;
+    border-radius: 10px;
+}
+QFrame#card QLabel { background: transparent; }
+QLabel#cardQuestion {
+    font-size: 15px;
+    font-weight: 600;
+    color: #eef2f7;
+}
+QLabel#exampleLabel {
+    color: #7fd1a8;
+    font-family: "Cascadia Mono", "Consolas", monospace;
+    font-size: 13px;
+}
+QToolButton {
+    background: transparent;
+    border: none;
+    color: #8ab4ff;
+    font-weight: 600;
+    padding: 6px 4px;
+}
+QToolButton:hover { color: #a9c6ff; }
 QScrollBar:vertical {
     background: #12151a; width: 12px; margin: 0;
 }

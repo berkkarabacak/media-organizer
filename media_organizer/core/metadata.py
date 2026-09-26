@@ -361,6 +361,65 @@ def _filename_date(name: str) -> Optional[datetime]:
 
 
 # ---------------------------------------------------------------------------
+# EXIF GPS
+# ---------------------------------------------------------------------------
+
+_GPS_IFD = 0x8825  # GPSInfo IFD pointer
+_TAG_GPS_LAT_REF = 1
+_TAG_GPS_LAT = 2
+_TAG_GPS_LON_REF = 3
+_TAG_GPS_LON = 4
+
+
+def _dms_to_decimal(dms, ref) -> Optional[float]:
+    """Convert EXIF (degrees, minutes, seconds) + hemisphere ref to decimal."""
+    try:
+        deg, minutes, seconds = (float(v) for v in dms[:3])
+    except (TypeError, ValueError, IndexError):
+        return None
+    dec = deg + minutes / 60.0 + seconds / 3600.0
+    if isinstance(ref, bytes):
+        ref = ref.decode("ascii", errors="ignore")
+    if str(ref).strip().upper() in ("S", "W"):
+        dec = -dec
+    if not -180.0 <= dec <= 180.0:
+        return None
+    return dec
+
+
+def extract_gps(path: os.PathLike | str) -> Optional[tuple[float, float]]:
+    """Read EXIF GPS coordinates. Returns (lat, lon) or None. Never raises."""
+    path = Path(path)
+    if path.suffix.lower().lstrip(".") not in (
+            "jpg", "jpeg", "tif", "tiff", "heic", "heif", "webp"):
+        return None
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            try:
+                exif = img.getexif()
+            except Exception:
+                return None
+            if not exif:
+                return None
+            gps = exif.get_ifd(_GPS_IFD)
+            if not gps:
+                return None
+            lat = _dms_to_decimal(gps.get(_TAG_GPS_LAT), gps.get(_TAG_GPS_LAT_REF))
+            lon = _dms_to_decimal(gps.get(_TAG_GPS_LON), gps.get(_TAG_GPS_LON_REF))
+            if lat is None or lon is None:
+                return None
+            if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                return None
+            if lat == 0.0 and lon == 0.0:
+                return None  # null-island placeholder, treat as unknown
+            return (lat, lon)
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 

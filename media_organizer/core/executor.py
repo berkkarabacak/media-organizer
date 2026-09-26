@@ -26,21 +26,28 @@ def _final_destination(dest: Path) -> Path:
 def execute_plan(
     plan: list[PlannedFile],
     options: OrganizeOptions,
-    progress: Optional[Callable[[int, int, str], None]] = None,
+    progress: Optional[Callable[[int, int, str, int, int], None]] = None,
     cancel: Optional[Callable[[], bool]] = None,
 ) -> tuple[RunLog, dict]:
-    """Execute the plan. Returns (run log, summary counters)."""
+    """Execute the plan. Returns (run log, summary counters).
+
+    progress(i, total, current_name, bytes_done, total_bytes) is called before
+    each item and once more at the end with i == total.
+    """
     log = new_log(options.dest_dir)
     summary = {"copied": 0, "moved": 0, "skipped_duplicates": 0,
                "undated": 0, "errors": 0, "cancelled": False}
     total = len(plan)
+    total_bytes = sum(item.size for item in plan if not item.is_duplicate
+                      and item.destination is not None and not item.error)
+    bytes_done = 0
 
     for i, item in enumerate(plan):
         if cancel and cancel():
             summary["cancelled"] = True
             break
         if progress:
-            progress(i, total, item.source.name)
+            progress(i, total, item.source.name, bytes_done, total_bytes)
 
         if item.is_duplicate:
             summary["skipped_duplicates"] += 1
@@ -65,6 +72,7 @@ def execute_plan(
                 shutil.move(str(item.source), str(final))
                 summary["moved"] += 1
             op.status = "done"
+            bytes_done += item.size
         except OSError as exc:
             op.status = "error"
             op.error = str(exc)
@@ -73,5 +81,5 @@ def execute_plan(
 
     save_log(log, options.dest_dir)
     if progress:
-        progress(total, total, "")
+        progress(total, total, "", total_bytes, total_bytes)
     return log, summary
