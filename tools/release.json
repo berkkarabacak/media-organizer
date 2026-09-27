@@ -1,7 +1,7 @@
 {
-  "tag_name": "v1.4.0",
-  "name": "Media Organizer 1.4.0",
-  "body": "**Commercial-completeness release:**\n- Total library size shown: \"12,427 files · 48.2 GB total · 47.9 GB to copy\"\n- Sortable columns — click any header (size sorts numerically, dates chronologically)\n- Resizable columns + remembered layout (widths, sort, window size all persist)\n- Right-click any file: exclude from plan / include / open file location (double-click also opens)\n- Keyboard shortcuts (Ctrl+O, Enter, Esc), busy cursor, empty-state hints\n\n151 automated tests, all passing.\n\nDownload **MediaOrganizer-Setup-1.4.0.exe** below.",
+  "tag_name": "v1.4.1",
+  "name": "Media Organizer 1.4.1",
+  "body": "**QA-hardened release.** A full automated QA cycle was run: 101 scenario checks covering input validation, hostile filenames (Turkish/Unicode/emoji/reserved names), corrupt files, locked files, flow abuse (cancel mid-run, double organize, undo twice), all 7 folder strategies, duplicates, a 2,000-file stress test, and settings persistence — 101/101 passing.\n\nOne real defect found and fixed: corrupted app settings could previously prevent the app from starting; it now starts safely.\n\nData-safety verified: no overwrite ever (collision suffixes), self-copy blocked, cancelled runs leave only complete files, undo restores exactly the partial set.\n\n153 automated tests, all passing.\n\nDownload **MediaOrganizer-Setup-1.4.1.exe** below.",
   "draft": false,
   "prerelease": false
 }

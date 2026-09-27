@@ -291,8 +291,13 @@ class MainWindow(QMainWindow):
 
     def _restore_geometry(self):
         geo = self.settings.value("geometry")
-        if geo:
+        from PySide6.QtCore import QByteArray
+        if not isinstance(geo, (bytes, bytearray, QByteArray)):
+            return  # missing or corrupted value — keep default geometry
+        try:
             self.restoreGeometry(geo)
+        except (TypeError, RuntimeError):
+            pass
 
     def _center_on_screen_if_no_geometry(self):
         if self.settings.value("geometry"):

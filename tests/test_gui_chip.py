@@ -62,6 +62,45 @@ def window(qapp, tmp_path):
     w.deleteLater()
 
 
+class TestCorruptSettings:
+    def test_garbage_geometry_does_not_lock_out(self, qapp):
+        """Regression: a corrupted QSettings geometry value crashed startup."""
+        from media_organizer.gui.main_window import MainWindow
+        s = QSettings("MediaOrganizer", "MediaOrganizer")
+        s.clear()
+        s.setValue("geometry", "!!!")
+        s.setValue("col_widths", "garbage")
+        s.setValue("sort_col", "not_a_number")
+        w = MainWindow()   # must not raise
+        w.show()
+        qapp.processEvents()
+        assert w.table is not None
+        w.close()
+        w.deleteLater()
+
+    def test_geometry_roundtrip(self, qapp):
+        from media_organizer.gui.main_window import MainWindow
+        s = QSettings("MediaOrganizer", "MediaOrganizer")
+        s.clear()
+        w1 = MainWindow()
+        w1.show()
+        w1.resize(1300, 850)
+        qapp.processEvents()
+        w1.close()
+        w1.deleteLater()
+        qapp.processEvents()
+        # the close must have persisted a restorable geometry blob...
+        geo = s.value("geometry")
+        assert geo is not None and len(geo) > 0
+        # ...and restoring it must succeed (the offscreen QPA clamps the
+        # actual size to its small virtual screen, so we assert the restore
+        # call itself, not exact pixels)
+        w2 = MainWindow()
+        assert w2.restoreGeometry(geo) is True
+        w2.close()
+        w2.deleteLater()
+
+
 class TestSuggestionChip:
     def _show_chip(self, w, suggested="C:/Photos_Organized"):
         """Simulate the state right after the user picked a source folder."""
