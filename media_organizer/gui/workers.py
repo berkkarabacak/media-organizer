@@ -9,8 +9,10 @@ from PySide6.QtCore import QThread, Signal
 
 from ..core.duplicates import find_duplicates
 from ..core.executor import execute_plan
+from ..core.metadata import analyze_media_batch
 from ..core.organizer import (OrganizeOptions, PlannedFile, build_plan,
-                              count_media_files, scan_media_files)
+                              scan_media_files)
+from ..core.strategies import get_strategy
 
 #: Minimum interval between progress signal emissions (keeps the UI smooth).
 PROGRESS_INTERVAL_S = 0.15
@@ -50,31 +52,43 @@ class ScanWorker(QThread):
                 last_emit[0] = now
                 self.progress.emit(done, total, name)
 
-            # Phase 0: fast pre-count so the bar can be determinate
+            # Phase 0: list files (the walk doubles as the pre-count)
             self.progress.emit(0, 0, "Counting files…")
-            total = count_media_files(self.options)
+            files = list(scan_media_files(self.options))
             if is_cancelled():
                 self.finished_plan.emit([])
                 return
+            n = len(files)
+            phases = (1 if self.options.skip_duplicates else 0) + 2
+            grand_total = max(n * phases, 1)
+            offset = 0
 
+            # Phase 1: duplicate hashing (parallel inside find_duplicates)
             duplicates = set()
             if self.options.skip_duplicates:
-                files = list(scan_media_files(self.options))
-                grand_total = 2 * max(len(files), total)
                 duplicates = find_duplicates(
                     files,
-                    progress=lambda i, n: emit(i, grand_total, n),
+                    progress=lambda i, _n: emit(i, grand_total, _n),
                     cancel=is_cancelled,
                 )
-                offset = len(files)
-            else:
-                grand_total = total
-                offset = 0
+                offset += n
 
+            # Phase 2: metadata extraction (parallel thread pool)
+            need_gps = get_strategy(self.options.strategy).uses_location
+            analysis = analyze_media_batch(
+                files, need_gps=need_gps,
+                progress=lambda i, _n: emit(offset + i, grand_total, _n),
+                cancel=is_cancelled,
+            )
+            offset += n
+
+            # Phase 3: plan assembly (pure, fast)
             plan = build_plan(
                 self.options,
                 duplicates=duplicates,
-                progress=lambda i, n: emit(offset + i, grand_total, n),
+                files=files,
+                analysis=analysis,
+                progress=lambda i, _n: emit(offset + i, grand_total, _n),
                 cancel=is_cancelled,
             )
             emit(grand_total, grand_total, "", force=True)

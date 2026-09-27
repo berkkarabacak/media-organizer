@@ -50,7 +50,7 @@ def run():
     w.start_scan()
     wait_worker(w.scan_worker)
     w.filter_edit.setText("beach")
-    pump(0.02)
+    pump(0.25)   # filter is debounced by 150 ms
     visible = [r for r in range(w.table.rowCount())
                if not w.table.isRowHidden(r)]
     check("filter: only matching rows visible", len(visible) == 3,
@@ -62,7 +62,7 @@ def run():
     check("exclude while filtered: hidden rows unaffected, exclusion kept",
           len(still_visible) == 3 and str(victim.source) in w.excluded)
     w.filter_edit.setText("")
-    pump(0.02)
+    pump(0.25)   # debounce
     check("clear filter: all rows back",
           all(not w.table.isRowHidden(r) for r in range(w.table.rowCount())))
     w.start_organize()

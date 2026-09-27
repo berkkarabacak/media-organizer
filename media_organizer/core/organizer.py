@@ -53,6 +53,7 @@ class OrganizeOptions:
     strategy: str = DEFAULT_STRATEGY_KEY
     copy_mode: bool = True  # copy by default; move is explicit opt-in
     skip_duplicates: bool = True
+    dry_run: bool = False   # simulate the full run, write nothing
     include_images: bool = True
     include_videos: bool = True
     extensions: Optional[frozenset] = None  # explicit override
@@ -89,26 +90,34 @@ def count_media_files(options: OrganizeOptions) -> int:
 
 
 def scan_media_files(options: OrganizeOptions) -> Iterator[Path]:
-    """Yield candidate media files under source_dir."""
-    root = Path(options.source_dir)
+    """Yield candidate media files under source_dir.
+
+    The destination tree is pruned at the directory level (no per-file
+    resolve() — that was the scan bottleneck on large trees).
+    """
+    root = Path(options.source_dir).resolve()  # resolved once so the
+    # dirpath strings from os.walk compare cleanly against dest_str
     exts = options.effective_extensions()
     dest_root = Path(options.dest_dir).resolve()
+    dest_str = os.path.normcase(os.path.normpath(str(dest_root)))
 
     if options.recursive:
         walker = os.walk(root)
     else:
         walker = [(str(root), [], os.listdir(root) if root.is_dir() else [])]
 
-    for dirpath, _dirnames, filenames in walker:
+    for dirpath, dirnames, filenames in walker:
+        dp = os.path.normcase(os.path.normpath(dirpath))
+        if dp == dest_str or dp.startswith(dest_str + os.sep):
+            # Never organise files that already live inside the destination
+            dirnames[:] = []
+            continue
         for name in sorted(filenames):
             p = Path(dirpath) / name
             if p.suffix.lower().lstrip(".") not in exts:
                 continue
             try:
                 if not p.is_file():
-                    continue
-                # Never organise files that already live inside the destination tree
-                if dest_root in p.resolve().parents or p.resolve() == dest_root:
                     continue
             except OSError:
                 continue
@@ -131,12 +140,7 @@ def _unique_destination(dest_dir: Path, filename: str, taken: set[str]) -> Path:
 def _location_for(src: Path, cache: dict[tuple[float, float], Optional[str]]
                   ) -> Optional[str]:
     """Resolve a file's GPS coordinates to a place label (cached)."""
-    coords = extract_gps(src)
-    if coords is None:
-        return None
-    if coords not in cache:
-        cache[coords] = location_label(*coords)
-    return cache[coords]
+    return _location_label_for(extract_gps(src), cache)
 
 
 def build_plan(
@@ -144,15 +148,23 @@ def build_plan(
     duplicates: Optional[set[Path]] = None,
     progress: Optional[Callable[[int, str], None]] = None,
     cancel: Optional[Callable[[], bool]] = None,
+    files: Optional[list[Path]] = None,
+    analysis: Optional[dict] = None,
 ) -> list[PlannedFile]:
-    """Build the full organise plan (dry run). Pure: touches nothing."""
+    """Build the full organise plan (dry run). Pure: touches nothing.
+
+    `files` and `analysis` ({path: (CaptureDate, gps)}) let the caller reuse
+    an already-listed/parallel-analyzed batch (the GUI scan does this).
+    """
     duplicates = duplicates or set()
     plan: list[PlannedFile] = []
     taken: set[str] = set()
     strategy = get_strategy(options.strategy)
     geo_cache: dict[tuple[float, float], Optional[str]] = {}
+    analysis = analysis or {}
 
-    for i, src in enumerate(scan_media_files(options)):
+    for i, src in enumerate(files if files is not None
+                            else scan_media_files(options)):
         if cancel and cancel():
             break
         if progress:
@@ -166,14 +178,21 @@ def build_plan(
 
         ext = src.suffix.lower().lstrip(".")
         kind = "image" if ext in IMAGE_EXTENSIONS else "video"
-        capture = extract_capture_date(src)
+        if src in analysis:
+            capture, coords = analysis[src]
+        else:
+            capture = extract_capture_date(src)
+            coords = extract_gps(src) if strategy.uses_location else None
 
         if src in duplicates and options.skip_duplicates:
             plan.append(PlannedFile(src, None, size, capture, kind,
                                     is_duplicate=True))
             continue
 
-        location = _location_for(src, geo_cache) if strategy.uses_location else None
+        if strategy.uses_location:
+            location = _location_label_for(coords, geo_cache)
+        else:
+            location = None
         rel = strategy.relative_path(capture, location)
         dest_dir = Path(options.dest_dir).joinpath(*rel.split("/"))
 
@@ -182,3 +201,12 @@ def build_plan(
                                 location=location))
 
     return plan
+
+
+def _location_label_for(coords: Optional[tuple[float, float]],
+                        cache: dict) -> Optional[str]:
+    if coords is None:
+        return None
+    if coords not in cache:
+        cache[coords] = location_label(*coords)
+    return cache[coords]

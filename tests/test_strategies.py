@@ -87,11 +87,16 @@ class TestStrategyRegistry:
 
     def test_examples_are_concrete(self):
         examples = {s.key: s.example for s in STRATEGIES}
-        assert examples["year_month"] == "2024 → 07 July"
-        assert examples["year_quarter_month"] == "2024 → Q3 → 07 July"
+        assert examples["year_month"] == "2024 › 07 July"
+        assert examples["year_quarter_month"] == "2024 › Q3 › 07 July"
         assert examples["monthly_flat"] == "2024-07 July"
         assert examples["location"] == "Istanbul, Turkey"
-        assert examples["location_year"] == "Istanbul, Turkey → 2024"
+        assert examples["location_year"] == "Istanbul, Turkey › 2024"
+
+    def test_examples_have_no_arrow_glyph(self):
+        # '→' triggered font-fallback scrambling in the example pills
+        for s in STRATEGIES:
+            assert "→" not in s.example
 
     def test_all_keys_unique(self):
         keys = [s.key for s in STRATEGIES]

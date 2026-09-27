@@ -18,9 +18,11 @@ import qa_05_strategies  # noqa: E402
 import qa_07_stress  # noqa: E402
 import qa_09_abuse  # noqa: E402
 import qa_10_edge  # noqa: E402
+import qa_11_features  # noqa: E402
 
 MODULES = (qa_01_validation, qa_02_filenames, qa_03_content, qa_04_flows,
-           qa_05_strategies, qa_07_stress, qa_09_abuse, qa_10_edge)
+           qa_05_strategies, qa_07_stress, qa_09_abuse, qa_10_edge,
+           qa_11_features)
 
 
 def main():

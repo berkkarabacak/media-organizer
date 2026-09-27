@@ -33,11 +33,20 @@ def run():
     files = _make_photos(src, 12)
 
     # 1. Back mid-scan must be blocked (busy guard)
+    # 1. Back mid-scan must be blocked (busy guard) — use a big source so the
+    # scan is provably still running when we click (parallel hashing is fast)
+    slow_src = tmp / "slow_src"
+    slow_src.mkdir()
+    _make_photos(slow_src, 200, size_mb=2)
     w = make_window()
-    w.source_card.edit.setText(str(src))
+    w.source_card.edit.setText(str(slow_src))
     w.dest_card.edit.setText(str(dst))
     w._goto_step(2)
     w.start_scan()
+    # wait until the worker is actually running, then try to go Back
+    end = time.monotonic() + 10
+    while not w.scan_worker.isRunning() and time.monotonic() < end:
+        pump(0.005)
     QTest.mouseClick(w.back_btn, Qt.LeftButton)
     pump(0.02)
     check("Back mid-scan is blocked", w._busy() and w.stack.currentIndex() == 2)
@@ -45,6 +54,8 @@ def run():
     wait_worker(w.scan_worker)
 
     # 2. Cancel scan mid-way -> partial plan OK, no crash
+    w.source_card.edit.setText(str(src))   # back to the 12-file source
+    w.dest_card.edit.setText(str(dst))
     w.start_scan()
     pump(0.05)
     w.cancel_work()

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings, QRectF
+from PySide6.QtCore import Qt, QSettings, QRectF, QTimer
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QShortcut,
@@ -24,8 +24,11 @@ from PySide6.QtWidgets import (
 
 from .. import APP_NAME, __version__
 from ..core.display import (elide_middle, format_bytes, relative_destination,
-                            sorted_plan_items)
+                            relative_destination_fast, sorted_plan_items)
 from ..core.eta import ThroughputEstimator, format_eta, format_rate
+from ..core.executor import free_space_status
+from ..core.journal import (completed_sources, discard_journal,
+                            find_unfinished_journal)
 from ..core.metadata import Confidence, DateSource
 from ..core.organizer import STRATEGIES, OrganizeOptions
 from ..core.plan import load_log, undo_log
@@ -241,6 +244,9 @@ class _StrategyCard(QFrame):
         name.setObjectName("strategyName")
         example = QLabel(f"e.g.  {strategy.example}")
         example.setObjectName("examplePill")
+        # force LTR: mixed-direction glyphs + font fallback produced garbled
+        # pills on some scaled displays
+        example.setLayoutDirection(Qt.LeftToRight)
         text_col.addWidget(name)
         text_col.addWidget(example, 0, Qt.AlignLeft)
         row.addLayout(text_col, 1)
@@ -279,6 +285,7 @@ class MainWindow(QMainWindow):
         self.scan_worker: ScanWorker | None = None
         self.org_worker: OrganizeWorker | None = None
         self._last_run: tuple | None = None  # (RunLog, dest_dir, summary)
+        self._last_active_bytes: int = 0
         self._throughput = ThroughputEstimator()
 
         self._build_menu()
@@ -510,6 +517,8 @@ class MainWindow(QMainWindow):
         self.copy_radio.setChecked(True)
         self.dupes_cb = QCheckBox("Skip exact duplicates (same content)")
         self.dupes_cb.setChecked(True)
+        self.dry_run_cb = QCheckBox("Dry run — simulate everything, write nothing")
+        self.dry_run_cb.setChecked(False)
         self.images_cb = QCheckBox("Photos")
         self.images_cb.setChecked(True)
         self.videos_cb = QCheckBox("Videos")
@@ -518,6 +527,7 @@ class MainWindow(QMainWindow):
         adv.addWidget(self.copy_radio)
         adv.addWidget(self.move_radio)
         adv.addWidget(self.dupes_cb)
+        adv.addWidget(self.dry_run_cb)
         types_row = QHBoxLayout()
         types_row.addWidget(QLabel("Include:"))
         types_row.addWidget(self.images_cb)
@@ -565,7 +575,15 @@ class MainWindow(QMainWindow):
         self.filter_edit.addAction(
             icons.icon("search", theme.TEXT_FAINT, 14),
             QLineEdit.LeadingPosition)
-        self.filter_edit.textChanged.connect(self._apply_filter)
+        # debounce keystrokes: filtering is instant per keystroke even on
+        # 10k-row plans, but typing shouldn't trigger it per character
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(150)
+        self._filter_timer.timeout.connect(
+            lambda: self._apply_filter(self.filter_edit.text()))
+        self.filter_edit.textChanged.connect(
+            lambda _t: self._filter_timer.start())
         top.addWidget(self.filter_edit)
         layout.addLayout(top)
 
@@ -635,6 +653,10 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.progress_panel)
 
         actions = QHBoxLayout()
+        self.dry_run_step3 = QCheckBox("Dry run (simulate)")
+        self.dry_run_step3.setToolTip("Run the full pipeline but write nothing")
+        actions.addWidget(self.dry_run_step3)
+        actions.addSpacing(14)
         self.organize_btn = QPushButton("Organize now")
         self.organize_btn.setObjectName("primaryButton")
         self.organize_btn.setIcon(icons.icon("play", "#1A1206", 15))
@@ -649,6 +671,10 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.cancel_btn)
         actions.addStretch(1)
         layout.addLayout(actions)
+
+        # keep the two dry-run switches in sync (same value -> no re-entry)
+        self.dry_run_cb.toggled.connect(self.dry_run_step3.setChecked)
+        self.dry_run_step3.toggled.connect(self.dry_run_cb.setChecked)
         return page
 
     # --------------------------------------------------------- navigation
@@ -691,6 +717,7 @@ class MainWindow(QMainWindow):
         self.move_radio.setChecked(self.settings.value("move_mode", False, type=bool))
         self.copy_radio.setChecked(not self.move_radio.isChecked())
         self.dupes_cb.setChecked(self.settings.value("skip_duplicates", True, type=bool))
+        self.dry_run_cb.setChecked(self.settings.value("dry_run", False, type=bool))
         self.images_cb.setChecked(self.settings.value("images", True, type=bool))
         self.videos_cb.setChecked(self.settings.value("videos", True, type=bool))
         self._select_strategy(self.settings.value(
@@ -703,6 +730,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("recursive", self.recursive_cb.isChecked())
         self.settings.setValue("move_mode", self.move_radio.isChecked())
         self.settings.setValue("skip_duplicates", self.dupes_cb.isChecked())
+        self.settings.setValue("dry_run", self.dry_run_cb.isChecked())
         self.settings.setValue("images", self.images_cb.isChecked())
         self.settings.setValue("videos", self.videos_cb.isChecked())
         self.settings.setValue("strategy", self._selected_strategy())
@@ -749,7 +777,7 @@ class MainWindow(QMainWindow):
             return None
         src = Path(self.source_card.edit.text().strip())
         dst = Path(self.dest_card.edit.text().strip())
-        if self.move_radio.isChecked():
+        if self.move_radio.isChecked() and not self.dry_run_cb.isChecked():
             answer = QMessageBox.question(
                 self, APP_NAME,
                 "Move mode removes files from the original folder.\n"
@@ -766,6 +794,7 @@ class MainWindow(QMainWindow):
             skip_duplicates=self.dupes_cb.isChecked(),
             include_images=self.images_cb.isChecked(),
             include_videos=self.videos_cb.isChecked(),
+            dry_run=self.dry_run_cb.isChecked(),
         )
 
     # ---------------------------------------------------------- scan/plan
@@ -951,7 +980,12 @@ class MainWindow(QMainWindow):
             self._set_excluded(item, not is_excluded)
 
     def _refresh_table(self):
-        """(Re)fill the preview table in the current sort/view order."""
+        """(Re)fill the preview table in the current sort/view order.
+
+        GUI-thread cost is bounded: painting is suspended during the fill and
+        each row's filter text is precomputed once (see _apply_filter), so a
+        10k-row plan does not freeze the UI.
+        """
         plan = self.plan
         if 0 <= self._sort_col < 5 and plan:
             view = sorted_plan_items(plan, _COL_KEYS[self._sort_col],
@@ -959,58 +993,76 @@ class MainWindow(QMainWindow):
         else:
             view = list(plan)
         self._view = view
+        import os
         dest_root = self.dest_card.edit.text().strip()
+        root_norm = (os.path.normcase(os.path.normpath(dest_root))
+                     if dest_root else None)
         dim = QColor(theme.TEXT_FAINT)
-        self.table.setRowCount(0)
-        self.table.setRowCount(len(view))
-        for row, item in enumerate(view):
-            is_excluded = str(item.source) in self.excluded
-            kind_icon = "film" if item.kind == "video" else "image"
-            name_item = QTableWidgetItem(item.source.name)
-            name_item.setIcon(icons.icon(
-                kind_icon, theme.TEXT_FAINT if is_excluded else theme.TEXT_DIM, 14))
-            name_item.setToolTip(str(item.source) +
-                                 ("\n(excluded from plan)" if is_excluded else ""))
-            self.table.setItem(row, COL_NAME, name_item)
-
-            if item.is_duplicate:
-                date_text, src_text = "duplicate", "exact duplicate (same content)"
-                conf = Confidence.LOW
-                src_icon = "copy"
-            elif item.capture.found:
-                date_text = item.capture.date.strftime("%Y-%m-%d %H:%M:%S")
-                src_text = _SOURCE_LABELS[item.capture.source]
-                conf = item.capture.confidence
-                src_icon = icons.SOURCE_ICONS.get(
-                    item.capture.source.value, "file-text")
-            else:
-                date_text, src_text, conf = "—", "no date found", Confidence.LOW
-                src_icon = "alert-triangle"
-            self.table.setItem(row, COL_DATE, QTableWidgetItem(date_text))
-
-            src_item = QTableWidgetItem(src_text)
-            src_item.setIcon(icons.icon(src_icon, _CONFIDENCE_COLORS[conf], 13))
-            src_item.setForeground(QColor(_CONFIDENCE_COLORS[conf]))
-            src_item.setToolTip(item.capture.detail)
-            self.table.setItem(row, COL_SOURCE, src_item)
-
-            # Show the path relative to the destination root; full path in tooltip
-            rel = relative_destination(item.destination, dest_root or None)
-            dest_item = QTableWidgetItem(elide_middle(rel, 120))
-            if item.destination:
-                dest_item.setToolTip(str(item.destination))
-            self.table.setItem(row, COL_DEST, dest_item)
-
-            size_item = QTableWidgetItem(_fmt_size(item.size))
-            size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.table.setItem(row, COL_SIZE, size_item)
-
-            if is_excluded:
-                for col in range(5):
-                    cell = self.table.item(row, col)
-                    if cell:
-                        cell.setForeground(dim)
+        self.table.setUpdatesEnabled(True)  # in case a previous fill crashed
+        self.table.setUpdatesEnabled(False)
+        try:
+            self.table.setRowCount(0)
+            self.table.setRowCount(len(view))
+            for row, item in enumerate(view):
+                self._fill_row(row, item, root_norm, dim)
+        finally:
+            self.table.setUpdatesEnabled(True)
         self._apply_filter(self.filter_edit.text())
+
+    def _fill_row(self, row, item, root_norm, dim):
+        is_excluded = str(item.source) in self.excluded
+        kind_icon = "film" if item.kind == "video" else "image"
+        name_item = QTableWidgetItem(item.source.name)
+        name_item.setIcon(icons.icon(
+            kind_icon, theme.TEXT_FAINT if is_excluded else theme.TEXT_DIM, 14))
+        name_item.setToolTip(str(item.source) +
+                             ("\n(excluded from plan)" if is_excluded else ""))
+        self.table.setItem(row, COL_NAME, name_item)
+
+        if item.is_duplicate:
+            date_text, src_text = "duplicate", "exact duplicate (same content)"
+            conf = Confidence.LOW
+            src_icon = "copy"
+        elif item.capture.found:
+            date_text = item.capture.date.strftime("%Y-%m-%d %H:%M:%S")
+            src_text = _SOURCE_LABELS[item.capture.source]
+            conf = item.capture.confidence
+            src_icon = icons.SOURCE_ICONS.get(
+                item.capture.source.value, "file-text")
+        else:
+            date_text, src_text, conf = "—", "no date found", Confidence.LOW
+            src_icon = "alert-triangle"
+        self.table.setItem(row, COL_DATE, QTableWidgetItem(date_text))
+
+        src_item = QTableWidgetItem(src_text)
+        src_item.setIcon(icons.icon(src_icon, _CONFIDENCE_COLORS[conf], 13))
+        src_item.setForeground(QColor(_CONFIDENCE_COLORS[conf]))
+        src_item.setToolTip(item.capture.detail)
+        self.table.setItem(row, COL_SOURCE, src_item)
+
+        # Show the path relative to the destination root; full path in tooltip
+        # (string-only relative computation — resolve() per row froze the UI)
+        rel = relative_destination_fast(item.destination, root_norm)
+        dest_item = QTableWidgetItem(elide_middle(rel, 120))
+        if item.destination:
+            dest_item.setToolTip(str(item.destination))
+        self.table.setItem(row, COL_DEST, dest_item)
+
+        size_item = QTableWidgetItem(_fmt_size(item.size))
+        size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.table.setItem(row, COL_SIZE, size_item)
+
+        # precomputed lowercase haystack for fast filtering (once per row)
+        haystack = " ".join(
+            (item.source.name, date_text, src_text, rel,
+             _fmt_size(item.size))).lower()
+        name_item.setData(Qt.UserRole, haystack)
+
+        if is_excluded:
+            for col in range(5):
+                cell = self.table.item(row, col)
+                if cell:
+                    cell.setForeground(dim)
 
     # backwards-compatible alias (used by older tools/tests)
     def _populate_table(self, plan: list):
@@ -1018,16 +1070,16 @@ class MainWindow(QMainWindow):
         self._refresh_table()
 
     def _apply_filter(self, text: str):
+        """Show/hide rows by substring match against the precomputed haystack
+        (one O(1) lookup per row — no per-cell string rebuilding)."""
         needle = text.strip().lower()
         for row in range(self.table.rowCount()):
             if not needle:
                 self.table.setRowHidden(row, False)
                 continue
-            hay = " ".join(
-                (self.table.item(row, c).text() if self.table.item(row, c) else "")
-                for c in range(self.table.columnCount())
-            ).lower()
-            self.table.setRowHidden(row, needle not in hay)
+            cell = self.table.item(row, COL_NAME)
+            hay = cell.data(Qt.UserRole) if cell else ""
+            self.table.setRowHidden(row, needle not in (hay or ""))
 
     # ---------------------------------------------------------- organize
 
@@ -1038,10 +1090,61 @@ class MainWindow(QMainWindow):
         options = self._options()
         if options is None:
             return
+
+        # --- free-space preflight (skipped for dry runs) ---
+        if not options.dry_run:
+            needed = sum(p.size for p in active
+                         if not p.is_duplicate and p.destination)
+            space = free_space_status(options.dest_dir, needed)
+            if not space["ok"]:
+                QMessageBox.critical(
+                    self, APP_NAME,
+                    f"Not enough free space.\n\n"
+                    f"Need {format_bytes(space['needed'])}, but only "
+                    f"{format_bytes(space['free'])} free on {space['drive']}\n\n"
+                    f"Free up space or choose another destination.")
+                return
+            if space["tight"]:
+                answer = QMessageBox.question(
+                    self, APP_NAME,
+                    f"This will nearly fill {space['drive']} "
+                    f"({format_bytes(space['needed'])} needed, "
+                    f"{format_bytes(space['free'])} free).\nContinue anyway?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if answer != QMessageBox.Yes:
+                    return
+
+        # --- crash-journal resume ---
+            journal = find_unfinished_journal(options.dest_dir)
+            if journal is not None:
+                done_before = completed_sources(journal)
+                answer = QMessageBox.question(
+                    self, APP_NAME,
+                    f"A previous run was interrupted (power loss?) — "
+                    f"{len(done_before):,} files were already organized.\n\n"
+                    f"Yes = Resume (skip them) · No = Discard and start over",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                if answer == QMessageBox.Yes:
+                    active = [p for p in active
+                              if str(p.source) not in done_before]
+                    if not active:
+                        QMessageBox.information(
+                            self, APP_NAME,
+                            "Everything was already organized — nothing left "
+                            "to resume.")
+                        discard_journal(options.dest_dir)
+                        return
+                else:
+                    discard_journal(options.dest_dir)
+
         self._set_busy(True, "Organizing…")
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self._throughput.reset()
-        self._show_progress_panel("Organizing your photos…", indeterminate=False)
+        self._last_active_bytes = sum(p.size for p in active
+                                      if not p.is_duplicate and p.destination)
+        title = ("Simulating (dry run)…" if options.dry_run
+                 else "Organizing your photos…")
+        self._show_progress_panel(title, indeterminate=False)
         self.progress_status.setText("Getting ready…")
         self.progress_detail.setText("")
         self.org_worker = OrganizeWorker(active, options, self)
@@ -1088,9 +1191,18 @@ class MainWindow(QMainWindow):
         self.status_label.setText(f"Finished: {done_n} {mode}.")
 
         box = QMessageBox(self)
-        box.setWindowTitle(f"{APP_NAME} — Done")
-        box.setIconPixmap(icons.pixmap("check-circle", theme.GREEN, 44))
-        text = f"Done! {done_n} photos/videos {mode} into {folders} folders."
+        dry = summary.get("dry_run", False)
+        box.setWindowTitle(f"{APP_NAME} — {'Dry run complete' if dry else 'Done'}")
+        box.setIconPixmap(icons.pixmap(
+            "scan" if dry else "check-circle",
+            theme.AMBER if dry else theme.GREEN, 44))
+        if dry:
+            text = (f"Dry run complete — nothing was written.\n\n"
+                    f"Would copy {done_n:,} files "
+                    f"({format_bytes(self._last_active_bytes)}) "
+                    f"into {folders} folders")
+        else:
+            text = f"Done! {done_n} photos/videos {mode} into {folders} folders."
         details = []
         if summary["skipped_duplicates"]:
             details.append(f"{summary['skipped_duplicates']} exact duplicates skipped")

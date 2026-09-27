@@ -78,6 +78,26 @@ def os_path_norm(path: Path) -> Path:
     return Path(os.path.normpath(str(path)))
 
 
+def relative_destination_fast(destination: Path | str | None,
+                              dest_root_norm: str | None) -> str:
+    """String-only relative path for table rendering at scale.
+
+    `dest_root_norm` must be os.path.normcase(os.path.normpath(root)) —
+    computed ONCE per table fill. No resolve() calls: Path.resolve() costs
+    ~ms per file on Windows, which froze the UI on multi-thousand-row plans.
+    """
+    if destination is None:
+        return "—"
+    if not dest_root_norm:
+        return str(destination)
+    import os
+    d = os.path.normcase(os.path.normpath(str(destination)))
+    prefix = dest_root_norm + os.sep
+    if d.startswith(prefix):
+        return d[len(prefix):].replace(os.sep, "/")
+    return str(destination)
+
+
 def elide_middle(text: str, max_chars: int = 60) -> str:
     """Elide the middle of a long path, always keeping head and tail.
 

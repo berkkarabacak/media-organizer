@@ -69,11 +69,16 @@ class Strategy:
 
     @property
     def example(self) -> str:
-        """Live example like '2024 → Q3 → 07 July'."""
+        """Live example like '2024 › Q3 › 07 July'.
+
+        Uses '›' (U+203A) rather than '→': the arrow glyph triggered
+        font-fallback scrambling inside the monospace example pills on
+        some Windows machines with fractional DPI scaling.
+        """
         capture = CaptureDate(EXAMPLE_DATE)
         path = self.relative_path(
             capture, EXAMPLE_LOCATION if self.uses_location else None)
-        return " → ".join(path.split("/"))
+        return " › ".join(path.split("/"))
 
 
 def _location_path(strategy: Strategy, capture: CaptureDate,

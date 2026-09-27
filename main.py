@@ -4,6 +4,9 @@ import sys
 
 
 def main() -> int:
+    import multiprocessing
+    multiprocessing.freeze_support()  # needed when frozen by PyInstaller
+
     from PySide6.QtWidgets import QApplication
 
     from media_organizer import APP_NAME, __version__

@@ -1,12 +1,22 @@
-"""SHA-256 duplicate detection with a fast size + partial-hash pre-filter."""
+"""SHA-256 duplicate detection with a fast size + partial-hash pre-filter.
+
+Hashing stages run on a thread pool: SHA-256 is implemented in C and
+releases the GIL, so hashing scales near-linearly across cores.
+"""
 
 from __future__ import annotations
 
 import hashlib
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
 _PARTIAL_BYTES = 64 * 1024  # 64 KiB head+tail sample for the pre-filter
+
+
+def _pool_workers() -> int:
+    return min(32, (os.cpu_count() or 4) * 4)
 
 
 def _partial_hash(path: Path, size: int) -> str:
@@ -56,35 +66,49 @@ def find_duplicates(
     if not candidates:
         return set()
 
-    # Stage 2: partial-hash pre-filter within same-size groups
+    # Stage 2: partial-hash pre-filter within same-size groups (parallel)
+    if cancel and cancel():
+        return set()
+    with ThreadPoolExecutor(max_workers=_pool_workers()) as pool:
+        partials = list(pool.map(_safe_partial, candidates))
+    if progress:
+        progress(len(files) + len(candidates), candidates[-1].name)
     by_partial: dict[tuple[int, str], list[Path]] = {}
-    for i, p in enumerate(candidates):
-        if cancel and cancel():
-            return set()
-        if progress:
-            progress(len(files) + i, p.name)
-        try:
-            size = p.stat().st_size
-            ph = _partial_hash(p, size)
-        except OSError:
+    for p, res in zip(candidates, partials):
+        if res is None:
             continue
-        by_partial.setdefault((size, ph), []).append(p)
+        by_partial.setdefault(res, []).append(p)
 
-    # Stage 3: full hash only for partial collisions
+    # Stage 3: full hash only for partial collisions (parallel)
+    hash_targets = [p for group in by_partial.values() if len(group) > 1
+                    for p in group]
+    if cancel and cancel():
+        return set()
+    with ThreadPoolExecutor(max_workers=_pool_workers()) as pool:
+        fulls = list(pool.map(_safe_full, hash_targets))
+
     duplicates: set[Path] = set()
-    for group in by_partial.values():
-        if len(group) < 2:
+    seen: dict[str, Path] = {}
+    for p, fh in zip(hash_targets, fulls):
+        if fh is None:
             continue
-        seen: dict[str, Path] = {}
-        for p in group:
-            if cancel and cancel():
-                return duplicates
-            try:
-                fh = full_hash(p)
-            except OSError:
-                continue
-            if fh in seen:
-                duplicates.add(p)
-            else:
-                seen[fh] = p
+        if fh in seen:
+            duplicates.add(p)
+        else:
+            seen[fh] = p
     return duplicates
+
+
+def _safe_partial(path: Path) -> Optional[tuple[int, str]]:
+    try:
+        size = path.stat().st_size
+        return (size, _partial_hash(path, size))
+    except OSError:
+        return None
+
+
+def _safe_full(path: Path) -> Optional[str]:
+    try:
+        return full_hash(path)
+    except OSError:
+        return None
