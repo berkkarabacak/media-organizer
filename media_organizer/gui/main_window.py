@@ -9,14 +9,17 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QAction, QColor, QDesktopServices
+from PySide6.QtCore import Qt, QSettings, QRectF
 from PySide6.QtCore import QUrl
+from PySide6.QtGui import (
+    QAction, QColor, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap,
+)
 from PySide6.QtWidgets import (
-    QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout,
-    QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox, QProgressBar,
-    QPushButton, QRadioButton, QStackedWidget, QStyledItemDelegate,
-    QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
+    QProgressBar, QPushButton, QRadioButton, QStackedWidget,
+    QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton,
+    QVBoxLayout, QWidget,
 )
 
 from .. import APP_NAME, __version__
@@ -26,12 +29,13 @@ from ..core.metadata import Confidence, DateSource
 from ..core.organizer import STRATEGIES, OrganizeOptions
 from ..core.plan import load_log, undo_log
 from ..core.strategies import DEFAULT_STRATEGY_KEY
+from . import theme
 from .workers import OrganizeWorker, ScanWorker
 
 _CONFIDENCE_COLORS = {
-    Confidence.HIGH: "#3fb950",
-    Confidence.MEDIUM: "#d29922",
-    Confidence.LOW: "#8b949e",
+    Confidence.HIGH: theme.GREEN,
+    Confidence.MEDIUM: theme.AMBER,
+    Confidence.LOW: theme.TEXT_FAINT,
 }
 
 _SOURCE_LABELS = {
@@ -45,8 +49,8 @@ _SOURCE_LABELS = {
 
 COL_NAME, COL_DATE, COL_SOURCE, COL_DEST, COL_SIZE = range(5)
 
-_STEPS = ("1 · Choose your folders", "2 · How should we sort them?",
-          "3 · Check the plan")
+_STEP_TITLES = ("Choose your folders", "How should we sort them?",
+                "Check the plan")
 
 
 def _fmt_size(n: int) -> str:
@@ -55,6 +59,195 @@ def _fmt_size(n: int) -> str:
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
     return f"{n} B"
+
+
+def _icon_pixmap(kind: str, size: int = 44) -> QPixmap:
+    """Hand-drawn amber line icons (photo / folder), no font dependency."""
+    dpr = 2
+    pm = QPixmap(size * dpr, size * dpr)
+    pm.fill(Qt.transparent)
+    pm.setDevicePixelRatio(dpr)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    # tinted disc background
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(theme.AMBER_TINT))
+    p.drawEllipse(QRectF(1, 1, size - 2, size - 2))
+    amber = QPen(QColor(theme.AMBER), 2.0, Qt.SolidLine,
+                 Qt.RoundCap, Qt.RoundJoin)
+    p.setPen(amber)
+    p.setBrush(Qt.NoBrush)
+    m = size * 0.24  # margin of the glyph inside the disc
+    if kind == "photo":
+        frame = QRectF(m, m, size - 2 * m, size - 2 * m)
+        p.drawRoundedRect(frame, 4, 4)
+        # sun
+        p.drawEllipse(QRectF(size * 0.60, size * 0.32, size * 0.10, size * 0.10))
+        # mountain ridge
+        path = QPainterPath()
+        path.moveTo(m + 2, size - m - 3)
+        path.lineTo(size * 0.46, size * 0.52)
+        path.lineTo(size * 0.58, size * 0.66)
+        path.lineTo(size * 0.66, size * 0.58)
+        path.lineTo(size - m - 2, size - m - 3)
+        p.drawPath(path)
+    else:  # folder
+        path = QPainterPath()
+        x0, y0 = m, size * 0.34
+        x1, y1 = size - m, size - m
+        path.moveTo(x0, y0 + 3)
+        path.lineTo(x0, y1 - 3)
+        path.quadTo(x0, y1, x0 + 3, y1)
+        path.lineTo(x1 - 3, y1)
+        path.quadTo(x1, y1, x1, y1 - 3)
+        path.lineTo(x1, y0 + 6)
+        path.quadTo(x1, y0 + 3, x1 - 3, y0 + 3)
+        path.lineTo(size * 0.55, y0 + 3)
+        path.lineTo(size * 0.48, y0)
+        path.lineTo(x0 + 3, y0)
+        path.quadTo(x0, y0, x0, y0 + 3)
+        p.drawPath(path)
+    p.end()
+    return pm
+
+
+class _StepIndicator(QWidget):
+    """Numbered circles connected by lines; active=amber, done=green check."""
+
+    def __init__(self, count: int = 3, parent=None):
+        super().__init__(parent)
+        self._count = count
+        self._current = 0
+        self.setFixedSize(300, 44)
+
+    def set_current(self, index: int):
+        self._current = index
+        self.update()
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        r = 13
+        cy = self.height() / 2
+        step = (self.width() - 2 * r - 20) / (self._count - 1)
+        xs = [10 + r + i * step for i in range(self._count)]
+        # connecting lines
+        for i in range(self._count - 1):
+            done = i < self._current
+            p.setPen(QPen(QColor(theme.GREEN if done else theme.BORDER),
+                          2, Qt.SolidLine, Qt.RoundCap))
+            p.drawLine(int(xs[i] + r + 5), int(cy), int(xs[i + 1] - r - 5), int(cy))
+        for i, x in enumerate(xs):
+            center = QRectF(x - r, cy - r, 2 * r, 2 * r)
+            if i < self._current:      # completed
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(theme.GREEN))
+                p.drawEllipse(center)
+                pen = QPen(QColor(theme.BG_APP), 2.2, Qt.SolidLine,
+                           Qt.RoundCap, Qt.RoundJoin)
+                p.setPen(pen)
+                p.drawLine(int(x - 5), int(cy + 1), int(x - 1), int(cy + 5))
+                p.drawLine(int(x - 1), int(cy + 5), int(x + 6), int(cy - 5))
+            elif i == self._current:   # active
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(theme.AMBER))
+                p.drawEllipse(center)
+                p.setPen(QColor("#1A1206"))
+                f = p.font(); f.setBold(True); f.setPixelSize(14); p.setFont(f)
+                p.drawText(center, Qt.AlignCenter, str(i + 1))
+            else:                      # todo
+                p.setPen(QPen(QColor(theme.BORDER), 1.5))
+                p.setBrush(QColor(theme.BG_PANEL))
+                p.drawEllipse(center)
+                p.setPen(QColor(theme.TEXT_FAINT))
+                f = p.font(); f.setBold(False); f.setPixelSize(13); p.setFont(f)
+                p.drawText(center, Qt.AlignCenter, str(i + 1))
+        p.end()
+
+
+class _FolderCard(QFrame):
+    """Drop-zone style folder picker with painted icon and pill path field."""
+
+    def __init__(self, icon: str, question: str, hint: str, button_text: str,
+                 parent=None):
+        super().__init__(parent)
+        self.setObjectName("card")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 22)
+        layout.setSpacing(12)
+
+        top = QHBoxLayout()
+        icon_label = QLabel()
+        icon_label.setPixmap(_icon_pixmap(icon))
+        top.addWidget(icon_label)
+        text_col = QVBoxLayout()
+        q = QLabel(question)
+        q.setObjectName("cardQuestion")
+        h = QLabel(hint)
+        h.setObjectName("cardHint")
+        h.setWordWrap(True)
+        text_col.addWidget(q)
+        text_col.addWidget(h)
+        top.addLayout(text_col, 1)
+        layout.addLayout(top)
+
+        row = QHBoxLayout()
+        self.edit = QLineEdit()
+        self.edit.setPlaceholderText("No folder chosen yet")
+        self.button = QPushButton(button_text)
+        row.addWidget(self.edit, 1)
+        row.addWidget(self.button)
+        layout.addLayout(row)
+
+        self.chip = QPushButton()
+        self.chip.setObjectName("chip")
+        self.chip.setVisible(False)
+        self.chip.setCursor(Qt.PointingHandCursor)
+        layout.addWidget(self.chip, 0, Qt.AlignLeft)
+
+
+class _StrategyCard(QFrame):
+    """Selectable strategy card (radio-button semantics for compatibility)."""
+
+    def __init__(self, strategy, parent=None):
+        super().__init__(parent)
+        self.setObjectName("strategyCard")
+        self.setProperty("strategyKey", strategy.key)
+        self.setProperty("selected", False)
+        self.setCursor(Qt.PointingHandCursor)
+        self._checked = False
+        self.on_toggled = None  # set by MainWindow
+
+        row = QHBoxLayout(self)
+        row.setContentsMargins(18, 12, 18, 12)
+        row.setSpacing(14)
+        text_col = QVBoxLayout()
+        text_col.setSpacing(6)
+        name = QLabel(strategy.name)
+        name.setObjectName("strategyName")
+        example = QLabel(f"e.g.  {strategy.example}")
+        example.setObjectName("examplePill")
+        text_col.addWidget(name)
+        text_col.addWidget(example, 0, Qt.AlignLeft)
+        row.addLayout(text_col, 1)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool):
+        if self._checked == checked:
+            return
+        self._checked = checked
+        self.setProperty("selected", checked)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        if checked and self.on_toggled:
+            self.on_toggled(self)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.setChecked(True)
+        super().mouseReleaseEvent(event)
 
 
 class _ElideMiddleDelegate(QStyledItemDelegate):
@@ -75,10 +268,14 @@ class AboutDialog(QDialog):
         self.setWindowTitle(f"About {APP_NAME}")
         self.setMinimumWidth(420)
         layout = QVBoxLayout(self)
-        title = QLabel(f"📁 {APP_NAME}")
-        title.setObjectName("heading")
+        layout.setContentsMargins(24, 22, 24, 18)
+        layout.setSpacing(10)
+        title = QLabel(f"◆ {APP_NAME}")
+        title.setObjectName("wordmark")
         layout.addWidget(title)
-        layout.addWidget(QLabel(f"Version {__version__}"))
+        ver = QLabel(f"Version {__version__}")
+        ver.setObjectName("muted")
+        layout.addWidget(ver)
         about = QLabel(
             "Sorts your photos and videos into tidy folders using their real "
             "capture dates (EXIF, video metadata, file names) or the place "
@@ -95,37 +292,12 @@ class AboutDialog(QDialog):
         layout.addWidget(buttons)
 
 
-class _FolderCard(QFrame):
-    """Big friendly folder picker card."""
-
-    def __init__(self, question: str, hint: str, button_text: str, parent=None):
-        super().__init__(parent)
-        self.setObjectName("card")
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 18, 18, 18)
-        layout.setSpacing(10)
-        q = QLabel(question)
-        q.setObjectName("cardQuestion")
-        layout.addWidget(q)
-        h = QLabel(hint)
-        h.setObjectName("muted")
-        h.setWordWrap(True)
-        layout.addWidget(h)
-        row = QHBoxLayout()
-        self.edit = QLineEdit()
-        self.edit.setPlaceholderText("No folder chosen yet")
-        self.button = QPushButton(button_text)
-        self.button.setObjectName("primaryButton")
-        row.addWidget(self.edit, 1)
-        row.addWidget(self.button)
-        layout.addLayout(row)
-
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} {__version__}")
-        self.resize(1120, 760)
+        self.setWindowTitle(APP_NAME)
+        self.setMinimumSize(1100, 760)
+        self.resize(1240, 820)
         self.settings = QSettings("MediaOrganizer", "MediaOrganizer")
         self.plan: list = []
         self.scan_worker: ScanWorker | None = None
@@ -137,6 +309,13 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._restore_settings()
         self._goto_step(0)
+        self._center_on_screen()
+
+    def _center_on_screen(self):
+        screen = QApplication.primaryScreen()
+        if screen:
+            geo = screen.availableGeometry()
+            self.move(geo.center() - self.frameGeometry().center())
 
     # ------------------------------------------------------------------ UI
 
@@ -158,21 +337,36 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         root = QVBoxLayout(central)
-        root.setContentsMargins(20, 18, 20, 16)
-        root.setSpacing(12)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        heading = QLabel(f"📁 {APP_NAME}")
-        heading.setObjectName("heading")
-        root.addWidget(heading)
-        self.step_label = QLabel()
-        self.step_label.setObjectName("stepLabel")
-        root.addWidget(self.step_label)
+        # Header bar: wordmark + version left, step indicator right
+        header = QFrame()
+        header.setObjectName("headerBar")
+        h = QHBoxLayout(header)
+        h.setContentsMargins(24, 14, 24, 14)
+        wordmark = QLabel(f"◆ {APP_NAME}")
+        wordmark.setObjectName("wordmark")
+        version = QLabel(f"v{__version__}")
+        version.setObjectName("versionLabel")
+        h.addWidget(wordmark)
+        h.addSpacing(8)
+        h.addWidget(version, 0, Qt.AlignBottom)
+        h.addStretch(1)
+        self.step_indicator = _StepIndicator(3)
+        h.addWidget(self.step_indicator)
+        root.addWidget(header)
 
+        # Content area
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(28, 24, 28, 16)
+        content_layout.setSpacing(14)
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_step1())
         self.stack.addWidget(self._build_step2())
         self.stack.addWidget(self._build_step3())
-        root.addWidget(self.stack, 1)
+        content_layout.addWidget(self.stack, 1)
 
         # Bottom navigation
         nav = QHBoxLayout()
@@ -184,7 +378,8 @@ class MainWindow(QMainWindow):
         nav.addWidget(self.back_btn)
         nav.addStretch(1)
         nav.addWidget(self.next_btn)
-        root.addLayout(nav)
+        content_layout.addLayout(nav)
+        root.addWidget(content, 1)
 
         self.status_label = QLabel("")
         self.statusBar().addWidget(self.status_label, 1)
@@ -192,33 +387,54 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------- step 1
 
+    def _page_header(self, title: str, subtitle: str) -> QVBoxLayout:
+        box = QVBoxLayout()
+        box.setSpacing(4)
+        t = QLabel(title)
+        t.setObjectName("pageTitle")
+        s = QLabel(subtitle)
+        s.setObjectName("pageSubtitle")
+        box.addWidget(t)
+        box.addWidget(s)
+        return box
+
     def _build_step1(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setSpacing(16)
-        intro = QLabel("Pick two folders and we'll take care of the rest.")
-        intro.setObjectName("muted")
-        layout.addWidget(intro)
+        layout.setSpacing(18)
+        layout.addLayout(self._page_header(
+            "Choose your folders",
+            "Pick two folders and we'll take care of the rest."))
+        layout.addSpacing(4)
 
         self.source_card = _FolderCard(
+            "photo",
             "Where are your messy photos?",
             "The folder (and its subfolders) with the photos and videos "
             "you want to sort.",
-            "Choose folder…")
+            "Browse…")
         self.source_card.button.clicked.connect(
             lambda: self._pick_folder(self.source_card.edit, suggest_dest=True))
         layout.addWidget(self.source_card)
 
         self.dest_card = _FolderCard(
+            "folder",
             "Where should organized copies go?",
             "Your files are copied here, neatly sorted. Nothing is "
             "overwritten or deleted from the original folder.",
-            "Choose folder…")
+            "Browse…")
         self.dest_card.button.clicked.connect(
             lambda: self._pick_folder(self.dest_card.edit))
+        self.dest_card.chip.clicked.connect(self._apply_dest_suggestion)
         layout.addWidget(self.dest_card)
         layout.addStretch(1)
         return page
+
+    def _apply_dest_suggestion(self):
+        text = self.chip.property("suggestedPath") or ""
+        if text:
+            self.dest_card.edit.setText(text)
+            self.dest_card.chip.setVisible(False)
 
     # ------------------------------------------------------------- step 2
 
@@ -226,34 +442,25 @@ class MainWindow(QMainWindow):
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setSpacing(10)
-        intro = QLabel("Choose how your photos and videos should be grouped "
-                       "into folders:")
-        intro.setObjectName("muted")
-        layout.addWidget(intro)
+        layout.addLayout(self._page_header(
+            "How should we sort them?",
+            "Choose how your photos and videos should be grouped into folders."))
+        layout.addSpacing(2)
 
-        self.strategy_radios: list[QRadioButton] = []
-        for i, strategy in enumerate(STRATEGIES):
-            radio = QRadioButton()
-            radio.setProperty("strategyKey", strategy.key)
-            card = QFrame()
-            card.setObjectName("card")
-            row = QHBoxLayout(card)
-            row.setContentsMargins(14, 8, 14, 8)
-            row.addWidget(radio)
-            text_col = QVBoxLayout()
-            name = QLabel(strategy.name)
-            name.setObjectName("cardQuestion")
-            example = QLabel(f"e.g.  {strategy.example}")
-            example.setObjectName("exampleLabel")
-            text_col.addWidget(name)
-            text_col.addWidget(example)
-            row.addLayout(text_col, 1)
+        self.strategy_radios: list[_StrategyCard] = []
+
+        def _uncheck_others(selected_card):
+            for card in self.strategy_radios:
+                if card is not selected_card:
+                    card.setChecked(False)
+
+        for strategy in STRATEGIES:
+            card = _StrategyCard(strategy)
+            card.on_toggled = lambda _c: _uncheck_others(_c)
             layout.addWidget(card)
             if strategy.key == DEFAULT_STRATEGY_KEY:
-                radio.setChecked(True)
-            self.strategy_radios.append(radio)
-            # clicking anywhere on the card selects the radio
-            card.mouseReleaseEvent = lambda _e, r=radio: r.setChecked(True)
+                card.setChecked(True)
+            self.strategy_radios.append(card)
 
         # Advanced options (collapsed by default)
         self.advanced_toggle = QToolButton()
@@ -266,6 +473,8 @@ class MainWindow(QMainWindow):
         self.advanced_panel = QFrame()
         self.advanced_panel.setObjectName("card")
         adv = QVBoxLayout(self.advanced_panel)
+        adv.setContentsMargins(20, 16, 20, 16)
+        adv.setSpacing(10)
         self.recursive_cb = QCheckBox("Also look inside subfolders (recommended)")
         self.recursive_cb.setChecked(True)
         self.copy_radio = QRadioButton("Copy files — originals stay put (safest)")
@@ -308,7 +517,10 @@ class MainWindow(QMainWindow):
     def _build_step3(self) -> QWidget:
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setSpacing(8)
+        layout.setSpacing(10)
+        layout.addLayout(self._page_header(
+            "Check the plan",
+            "Look over where everything will go — nothing has been moved yet."))
 
         top = QHBoxLayout()
         self.plan_summary = QLabel("Building the plan…")
@@ -323,7 +535,7 @@ class MainWindow(QMainWindow):
 
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(
-            ["File", "Date taken", "Found via", "New location", "Size"])
+            ["FILE", "DATE TAKEN", "FOUND VIA", "NEW LOCATION", "SIZE"])
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(COL_DATE, QHeaderView.ResizeToContents)
@@ -335,25 +547,31 @@ class MainWindow(QMainWindow):
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        self.table.setShowGrid(False)
         layout.addWidget(self.table, 1)
 
-        # Progress area: a large dedicated panel, always visible while working
+        # Progress panel: large, always visible while working
         self.progress_panel = QFrame()
         self.progress_panel.setObjectName("card")
         pp = QVBoxLayout(self.progress_panel)
-        pp.setContentsMargins(16, 14, 16, 14)
-        pp.setSpacing(8)
+        pp.setContentsMargins(22, 18, 22, 18)
+        pp.setSpacing(10)
+        title_row = QHBoxLayout()
         self.progress_title = QLabel("Working…")
         self.progress_title.setObjectName("cardQuestion")
-        pp.addWidget(self.progress_title)
+        self.progress_percent = QLabel("")
+        self.progress_percent.setObjectName("progressPercent")
+        title_row.addWidget(self.progress_title)
+        title_row.addStretch(1)
+        title_row.addWidget(self.progress_percent)
+        pp.addLayout(title_row)
         self.progress = QProgressBar()
-        self.progress.setTextVisible(True)
-        self.progress.setMinimumHeight(28)
+        self.progress.setTextVisible(False)
         pp.addWidget(self.progress)
         self.progress_status = QLabel("")
         pp.addWidget(self.progress_status)
         self.progress_detail = QLabel("")
-        self.progress_detail.setObjectName("muted")
+        self.progress_detail.setObjectName("progressEta")
         pp.addWidget(self.progress_detail)
         self.progress_panel.setVisible(False)
         layout.addWidget(self.progress_panel)
@@ -377,7 +595,7 @@ class MainWindow(QMainWindow):
 
     def _goto_step(self, index: int):
         self.stack.setCurrentIndex(index)
-        self.step_label.setText(f"Step {index + 1} of 3 — {_STEPS[index].split('· ')[1]}")
+        self.step_indicator.set_current(index)
         self.back_btn.setEnabled(index > 0)
         self.next_btn.setVisible(index < 2)
         if index == 0:
@@ -440,7 +658,10 @@ class MainWindow(QMainWindow):
             return
         edit.setText(path)
         if suggest_dest and not self.dest_card.edit.text().strip():
-            self.dest_card.edit.setText(f"{path.rstrip('/\\\\')}_Organized")
+            suggested = f"{path.rstrip('/\\\\')}_Organized"
+            self.dest_card.chip.setText(f"Use suggested:  {suggested}")
+            self.dest_card.chip.setProperty("suggestedPath", suggested)
+            self.dest_card.chip.setVisible(True)
 
     def _validate_folders(self) -> bool:
         src = Path(self.source_card.edit.text().strip())
@@ -505,9 +726,11 @@ class MainWindow(QMainWindow):
         self.progress_title.setText(title)
         if indeterminate:
             self.progress.setRange(0, 0)  # busy-pulse style
+            self.progress_percent.setText("")
         else:
             self.progress.setRange(0, 100)
             self.progress.setValue(0)
+            self.progress_percent.setText("0%")
         self.progress_panel.setVisible(True)
 
     def _hide_progress_panel(self):
@@ -521,10 +744,12 @@ class MainWindow(QMainWindow):
         dupes = sum(1 for p in plan if p.is_duplicate)
         undated = sum(1 for p in plan if not p.capture.found and not p.is_duplicate)
         folders = len({p.destination.parent for p in plan if p.destination})
+        dupe_txt = ("1 exact duplicate will be skipped" if dupes == 1
+                    else f"{dupes} exact duplicates will be skipped")
+        undated_txt = ("1 without a date" if undated == 1
+                       else f"{undated} without a date")
         self.plan_summary.setText(
-            f"{len(plan)} files · {folders} folders · "
-            f"{dupes} exact duplicates will be skipped · "
-            f"{undated} without a date")
+            f"{len(plan)} files · {folders} folders · {dupe_txt} · {undated_txt}")
         self.status_label.setText("Plan ready — take a look, then press "
                                   "\"Organize now\".")
         self.organize_btn.setEnabled(bool(plan))
@@ -609,6 +834,7 @@ class MainWindow(QMainWindow):
             percent = int(100 * i / total) if total else 0
         percent = max(0, min(percent, 100))
         self.progress.setValue(percent)
+        self.progress_percent.setText(f"{percent}%")
         self._throughput.add(bytes_done)
         rate = self._throughput.rate()
         eta = self._throughput.eta_seconds(max(0, total_bytes - bytes_done))

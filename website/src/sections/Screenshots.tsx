@@ -1,13 +1,13 @@
 const shots = [
   {
     src: 'images/screenshot-main.png',
-    alt: 'Media Organizer main window — source folder scan with detected capture dates',
-    caption: 'The main window — scanning a source folder and reading true capture dates.',
+    alt: 'Media Organizer — choosing a folder strategy in the guided 3-step flow',
+    caption: 'Pick a strategy — year, quarter, month, flat or by GPS location — with live examples.',
   },
   {
     src: 'images/screenshot-preview.png',
-    alt: 'Dry-run preview showing the proposed year, quarter and month folder plan',
-    caption: 'The dry-run preview — the full folder plan before anything is touched.',
+    alt: 'Media Organizer organizing files with live progress bar and ETA',
+    caption: 'Real progress — percent, speed and ETA while your library sorts itself.',
   },
 ];
 
