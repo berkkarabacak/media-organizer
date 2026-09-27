@@ -15,11 +15,11 @@ from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
-    QMessageBox, QProgressBar, QPushButton, QRadioButton, QStackedWidget,
-    QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
+    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QRadioButton,
+    QStackedWidget, QStyledItemDelegate, QTableWidget, QTableWidgetItem,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import APP_NAME, __version__
@@ -528,6 +528,16 @@ class MainWindow(QMainWindow):
         adv.addWidget(self.move_radio)
         adv.addWidget(self.dupes_cb)
         adv.addWidget(self.dry_run_cb)
+        uncertain_row = QHBoxLayout()
+        uncertain_label = QLabel("When only the file's date is available:")
+        uncertain_row.addWidget(uncertain_label)
+        self.uncertain_combo = QComboBox()
+        self.uncertain_combo.addItem(
+            "Set them aside in an '_uncertain' folder (recommended)", "aside")
+        self.uncertain_combo.addItem("Use the file date anyway", "use")
+        uncertain_row.addWidget(self.uncertain_combo)
+        uncertain_row.addStretch(1)
+        adv.addLayout(uncertain_row)
         types_row = QHBoxLayout()
         types_row.addWidget(QLabel("Include:"))
         types_row.addWidget(self.images_cb)
@@ -718,6 +728,9 @@ class MainWindow(QMainWindow):
         self.copy_radio.setChecked(not self.move_radio.isChecked())
         self.dupes_cb.setChecked(self.settings.value("skip_duplicates", True, type=bool))
         self.dry_run_cb.setChecked(self.settings.value("dry_run", False, type=bool))
+        idx = self.uncertain_combo.findData(
+            self.settings.value("uncertain", "aside"))
+        self.uncertain_combo.setCurrentIndex(max(idx, 0))
         self.images_cb.setChecked(self.settings.value("images", True, type=bool))
         self.videos_cb.setChecked(self.settings.value("videos", True, type=bool))
         self._select_strategy(self.settings.value(
@@ -731,6 +744,7 @@ class MainWindow(QMainWindow):
         self.settings.setValue("move_mode", self.move_radio.isChecked())
         self.settings.setValue("skip_duplicates", self.dupes_cb.isChecked())
         self.settings.setValue("dry_run", self.dry_run_cb.isChecked())
+        self.settings.setValue("uncertain", self.uncertain_combo.currentData())
         self.settings.setValue("images", self.images_cb.isChecked())
         self.settings.setValue("videos", self.videos_cb.isChecked())
         self.settings.setValue("strategy", self._selected_strategy())
@@ -795,6 +809,7 @@ class MainWindow(QMainWindow):
             include_images=self.images_cb.isChecked(),
             include_videos=self.videos_cb.isChecked(),
             dry_run=self.dry_run_cb.isChecked(),
+            uncertain=self.uncertain_combo.currentData(),
         )
 
     # ---------------------------------------------------------- scan/plan
@@ -881,6 +896,9 @@ class MainWindow(QMainWindow):
         dupes = sum(1 for p in active if p.is_duplicate)
         undated = sum(1 for p in active
                       if not p.capture.found and not p.is_duplicate)
+        uncertain = sum(1 for p in active
+                        if p.capture.found and not p.is_duplicate
+                        and p.capture.source is DateSource.MTIME)
         folders = len({p.destination.parent for p in active if p.destination})
         excl = len(self.excluded)
         parts = [f"{len(active):,} files",
@@ -892,6 +910,11 @@ class MainWindow(QMainWindow):
         if undated:
             parts.append("1 without a date" if undated == 1
                          else f"{undated} without a date")
+        if uncertain:
+            aside = self.uncertain_combo.currentData() == "aside"
+            parts.append(
+                f"{uncertain} uncertain date{'s' if uncertain != 1 else ''} "
+                + ("set aside" if aside else "used (file date)"))
         if excl:
             parts.append(f"{excl} excluded")
         parts.append(f"{format_bytes(copy_bytes)} to copy")

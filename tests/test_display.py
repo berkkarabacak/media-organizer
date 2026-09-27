@@ -75,6 +75,22 @@ class TestPlanSortKeys:
             str(Path("/dst/b.jpg")).lower()
         assert plan_sort_key("source", _rows()[0]) == "exif"
 
+    def test_relative_destination_fast_preserves_case(self):
+        # regression: normcase lowercased the DISPLAYED path too
+        import os
+        from media_organizer.core.display import relative_destination_fast
+        root = os.path.normcase(os.path.normpath("C:/Photos_Organized"))
+        shown = relative_destination_fast(
+            "C:/Photos_Organized/2024/07 July/IMG_1234.jpg", root)
+        assert shown == "2024/07 July/IMG_1234.jpg"
+
+    def test_relative_destination_fast_outside_root(self):
+        import os
+        from media_organizer.core.display import relative_destination_fast
+        root = os.path.normcase(os.path.normpath("C:/Photos_Organized"))
+        shown = relative_destination_fast("D:/elsewhere/f.jpg", root)
+        assert shown == "D:/elsewhere/f.jpg"
+
 
 class TestRelativeDestination:
     def test_relative_path_shown(self, tmp_path):

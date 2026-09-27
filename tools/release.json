@@ -1,7 +1,7 @@
 {
-  "tag_name": "v1.5.0",
-  "name": "Media Organizer 1.5.0",
-  "body": "**The 'real machine' release:**\n- Fixed unreadable/garbled example text on scaled displays (125–150% DPI)\n- Fixed freezing: 3 real freeze sources removed — scanning a 2,000-file library no longer stalls the interface\n- **Multicore parallel processing**: metadata reads use all CPU cores (2.1x faster on 2,000 files), duplicate hashing 5.7x faster\n- **Dry run mode**: simulate the whole organize — see exactly what would happen, zero writes\n- **Free-space check** before organizing (blocks with a clear message if the destination drive is too small)\n- **Crash resilience**: if the PC dies mid-run, the app offers to resume exactly where it left off; per-file copies are atomic (no half-written files ever)\n\n171 automated tests + 119 QA scenario checks, all passing.\n\nDownload **MediaOrganizer-Setup-1.5.0.exe** below.",
+  "tag_name": "v1.5.1",
+  "name": "Media Organizer 1.5.1",
+  "body": "**New option: uncertain dates.** When no real capture date can be found (no EXIF, no video metadata, no filename date), the app previously guessed from the file's modified date and sorted the file by it. Now you choose in Advanced options:\n- **Set them aside in an '_uncertain' folder (default)** — guesses never get misfiled into wrong dates\n- Use the file date anyway\n\nAlso fixes folder names showing in lowercase in the plan table on some systems.\n\n179 automated tests + 131 QA scenario checks, all passing.\n\nDownload **MediaOrganizer-Setup-1.5.1.exe** below.",
   "draft": false,
   "prerelease": false
 }

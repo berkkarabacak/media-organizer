@@ -63,10 +63,16 @@ def main():
               for k in ("Scanning files", "Reading", "Counting")),
           repr(w.progress_status.text()))
     saw_determinate = []
+    # wait until the worker is actually running (it can finish before the
+    # first sample on fast machines)
+    end = time.monotonic() + 10
+    while not w.scan_worker.isRunning() and time.monotonic() < end:
+        app.processEvents(); time.sleep(0.005)
     while w.scan_worker.isRunning():
         app.processEvents(); time.sleep(0.005)
         saw_determinate.append(w.progress.maximum() == 100)
     w.scan_worker.wait(30000); app.processEvents()
+    saw_determinate.append(w.progress.maximum() == 100)  # final state
     check("scan: determinate bar appeared", any(saw_determinate))
     check("scan: plan has 12+ rows", w.table.rowCount() >= 12,
           f"rows={w.table.rowCount()}")

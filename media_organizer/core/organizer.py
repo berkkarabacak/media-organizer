@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 from .geodata import location_label
-from .metadata import CaptureDate, extract_capture_date, extract_gps
-from .strategies import (DEFAULT_STRATEGY_KEY, STRATEGIES, UNDATED_FOLDER,
-                         UNKNOWN_LOCATION_FOLDER, get_strategy, quarter_of)
+from .metadata import (CaptureDate, DateSource, extract_capture_date,
+                       extract_gps)
+from .strategies import (DEFAULT_STRATEGY_KEY, STRATEGIES, UNCERTAIN_FOLDER,
+                         UNDATED_FOLDER, UNKNOWN_LOCATION_FOLDER,
+                         get_strategy, quarter_of)
 
 IMAGE_EXTENSIONS = frozenset(
     {"jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "webp", "heic", "heif"}
@@ -54,6 +56,8 @@ class OrganizeOptions:
     copy_mode: bool = True  # copy by default; move is explicit opt-in
     skip_duplicates: bool = True
     dry_run: bool = False   # simulate the full run, write nothing
+    # "aside": mtime-only guesses go to _uncertain/; "use": file date is used
+    uncertain: str = "aside"
     include_images: bool = True
     include_videos: bool = True
     extensions: Optional[frozenset] = None  # explicit override
@@ -189,11 +193,17 @@ def build_plan(
                                     is_duplicate=True))
             continue
 
-        if strategy.uses_location:
+        # mtime-only guesses ("file date (guess)") are unreliable after
+        # copies — set them aside instead of misfiling them by date/place
+        location = None
+        if (options.uncertain == "aside" and capture.found
+                and capture.source is DateSource.MTIME):
+            rel = UNCERTAIN_FOLDER
+        elif strategy.uses_location:
             location = _location_label_for(coords, geo_cache)
+            rel = strategy.relative_path(capture, location)
         else:
-            location = None
-        rel = strategy.relative_path(capture, location)
+            rel = strategy.relative_path(capture, location)
         dest_dir = Path(options.dest_dir).joinpath(*rel.split("/"))
 
         dest = _unique_destination(dest_dir, src.name, taken)

@@ -91,10 +91,11 @@ def relative_destination_fast(destination: Path | str | None,
     if not dest_root_norm:
         return str(destination)
     import os
-    d = os.path.normcase(os.path.normpath(str(destination)))
+    raw = os.path.normpath(str(destination))
+    d = os.path.normcase(raw)  # compare lowercased…
     prefix = dest_root_norm + os.sep
     if d.startswith(prefix):
-        return d[len(prefix):].replace(os.sep, "/")
+        return raw[len(prefix):].replace(os.sep, "/")  # …but display original case
     return str(destination)
 
 

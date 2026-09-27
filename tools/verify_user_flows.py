@@ -92,6 +92,11 @@ def main():
     seen_status, seen_detail, saw_determinate = [], [], []
     QTest.mouseClick(w.next_btn, Qt.LeftButton)   # step 2 -> 3, starts scan
     pump(app, 0.02)
+    # wait until the worker is actually running (fast scans finish before
+    # the first sample otherwise)
+    end = time.monotonic() + 10
+    while not w.scan_worker.isRunning() and time.monotonic() < end:
+        app.processEvents(); time.sleep(0.005)
     while w.scan_worker.isRunning():
         app.processEvents()
         seen_status.append(w.progress_status.text())
@@ -100,6 +105,7 @@ def main():
         time.sleep(0.01)
     w.scan_worker.wait(60000)
     pump(app, 0.05)
+    saw_determinate.append(w.progress.maximum() == 100)  # final state
     # the worker's final forced progress event is queued behind finished_plan;
     # sample the labels once more after everything was delivered
     seen_status.append(w.progress_status.text())

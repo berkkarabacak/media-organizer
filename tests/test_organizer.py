@@ -64,7 +64,7 @@ class TestBuildPlanStrategies:
         plan = build_plan(_options(src, dst, strategy="location"))
         assert plan[0].destination.parent.name == "_unknown-location"
 
-    def test_mtime_fallback_lands_in_date_folder(self, tmp_path):
+    def test_mtime_fallback_set_aside_by_default(self, tmp_path):
         src = tmp_path / "src"
         dst = tmp_path / "dst"
         src.mkdir()
@@ -75,6 +75,17 @@ class TestBuildPlanStrategies:
         plan = build_plan(_options(src, dst))
         assert len(plan) == 1
         assert plan[0].capture.found  # mtime fallback
+        assert plan[0].destination.parent.name == "_uncertain"
+
+    def test_mtime_fallback_used_when_opted_in(self, tmp_path):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        f = src / "nodate.jpg"
+        f.write_bytes(b"\xff\xd8\xff" + b"\x00" * 20)
+        ts = datetime(2019, 3, 2, 10, 0, 0).timestamp()
+        os.utime(f, (ts, ts))
+        plan = build_plan(_options(src, dst, uncertain="use"))
         assert plan[0].destination.parent.name == "03 March"
 
     def test_never_overwrites_collision_suffixes(self, tmp_path):

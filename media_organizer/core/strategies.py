@@ -15,6 +15,7 @@ from typing import Optional
 from .metadata import CaptureDate
 
 UNDATED_FOLDER = "_undated"
+UNCERTAIN_FOLDER = "_uncertain"
 UNKNOWN_LOCATION_FOLDER = "_unknown-location"
 
 MONTH_NAMES = (
