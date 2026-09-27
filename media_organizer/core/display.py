@@ -1,9 +1,51 @@
-"""Display helpers: how paths are shown in the UI. Pure logic, no Qt."""
+"""Display helpers: how paths, sizes and sort orders are shown. Pure logic."""
 
 from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+
+
+def format_bytes(n: float) -> str:
+    """Human size with 1 decimal: '812.5 KB', '3.9 MB', '48.2 GB'."""
+    if n < 0:
+        n = 0
+    if n < 1024:
+        return f"{n:.0f} B"
+    for unit in ("KB", "MB", "GB", "TB"):
+        n /= 1024
+        if n < 1024 or unit == "TB":
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} TB"
+
+
+#: preview-table column id -> duck-typed PlannedFile sort key.
+#: Returns None for "missing" values (they always sort last, both directions).
+def plan_sort_key(column: str, item):
+    """Sort key for one plan row. None => sorts last."""
+    if column == "file":
+        return item.source.name.lower()
+    if column == "date":
+        return item.capture.date  # datetime or None
+    if column == "source":
+        return item.capture.source.value if item.capture else ""
+    if column == "dest":
+        return str(item.destination).lower() if item.destination else None
+    if column == "size":
+        return item.size
+    raise ValueError(f"unknown column: {column}")
+
+
+def sorted_plan_items(plan: list, column: str, descending: bool = False) -> list:
+    """Return the plan rows sorted for display; the plan itself is untouched.
+
+    Items with a missing sort key (no date / no destination) stay at the
+    bottom regardless of direction.
+    """
+    present = [p for p in plan if plan_sort_key(column, p) is not None]
+    missing = [p for p in plan if plan_sort_key(column, p) is None]
+    present.sort(key=lambda p: plan_sort_key(column, p), reverse=descending)
+    return present + missing
 
 
 def relative_destination(destination: Path | str | None,

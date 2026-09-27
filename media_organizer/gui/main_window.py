@@ -12,18 +12,19 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSettings, QRectF
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import (
-    QAction, QColor, QDesktopServices, QPainter, QPen,
+    QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QShortcut,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
-    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMessageBox,
-    QProgressBar, QPushButton, QRadioButton, QStackedWidget,
+    QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu,
+    QMessageBox, QProgressBar, QPushButton, QRadioButton, QStackedWidget,
     QStyledItemDelegate, QTableWidget, QTableWidgetItem, QToolButton,
     QVBoxLayout, QWidget,
 )
 
 from .. import APP_NAME, __version__
-from ..core.display import elide_middle, relative_destination
+from ..core.display import (elide_middle, format_bytes, relative_destination,
+                            sorted_plan_items)
 from ..core.eta import ThroughputEstimator, format_eta, format_rate
 from ..core.metadata import Confidence, DateSource
 from ..core.organizer import STRATEGIES, OrganizeOptions
@@ -48,14 +49,17 @@ _SOURCE_LABELS = {
 }
 
 COL_NAME, COL_DATE, COL_SOURCE, COL_DEST, COL_SIZE = range(5)
+_COL_KEYS = {COL_NAME: "file", COL_DATE: "date", COL_SOURCE: "source",
+             COL_DEST: "dest", COL_SIZE: "size"}
+#: sensible minimum widths per column (px)
+_COL_MIN_WIDTHS = {COL_NAME: 180, COL_DATE: 130, COL_SOURCE: 150,
+                   COL_DEST: 200, COL_SIZE: 80}
+_COL_DEFAULT_WIDTHS = {COL_NAME: 280, COL_DATE: 160, COL_SOURCE: 210,
+                       COL_SIZE: 90}
 
 
 def _fmt_size(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n} B"
+    return format_bytes(n)
 
 
 def _badge(icon_name: str, badge_px: int = 44, icon_px: int = 20,
@@ -268,6 +272,10 @@ class MainWindow(QMainWindow):
         self.resize(1240, 820)
         self.settings = QSettings("MediaOrganizer", "MediaOrganizer")
         self.plan: list = []
+        self._view: list = []              # plan rows in display (sorted) order
+        self.excluded: set[str] = set()    # sources excluded from the plan
+        self._sort_col: int = -1           # -1 = scan order
+        self._sort_desc: bool = False
         self.scan_worker: ScanWorker | None = None
         self.org_worker: OrganizeWorker | None = None
         self._last_run: tuple | None = None  # (RunLog, dest_dir, summary)
@@ -276,14 +284,47 @@ class MainWindow(QMainWindow):
         self._build_menu()
         self._build_ui()
         self._restore_settings()
+        self._restore_geometry()
+        self._build_shortcuts()
         self._goto_step(0)
-        self._center_on_screen()
+        self._center_on_screen_if_no_geometry()
 
-    def _center_on_screen(self):
+    def _restore_geometry(self):
+        geo = self.settings.value("geometry")
+        if geo:
+            self.restoreGeometry(geo)
+
+    def _center_on_screen_if_no_geometry(self):
+        if self.settings.value("geometry"):
+            return
         screen = QApplication.primaryScreen()
         if screen:
             geo = screen.availableGeometry()
             self.move(geo.center() - self.frameGeometry().center())
+
+    def _build_shortcuts(self):
+        open_src = QShortcut(QKeySequence("Ctrl+O"), self)
+        open_src.setContext(Qt.WindowShortcut)
+        open_src.activated.connect(
+            lambda: self._pick_folder(self.source_card.edit, suggest_dest=True))
+        enter = QShortcut(QKeySequence(Qt.Key_Return), self)
+        enter.setContext(Qt.WindowShortcut)
+        enter.activated.connect(self._primary_action)
+        enter2 = QShortcut(QKeySequence(Qt.Key_Enter), self)
+        enter2.setContext(Qt.WindowShortcut)
+        enter2.activated.connect(self._primary_action)
+        esc = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        esc.setContext(Qt.WindowShortcut)
+        esc.activated.connect(self.cancel_work)
+
+    def _primary_action(self):
+        if self._busy():
+            return
+        idx = self.stack.currentIndex()
+        if idx < 2:
+            self._go_next()
+        elif self.organize_btn.isEnabled():
+            self.start_organize()
 
     # ------------------------------------------------------------------ UI
 
@@ -509,7 +550,8 @@ class MainWindow(QMainWindow):
             "Look over where everything will go — nothing has been moved yet."))
 
         top = QHBoxLayout()
-        self.plan_summary = QLabel("Building the plan…")
+        self.plan_summary = QLabel("No files yet — choose your folders and "
+                                   "sorting, then the plan appears here.")
         self.plan_summary.setObjectName("muted")
         top.addWidget(self.plan_summary, 1)
         self.filter_edit = QLineEdit()
@@ -526,17 +568,27 @@ class MainWindow(QMainWindow):
         self.table.setHorizontalHeaderLabels(
             ["FILE", "DATE TAKEN", "FOUND VIA", "NEW LOCATION", "SIZE"])
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(COL_NAME, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_DATE, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_SOURCE, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(COL_DEST, QHeaderView.Stretch)
-        header.setSectionResizeMode(COL_SIZE, QHeaderView.ResizeToContents)
+        # user-resizable columns; the destination column absorbs extra width
+        for col in range(5):
+            mode = (QHeaderView.Stretch if col == COL_DEST
+                    else QHeaderView.Interactive)
+            header.setSectionResizeMode(col, mode)
+            header.resizeSection(col, _COL_DEFAULT_WIDTHS.get(col, 140))
+        header.setMinimumSectionSize(70)
+        header.setStretchLastSection(False)
+        header.setSectionsClickable(True)
+        header.setSortIndicatorShown(True)
+        header.sectionClicked.connect(self._on_header_clicked)
         self.table.setItemDelegateForColumn(COL_DEST, _ElideMiddleDelegate(self.table))
-        self.table.setSortingEnabled(True)
+        self.table.setSortingEnabled(False)  # custom typed sorting instead
         self.table.setAlternatingRowColors(True)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         self.table.setShowGrid(False)
+        self.table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_row_menu)
+        self.table.doubleClicked.connect(
+            lambda idx: self._open_file_location(idx.row()))
         layout.addWidget(self.table, 1)
 
         # Progress panel: large, always visible while working
@@ -638,6 +690,7 @@ class MainWindow(QMainWindow):
         self.videos_cb.setChecked(self.settings.value("videos", True, type=bool))
         self._select_strategy(self.settings.value(
             "strategy", self.settings.value("pattern_key", DEFAULT_STRATEGY_KEY)))
+        self._restore_column_widths()
 
     def _save_settings(self):
         self.settings.setValue("source_dir", self.source_card.edit.text())
@@ -648,9 +701,11 @@ class MainWindow(QMainWindow):
         self.settings.setValue("images", self.images_cb.isChecked())
         self.settings.setValue("videos", self.videos_cb.isChecked())
         self.settings.setValue("strategy", self._selected_strategy())
+        self._save_column_widths()
 
     def closeEvent(self, event):
         self._save_settings()
+        self.settings.setValue("geometry", self.saveGeometry())
         super().closeEvent(event)
 
     # -------------------------------------------------------------- actions
@@ -716,6 +771,7 @@ class MainWindow(QMainWindow):
             self._goto_step(0)
             return
         self._set_busy(True, "Looking at your photos…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         self._show_progress_panel("Scanning files…", indeterminate=True)
         self._throughput.reset()
         self.progress_status.setText("Counting files…")
@@ -764,33 +820,152 @@ class MainWindow(QMainWindow):
         self.progress_panel.setVisible(False)
 
     def _on_plan_ready(self, plan: list):
+        QApplication.restoreOverrideCursor()
         self.plan = plan
+        self.excluded.clear()
         self._set_busy(False)
         self._hide_progress_panel()
-        self._populate_table(plan)
-        dupes = sum(1 for p in plan if p.is_duplicate)
-        undated = sum(1 for p in plan if not p.capture.found and not p.is_duplicate)
-        folders = len({p.destination.parent for p in plan if p.destination})
-        dupe_txt = ("1 exact duplicate will be skipped" if dupes == 1
-                    else f"{dupes} exact duplicates will be skipped")
-        undated_txt = ("1 without a date" if undated == 1
-                       else f"{undated} without a date")
-        self.plan_summary.setText(
-            f"{len(plan)} files · {folders} folders · {dupe_txt} · {undated_txt}")
+        self._refresh_table()
+        self._refresh_summary()
         self.status_label.setText("Plan ready — take a look, then press "
                                   "\"Organize now\".")
-        self.organize_btn.setEnabled(bool(plan))
+        self.organize_btn.setEnabled(bool(self._active_plan()))
 
-    def _populate_table(self, plan: list):
+    def _active_plan(self) -> list:
+        """Plan rows not excluded by the user (duplicates already flagged)."""
+        return [p for p in self.plan if str(p.source) not in self.excluded]
+
+    def _refresh_summary(self):
+        if not self.plan:
+            self.plan_summary.setText(
+                "No files found — nothing to organize.")
+            return
+        active = self._active_plan()
+        total_bytes = sum(p.size for p in active)
+        copy_bytes = sum(p.size for p in active
+                         if not p.is_duplicate and p.destination)
+        dupes = sum(1 for p in active if p.is_duplicate)
+        undated = sum(1 for p in active
+                      if not p.capture.found and not p.is_duplicate)
+        folders = len({p.destination.parent for p in active if p.destination})
+        excl = len(self.excluded)
+        parts = [f"{len(active):,} files",
+                 f"{format_bytes(total_bytes)} total",
+                 "1 folder" if folders == 1 else f"{folders} folders"]
+        if dupes:
+            parts.append("1 exact duplicate will be skipped" if dupes == 1
+                         else f"{dupes} exact duplicates will be skipped")
+        if undated:
+            parts.append("1 without a date" if undated == 1
+                         else f"{undated} without a date")
+        if excl:
+            parts.append(f"{excl} excluded")
+        parts.append(f"{format_bytes(copy_bytes)} to copy")
+        self.plan_summary.setText("  ·  ".join(parts))
+
+    # ----------------------------------------------------- sorting & columns
+
+    def _on_header_clicked(self, col: int):
+        if not self.plan:
+            return
+        if self._sort_col == col:
+            self._sort_desc = not self._sort_desc
+        else:
+            self._sort_col, self._sort_desc = col, False
+        self.table.horizontalHeader().setSortIndicator(
+            col, Qt.DescendingOrder if self._sort_desc else Qt.AscendingOrder)
+        self._refresh_table()
+
+    def _save_column_widths(self):
+        header = self.table.horizontalHeader()
+        widths = [header.sectionSize(c) for c in range(5)]
+        self.settings.setValue("col_widths", widths)
+        self.settings.setValue("sort_col", self._sort_col)
+        self.settings.setValue("sort_desc", self._sort_desc)
+
+    def _restore_column_widths(self):
+        widths = self.settings.value("col_widths")
+        if widths:
+            header = self.table.horizontalHeader()
+            for col in range(5):
+                try:
+                    w = int(widths[col])
+                except (IndexError, TypeError, ValueError):
+                    continue
+                if w >= 70 and header.sectionResizeMode(col) != QHeaderView.Stretch:
+                    header.resizeSection(col, w)
+        self._sort_col = int(self.settings.value("sort_col", -1, type=int))
+        self._sort_desc = self.settings.value("sort_desc", False, type=bool)
+        if 0 <= self._sort_col < 5:
+            self.table.horizontalHeader().setSortIndicator(
+                self._sort_col,
+                Qt.DescendingOrder if self._sort_desc else Qt.AscendingOrder)
+
+    # --------------------------------------------------------- row actions
+
+    def _item_at_row(self, row: int):
+        if 0 <= row < len(self._view):
+            return self._view[row]
+        return None
+
+    def _open_file_location(self, row: int):
+        item = self._item_at_row(row)
+        if item is None:
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(item.source.parent)))
+
+    def _set_excluded(self, item, excluded: bool):
+        key = str(item.source)
+        if excluded:
+            self.excluded.add(key)
+        else:
+            self.excluded.discard(key)
+        self._refresh_table()
+        self._refresh_summary()
+        self.organize_btn.setEnabled(bool(self._active_plan()))
+
+    def _on_row_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        item = self._item_at_row(row)
+        if item is None:
+            return
+        is_excluded = str(item.source) in self.excluded
+        menu = QMenu(self)
+        open_action = menu.addAction(
+            icons.icon("external-link", theme.TEXT_DIM, 14),
+            "Open file location")
+        menu.addSeparator()
+        exclude_action = menu.addAction(
+            icons.icon("x", theme.RED, 14) if not is_excluded
+            else icons.icon("check", theme.GREEN, 14),
+            "Include in plan" if is_excluded else "Exclude from plan")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(pos))
+        if chosen is open_action:
+            self._open_file_location(row)
+        elif chosen is exclude_action:
+            self._set_excluded(item, not is_excluded)
+
+    def _refresh_table(self):
+        """(Re)fill the preview table in the current sort/view order."""
+        plan = self.plan
+        if 0 <= self._sort_col < 5 and plan:
+            view = sorted_plan_items(plan, _COL_KEYS[self._sort_col],
+                                     self._sort_desc)
+        else:
+            view = list(plan)
+        self._view = view
         dest_root = self.dest_card.edit.text().strip()
-        self.table.setSortingEnabled(False)
+        dim = QColor(theme.TEXT_FAINT)
         self.table.setRowCount(0)
-        self.table.setRowCount(len(plan))
-        for row, item in enumerate(plan):
+        self.table.setRowCount(len(view))
+        for row, item in enumerate(view):
+            is_excluded = str(item.source) in self.excluded
             kind_icon = "film" if item.kind == "video" else "image"
             name_item = QTableWidgetItem(item.source.name)
-            name_item.setIcon(icons.icon(kind_icon, theme.TEXT_DIM, 14))
-            name_item.setToolTip(str(item.source))
+            name_item.setIcon(icons.icon(
+                kind_icon, theme.TEXT_FAINT if is_excluded else theme.TEXT_DIM, 14))
+            name_item.setToolTip(str(item.source) +
+                                 ("\n(excluded from plan)" if is_excluded else ""))
             self.table.setItem(row, COL_NAME, name_item)
 
             if item.is_duplicate:
@@ -824,8 +999,18 @@ class MainWindow(QMainWindow):
             size_item = QTableWidgetItem(_fmt_size(item.size))
             size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.table.setItem(row, COL_SIZE, size_item)
-        self.table.setSortingEnabled(True)
+
+            if is_excluded:
+                for col in range(5):
+                    cell = self.table.item(row, col)
+                    if cell:
+                        cell.setForeground(dim)
         self._apply_filter(self.filter_edit.text())
+
+    # backwards-compatible alias (used by older tools/tests)
+    def _populate_table(self, plan: list):
+        self.plan = plan
+        self._refresh_table()
 
     def _apply_filter(self, text: str):
         needle = text.strip().lower()
@@ -842,17 +1027,19 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------- organize
 
     def start_organize(self):
-        if not self.plan:
+        active = self._active_plan()
+        if not active:
             return
         options = self._options()
         if options is None:
             return
         self._set_busy(True, "Organizing…")
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         self._throughput.reset()
         self._show_progress_panel("Organizing your photos…", indeterminate=False)
         self.progress_status.setText("Getting ready…")
         self.progress_detail.setText("")
-        self.org_worker = OrganizeWorker(self.plan, options, self)
+        self.org_worker = OrganizeWorker(active, options, self)
         self.org_worker.progress.connect(self._on_org_progress)
         self.org_worker.finished_run.connect(self._on_run_finished)
         self.org_worker.failed.connect(self._on_worker_failed)
@@ -881,6 +1068,7 @@ class MainWindow(QMainWindow):
             f"Organizing {min(i + 1, total):,} of {total:,}{current}")
 
     def _on_run_finished(self, log, summary: dict):
+        QApplication.restoreOverrideCursor()
         self._set_busy(False)
         self._hide_progress_panel()
         self.plan = []
@@ -963,7 +1151,7 @@ class MainWindow(QMainWindow):
     # -------------------------------------------------------------- helpers
 
     def _set_busy(self, busy: bool, message: str = ""):
-        self.organize_btn.setEnabled(not busy and bool(self.plan))
+        self.organize_btn.setEnabled(not busy and bool(self._active_plan()))
         self.cancel_btn.setEnabled(busy)
         self.next_btn.setEnabled(not busy)
         self.back_btn.setEnabled(not busy)
@@ -971,6 +1159,7 @@ class MainWindow(QMainWindow):
             self.status_label.setText(message)
 
     def _on_worker_failed(self, message: str):
+        QApplication.restoreOverrideCursor()
         self._set_busy(False)
         self._hide_progress_panel()
         QMessageBox.critical(self, APP_NAME, f"Something went wrong:\n{message}")
