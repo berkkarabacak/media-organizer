@@ -12,7 +12,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QSettings, QRectF
 from PySide6.QtCore import QUrl
 from PySide6.QtGui import (
-    QAction, QColor, QDesktopServices, QPainter, QPainterPath, QPen, QPixmap,
+    QAction, QColor, QDesktopServices, QPainter, QPen,
 )
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QDialogButtonBox, QFileDialog, QFrame,
@@ -29,7 +29,7 @@ from ..core.metadata import Confidence, DateSource
 from ..core.organizer import STRATEGIES, OrganizeOptions
 from ..core.plan import load_log, undo_log
 from ..core.strategies import DEFAULT_STRATEGY_KEY
-from . import theme
+from . import icons, theme
 from .workers import OrganizeWorker, ScanWorker
 
 _CONFIDENCE_COLORS = {
@@ -61,54 +61,15 @@ def _fmt_size(n: int) -> str:
     return f"{n} B"
 
 
-def _icon_pixmap(kind: str, size: int = 44) -> QPixmap:
-    """Hand-drawn amber line icons (photo / folder), no font dependency."""
-    dpr = 2
-    pm = QPixmap(size * dpr, size * dpr)
-    pm.fill(Qt.transparent)
-    pm.setDevicePixelRatio(dpr)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    # tinted disc background
-    p.setPen(Qt.NoPen)
-    p.setBrush(QColor(theme.AMBER_TINT))
-    p.drawEllipse(QRectF(1, 1, size - 2, size - 2))
-    amber = QPen(QColor(theme.AMBER), 2.0, Qt.SolidLine,
-                 Qt.RoundCap, Qt.RoundJoin)
-    p.setPen(amber)
-    p.setBrush(Qt.NoBrush)
-    m = size * 0.24  # margin of the glyph inside the disc
-    if kind == "photo":
-        frame = QRectF(m, m, size - 2 * m, size - 2 * m)
-        p.drawRoundedRect(frame, 4, 4)
-        # sun
-        p.drawEllipse(QRectF(size * 0.60, size * 0.32, size * 0.10, size * 0.10))
-        # mountain ridge
-        path = QPainterPath()
-        path.moveTo(m + 2, size - m - 3)
-        path.lineTo(size * 0.46, size * 0.52)
-        path.lineTo(size * 0.58, size * 0.66)
-        path.lineTo(size * 0.66, size * 0.58)
-        path.lineTo(size - m - 2, size - m - 3)
-        p.drawPath(path)
-    else:  # folder
-        path = QPainterPath()
-        x0, y0 = m, size * 0.34
-        x1, y1 = size - m, size - m
-        path.moveTo(x0, y0 + 3)
-        path.lineTo(x0, y1 - 3)
-        path.quadTo(x0, y1, x0 + 3, y1)
-        path.lineTo(x1 - 3, y1)
-        path.quadTo(x1, y1, x1, y1 - 3)
-        path.lineTo(x1, y0 + 6)
-        path.quadTo(x1, y0 + 3, x1 - 3, y0 + 3)
-        path.lineTo(size * 0.55, y0 + 3)
-        path.lineTo(size * 0.48, y0)
-        path.lineTo(x0 + 3, y0)
-        path.quadTo(x0, y0, x0, y0 + 3)
-        p.drawPath(path)
-    p.end()
-    return pm
+def _badge(icon_name: str, badge_px: int = 44, icon_px: int = 20,
+           color: str = theme.AMBER) -> QLabel:
+    """Amber-tinted rounded badge holding a centered SVG icon."""
+    label = QLabel()
+    label.setObjectName("iconBadge")
+    label.setFixedSize(badge_px, badge_px)
+    label.setAlignment(Qt.AlignCenter)
+    label.setPixmap(icons.pixmap(icon_name, color, icon_px))
+    return label
 
 
 class _StepIndicator(QWidget):
@@ -166,7 +127,7 @@ class _StepIndicator(QWidget):
 
 
 class _FolderCard(QFrame):
-    """Drop-zone style folder picker with painted icon and pill path field."""
+    """Drop-zone style folder picker with icon badge and pill path field."""
 
     def __init__(self, icon: str, question: str, hint: str, button_text: str,
                  parent=None):
@@ -177,10 +138,10 @@ class _FolderCard(QFrame):
         layout.setSpacing(12)
 
         top = QHBoxLayout()
-        icon_label = QLabel()
-        icon_label.setPixmap(_icon_pixmap(icon))
-        top.addWidget(icon_label)
+        top.setSpacing(16)
+        top.addWidget(_badge(icon, badge_px=52, icon_px=26))
         text_col = QVBoxLayout()
+        text_col.setSpacing(3)
         q = QLabel(question)
         q.setObjectName("cardQuestion")
         h = QLabel(hint)
@@ -195,19 +156,21 @@ class _FolderCard(QFrame):
         self.edit = QLineEdit()
         self.edit.setPlaceholderText("No folder chosen yet")
         self.button = QPushButton(button_text)
+        self.button.setIcon(icons.icon("folder-open", theme.TEXT, 15))
         row.addWidget(self.edit, 1)
         row.addWidget(self.button)
         layout.addLayout(row)
 
         self.chip = QPushButton()
         self.chip.setObjectName("chip")
+        self.chip.setIcon(icons.icon("sparkles", theme.AMBER_HOVER, 13))
         self.chip.setVisible(False)
         self.chip.setCursor(Qt.PointingHandCursor)
         layout.addWidget(self.chip, 0, Qt.AlignLeft)
 
 
 class _StrategyCard(QFrame):
-    """Selectable strategy card (radio-button semantics for compatibility)."""
+    """Selectable strategy card with a distinct icon badge."""
 
     def __init__(self, strategy, parent=None):
         super().__init__(parent)
@@ -219,8 +182,10 @@ class _StrategyCard(QFrame):
         self.on_toggled = None  # set by MainWindow
 
         row = QHBoxLayout(self)
-        row.setContentsMargins(18, 12, 18, 12)
+        row.setContentsMargins(16, 12, 18, 12)
         row.setSpacing(14)
+        row.addWidget(_badge(icons.STRATEGY_ICONS.get(strategy.key, "calendar"),
+                             badge_px=42, icon_px=20))
         text_col = QVBoxLayout()
         text_col.setSpacing(6)
         name = QLabel(strategy.name)
@@ -270,9 +235,15 @@ class AboutDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 22, 24, 18)
         layout.setSpacing(10)
-        title = QLabel(f"◆ {APP_NAME}")
+        title_row = QHBoxLayout()
+        logo = QLabel()
+        logo.setPixmap(icons.pixmap("diamond", theme.AMBER, 20))
+        title_row.addWidget(logo)
+        title = QLabel(APP_NAME)
         title.setObjectName("wordmark")
-        layout.addWidget(title)
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        layout.addLayout(title_row)
         ver = QLabel(f"Version {__version__}")
         ver.setObjectName("muted")
         layout.addWidget(ver)
@@ -321,16 +292,18 @@ class MainWindow(QMainWindow):
 
     def _build_menu(self):
         file_menu = self.menuBar().addMenu("&File")
-        undo_action = QAction("Undo last run…", self)
+        undo_action = QAction(icons.icon("undo", theme.TEXT_DIM, 14),
+                              "Undo last run…", self)
         undo_action.triggered.connect(self.undo_last_run)
         file_menu.addAction(undo_action)
         file_menu.addSeparator()
-        quit_action = QAction("E&xit", self)
+        quit_action = QAction(icons.icon("x", theme.TEXT_DIM, 14), "E&xit", self)
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
         help_menu = self.menuBar().addMenu("&Help")
-        about_action = QAction(f"About {APP_NAME}", self)
+        about_action = QAction(icons.icon("info", theme.TEXT_DIM, 14),
+                               f"About {APP_NAME}", self)
         about_action.triggered.connect(lambda: AboutDialog(self).exec())
         help_menu.addAction(about_action)
 
@@ -340,15 +313,19 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Header bar: wordmark + version left, step indicator right
+        # Header bar: logo + wordmark + version left, step indicator right
         header = QFrame()
         header.setObjectName("headerBar")
         h = QHBoxLayout(header)
         h.setContentsMargins(24, 14, 24, 14)
-        wordmark = QLabel(f"◆ {APP_NAME}")
+        logo = QLabel()
+        logo.setPixmap(icons.pixmap("diamond", theme.AMBER, 20))
+        wordmark = QLabel(APP_NAME)
         wordmark.setObjectName("wordmark")
         version = QLabel(f"v{__version__}")
         version.setObjectName("versionLabel")
+        h.addWidget(logo)
+        h.addSpacing(8)
         h.addWidget(wordmark)
         h.addSpacing(8)
         h.addWidget(version, 0, Qt.AlignBottom)
@@ -370,10 +347,12 @@ class MainWindow(QMainWindow):
 
         # Bottom navigation
         nav = QHBoxLayout()
-        self.back_btn = QPushButton("← Back")
+        self.back_btn = QPushButton("Back")
+        self.back_btn.setIcon(icons.icon("arrow-left", theme.TEXT, 15))
         self.back_btn.clicked.connect(self._go_back)
-        self.next_btn = QPushButton("Continue →")
+        self.next_btn = QPushButton("Continue")
         self.next_btn.setObjectName("primaryButton")
+        self.next_btn.setIcon(icons.icon("arrow-right", "#1A1206", 15))
         self.next_btn.clicked.connect(self._go_next)
         nav.addWidget(self.back_btn)
         nav.addStretch(1)
@@ -408,7 +387,7 @@ class MainWindow(QMainWindow):
         layout.addSpacing(4)
 
         self.source_card = _FolderCard(
-            "photo",
+            "image",
             "Where are your messy photos?",
             "The folder (and its subfolders) with the photos and videos "
             "you want to sort.",
@@ -418,7 +397,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.source_card)
 
         self.dest_card = _FolderCard(
-            "folder",
+            "folder-input",
             "Where should organized copies go?",
             "Your files are copied here, neatly sorted. Nothing is "
             "overwritten or deleted from the original folder.",
@@ -464,10 +443,13 @@ class MainWindow(QMainWindow):
 
         # Advanced options (collapsed by default)
         self.advanced_toggle = QToolButton()
-        self.advanced_toggle.setText("Advanced options ▾")
+        self.advanced_toggle.setText("Advanced options")
         self.advanced_toggle.setCheckable(True)
         self.advanced_toggle.setChecked(False)
         self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.advanced_toggle.setIcon(icons.icon("chevron-down",
+                                                theme.AMBER_HOVER, 14))
+        self.advanced_toggle.toggled.connect(self._on_advanced_toggled)
         layout.addWidget(self.advanced_toggle)
 
         self.advanced_panel = QFrame()
@@ -497,10 +479,14 @@ class MainWindow(QMainWindow):
         types_row.addStretch(1)
         adv.addLayout(types_row)
         self.advanced_panel.setVisible(False)
-        self.advanced_toggle.toggled.connect(self.advanced_panel.setVisible)
         layout.addWidget(self.advanced_panel)
         layout.addStretch(1)
         return page
+
+    def _on_advanced_toggled(self, on: bool):
+        self.advanced_panel.setVisible(on)
+        self.advanced_toggle.setIcon(icons.icon(
+            "chevron-up" if on else "chevron-down", theme.AMBER_HOVER, 14))
 
     def _selected_strategy(self) -> str:
         for radio in self.strategy_radios:
@@ -529,6 +515,9 @@ class MainWindow(QMainWindow):
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("Filter…")
         self.filter_edit.setMaximumWidth(260)
+        self.filter_edit.addAction(
+            icons.icon("search", theme.TEXT_FAINT, 14),
+            QLineEdit.LeadingPosition)
         self.filter_edit.textChanged.connect(self._apply_filter)
         top.addWidget(self.filter_edit)
         layout.addLayout(top)
@@ -568,21 +557,35 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setTextVisible(False)
         pp.addWidget(self.progress)
+        status_row = QHBoxLayout()
+        status_row.setSpacing(8)
+        status_icon = QLabel()
+        status_icon.setPixmap(icons.pixmap("gauge", theme.TEXT_DIM, 15))
+        status_row.addWidget(status_icon)
         self.progress_status = QLabel("")
-        pp.addWidget(self.progress_status)
+        status_row.addWidget(self.progress_status, 1)
+        pp.addLayout(status_row)
+        eta_row = QHBoxLayout()
+        eta_row.setSpacing(8)
+        eta_icon = QLabel()
+        eta_icon.setPixmap(icons.pixmap("clock", theme.TEXT_DIM, 15))
+        eta_row.addWidget(eta_icon)
         self.progress_detail = QLabel("")
         self.progress_detail.setObjectName("progressEta")
-        pp.addWidget(self.progress_detail)
+        eta_row.addWidget(self.progress_detail, 1)
+        pp.addLayout(eta_row)
         self.progress_panel.setVisible(False)
         layout.addWidget(self.progress_panel)
 
         actions = QHBoxLayout()
-        self.organize_btn = QPushButton("✔  Organize now")
+        self.organize_btn = QPushButton("Organize now")
         self.organize_btn.setObjectName("primaryButton")
+        self.organize_btn.setIcon(icons.icon("play", "#1A1206", 15))
         self.organize_btn.setEnabled(False)
         self.organize_btn.clicked.connect(self.start_organize)
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.setObjectName("dangerButton")
+        self.cancel_btn.setIcon(icons.icon("x", theme.RED, 15))
         self.cancel_btn.setEnabled(False)
         self.cancel_btn.clicked.connect(self.cancel_work)
         actions.addWidget(self.organize_btn)
@@ -599,9 +602,9 @@ class MainWindow(QMainWindow):
         self.back_btn.setEnabled(index > 0)
         self.next_btn.setVisible(index < 2)
         if index == 0:
-            self.next_btn.setText("Continue →")
+            self.next_btn.setText("Continue")
         elif index == 1:
-            self.next_btn.setText("Check the plan →")
+            self.next_btn.setText("Check the plan")
 
     def _go_back(self):
         if self._busy():
@@ -760,22 +763,29 @@ class MainWindow(QMainWindow):
         self.table.setRowCount(0)
         self.table.setRowCount(len(plan))
         for row, item in enumerate(plan):
+            kind_icon = "film" if item.kind == "video" else "image"
             name_item = QTableWidgetItem(item.source.name)
+            name_item.setIcon(icons.icon(kind_icon, theme.TEXT_DIM, 14))
             name_item.setToolTip(str(item.source))
             self.table.setItem(row, COL_NAME, name_item)
 
             if item.is_duplicate:
                 date_text, src_text = "duplicate", "exact duplicate (same content)"
                 conf = Confidence.LOW
+                src_icon = "copy"
             elif item.capture.found:
                 date_text = item.capture.date.strftime("%Y-%m-%d %H:%M:%S")
                 src_text = _SOURCE_LABELS[item.capture.source]
                 conf = item.capture.confidence
+                src_icon = icons.SOURCE_ICONS.get(
+                    item.capture.source.value, "file-text")
             else:
                 date_text, src_text, conf = "—", "no date found", Confidence.LOW
+                src_icon = "alert-triangle"
             self.table.setItem(row, COL_DATE, QTableWidgetItem(date_text))
 
-            src_item = QTableWidgetItem(f"● {src_text}")
+            src_item = QTableWidgetItem(src_text)
+            src_item.setIcon(icons.icon(src_icon, _CONFIDENCE_COLORS[conf], 13))
             src_item.setForeground(QColor(_CONFIDENCE_COLORS[conf]))
             src_item.setToolTip(item.capture.detail)
             self.table.setItem(row, COL_SOURCE, src_item)
@@ -862,7 +872,7 @@ class MainWindow(QMainWindow):
 
         box = QMessageBox(self)
         box.setWindowTitle(f"{APP_NAME} — Done")
-        box.setIcon(QMessageBox.Information)
+        box.setIconPixmap(icons.pixmap("check-circle", theme.GREEN, 44))
         text = f"Done! {done_n} photos/videos {mode} into {folders} folders."
         details = []
         if summary["skipped_duplicates"]:
@@ -877,7 +887,9 @@ class MainWindow(QMainWindow):
             text += "\n\n" + "\n".join(f"• {d}" for d in details)
         box.setText(text)
         open_btn = box.addButton("Open folder", QMessageBox.AcceptRole)
+        open_btn.setIcon(icons.icon("external-link", theme.TEXT, 14))
         undo_btn = box.addButton("Undo", QMessageBox.DestructiveRole)
+        undo_btn.setIcon(icons.icon("undo", theme.TEXT, 14))
         box.addButton(QMessageBox.Close)
         box.exec()
         clicked = box.clickedButton()

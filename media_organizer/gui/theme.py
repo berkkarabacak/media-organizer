@@ -86,6 +86,11 @@ QLabel#cardQuestion {{
     color: {TEXT};
 }}
 QLabel#cardHint {{ color: {TEXT_DIM}; }}
+QLabel#iconBadge {{
+    background: rgba(217, 158, 63, 0.10);
+    border: 1px solid rgba(217, 158, 63, 0.22);
+    border-radius: 12px;
+}}
 
 /* --------------------------------------------------- strategy cards */
 QFrame#strategyCard {{

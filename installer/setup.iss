@@ -2,7 +2,7 @@
 ; Build after PyInstaller:  iscc installer\setup.iss
 
 #define MyAppName "Media Organizer"
-#define MyAppVersion "1.2.0"
+#define MyAppVersion "1.3.0"
 #define MyAppPublisher "MediaOrganizer"
 #define MyAppExeName "MediaOrganizer.exe"
 #define MyAppIcon "media_organizer.ico"
