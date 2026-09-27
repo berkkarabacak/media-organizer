@@ -1,1 +1,1 @@
-"""PySide6 GUI for Media Organizer."""
+"""PySide6 GUI: main window, workers, theme, icons."""

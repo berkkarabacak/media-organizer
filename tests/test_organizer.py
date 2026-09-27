@@ -5,7 +5,8 @@ from datetime import datetime
 from pathlib import Path
 
 from media_organizer.core.executor import execute_plan
-from media_organizer.core.organizer import OrganizeOptions, build_plan
+from media_organizer.core.organizer import (OrganizeOptions, build_plan,
+                                            count_media_files)
 from media_organizer.core.plan import load_log, undo_log
 from tests.helpers import make_jpeg_with_exif, make_jpeg_with_gps
 
@@ -106,6 +107,28 @@ class TestBuildPlanStrategies:
         _photo(dst / "already_there.jpg")
         plan = build_plan(_options(src, dst))
         assert plan == []
+
+
+class TestPreCount:
+    def test_count_media_files(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        _photo(src / "a.jpg")
+        _photo(src / "b.jpg")
+        (src / "notes.txt").write_text("not media")
+        (src / "sub").mkdir()
+        _photo(src / "sub" / "c.jpg")
+        options = _options(src, tmp_path / "dst")
+        assert count_media_files(options) == 3
+
+    def test_count_respects_nonrecursive(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        _photo(src / "a.jpg")
+        (src / "sub").mkdir()
+        _photo(src / "sub" / "b.jpg")
+        options = _options(src, tmp_path / "dst", recursive=False)
+        assert count_media_files(options) == 1
 
 
 class TestExecutePlan:

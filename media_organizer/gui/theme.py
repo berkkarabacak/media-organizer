@@ -173,6 +173,7 @@ QPushButton#chip {{
     font-size: 12px;
 }}
 QPushButton#chip:hover {{ background: rgba(217, 158, 63, 0.18); }}
+QPushButton#chip:disabled {{ color: {GREEN}; border-color: rgba(95, 168, 124, 0.35); background: rgba(95, 168, 124, 0.08); }}
 
 /* -------------------------------------------------------------- inputs */
 QLineEdit {{

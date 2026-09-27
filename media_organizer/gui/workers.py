@@ -9,16 +9,22 @@ from PySide6.QtCore import QThread, Signal
 
 from ..core.duplicates import find_duplicates
 from ..core.executor import execute_plan
-from ..core.organizer import OrganizeOptions, PlannedFile, build_plan, scan_media_files
+from ..core.organizer import (OrganizeOptions, PlannedFile, build_plan,
+                              count_media_files, scan_media_files)
 
 #: Minimum interval between progress signal emissions (keeps the UI smooth).
 PROGRESS_INTERVAL_S = 0.15
 
 
 class ScanWorker(QThread):
-    """Builds the organise plan off the UI thread."""
+    """Builds the organise plan off the UI thread.
 
-    progress = Signal(int, str)
+    Emits determinate progress: a fast pre-count pass establishes the total,
+    then hashing (if duplicate-skip is on) + planning report files done.
+    """
+
+    # done, total, current_name — total == 0 means "counting, indeterminate"
+    progress = Signal(int, int, str)
     finished_plan = Signal(list)          # list[PlannedFile]
     failed = Signal(str)
 
@@ -37,27 +43,41 @@ class ScanWorker(QThread):
 
             last_emit = [0.0]
 
-            def on_progress(i, name):
+            def emit(done, total, name, force=False):
                 now = time.monotonic()
-                if now - last_emit[0] < PROGRESS_INTERVAL_S:
+                if not force and now - last_emit[0] < PROGRESS_INTERVAL_S:
                     return
                 last_emit[0] = now
-                self.progress.emit(i, name)
+                self.progress.emit(done, total, name)
+
+            # Phase 0: fast pre-count so the bar can be determinate
+            self.progress.emit(0, 0, "Counting files…")
+            total = count_media_files(self.options)
+            if is_cancelled():
+                self.finished_plan.emit([])
+                return
 
             duplicates = set()
             if self.options.skip_duplicates:
                 files = list(scan_media_files(self.options))
+                grand_total = 2 * max(len(files), total)
                 duplicates = find_duplicates(
                     files,
-                    progress=lambda i, n: on_progress(i, f"Hashing {n}"),
+                    progress=lambda i, n: emit(i, grand_total, n),
                     cancel=is_cancelled,
                 )
+                offset = len(files)
+            else:
+                grand_total = total
+                offset = 0
+
             plan = build_plan(
                 self.options,
                 duplicates=duplicates,
-                progress=on_progress,
+                progress=lambda i, n: emit(offset + i, grand_total, n),
                 cancel=is_cancelled,
             )
+            emit(grand_total, grand_total, "", force=True)
             self.finished_plan.emit(plan)
         except Exception as exc:  # never crash the UI
             self.failed.emit(str(exc))

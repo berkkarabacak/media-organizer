@@ -1,6 +1,6 @@
 # Media Organizer
 
-**Version 1.1.0** — a Windows desktop app that sorts photos and videos into
+**Version 1.3.0** — a Windows desktop app that sorts photos and videos into
 tidy folders using their **real capture date** (embedded metadata), not the
 unreliable filesystem copy dates — or by **where they were taken** (GPS).
 
@@ -14,14 +14,14 @@ GPS location) and sorts everything into folders like `2024/07 July/`,
 The app guides you through three steps:
 
 1. **Choose your folders** — where the messy photos are, and where the
-   organized copies should go (suggested automatically).
+   organized copies should go (a suggestion chip offers `<source>_Organized`).
 2. **How should we sort them?** — pick a folder structure (see below).
    Advanced options (copy vs move, subfolders, duplicates, media types) are
    tucked away under *Advanced options*.
 3. **Check the plan** — review every file's destination in a preview table,
-   then press **Organize now**. A progress bar shows percent, files done,
-   current file, speed, and estimated time left. The completion dialog offers
-   **Undo** and **Open folder**.
+   then press **Organize now**. Both scanning and organizing show a determinate
+   progress bar with percent, files done/total, speed, and an ETA.
+   The completion dialog offers **Undo** and **Open folder**.
 
 ## Folder structures
 
@@ -62,17 +62,6 @@ Date detection fallback chain:
   completion dialog's **Undo** button restores it.
 - Corrupt/unreadable files are logged and skipped — the run never crashes.
 
-## What's new in 1.1.0
-
-- Friendly 3-step guided flow with plain language and bigger controls.
-- Seven folder structures, including flat monthly and GPS-location grouping
-  (offline city lookup, ~580 cities bundled).
-- Progress bar with percent, files done/total, throughput, and ETA.
-- Fixed the destination column showing only `C:\...`: it now shows the path
-  relative to the destination folder, with the full path as a tooltip.
-- Duplicate skipping is on by default and labelled "exact duplicates
-  (same content)".
-
 ## Running from source (developers)
 
 ```bat
@@ -92,7 +81,8 @@ including GPS), hand-built synthetic MP4 files (mvhd v0 and v1), every
 filename pattern, fallback ordering, every folder strategy (incl. quarter
 math and flat monthly), the nearest-city mapper, content-hash duplicate
 detection with renamed files, the ETA estimator, display helpers, collision
-handling, and undo-log round-trips. Core logic has no Qt imports.
+handling, undo-log round-trips, and offscreen QTest GUI click tests.
+Core logic has no Qt imports.
 
 ### Project layout
 
@@ -102,12 +92,16 @@ media_organizer/
   core/                     pure logic (no Qt): metadata, organizer,
                             strategies, geodata, duplicates, executor,
                             eta, display, plan (undo log)
-  gui/                      PySide6 UI: main window, workers, theme
-tests/                      pytest suite for all core logic
+  gui/                      PySide6 UI: main window, workers, theme, icons
+tests/                      pytest suite for all core logic + GUI clicks
+tools/
+  capture_ui.py             offscreen screenshot harness (ui_shots/)
+  verify_progress.py        offscreen progress/ETA verification
+  verify_user_flows.py      offscreen QTest user-flow verification
 installer/
   media_organizer.spec      PyInstaller spec (onedir, windowed)
   version_info.txt          exe version resource
-  media_organizer.ico       generated app icon (make_icon.py)
+  media_organizer.ico       app icon
   setup.iss                 Inno Setup 6 installer script
 ```
 
@@ -119,4 +113,4 @@ iscc installer\setup.iss
 ```
 
 Produces `dist\MediaOrganizer\MediaOrganizer.exe` and
-`installer\dist\MediaOrganizer-Setup-1.1.0.exe`.
+`installer\dist\MediaOrganizer-Setup-1.3.0.exe`.

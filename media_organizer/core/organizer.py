@@ -28,7 +28,8 @@ __all__ = [
     "IMAGE_EXTENSIONS", "VIDEO_EXTENSIONS", "MEDIA_EXTENSIONS",
     "STRATEGIES", "UNDATED_FOLDER", "UNKNOWN_LOCATION_FOLDER",
     "DEFAULT_STRATEGY_KEY", "get_strategy", "quarter_of",
-    "PlannedFile", "OrganizeOptions", "scan_media_files", "build_plan",
+    "PlannedFile", "OrganizeOptions", "scan_media_files", "count_media_files",
+    "build_plan",
 ]
 
 
@@ -65,6 +66,26 @@ class OrganizeOptions:
         if self.include_videos:
             exts |= VIDEO_EXTENSIONS
         return frozenset(exts)
+
+
+def count_media_files(options: OrganizeOptions) -> int:
+    """Fast pre-count of candidate media files (extension match only).
+
+    Used to make scan progress determinate: no per-file stat/metadata reads,
+    just one directory walk. Cheap even on large trees.
+    """
+    root = Path(options.source_dir)
+    exts = options.effective_extensions()
+    count = 0
+    if options.recursive:
+        walker = os.walk(root)
+    else:
+        walker = [(str(root), [], os.listdir(root) if root.is_dir() else [])]
+    for _dirpath, _dirnames, filenames in walker:
+        for name in filenames:
+            if Path(name).suffix.lower().lstrip(".") in exts:
+                count += 1
+    return count
 
 
 def scan_media_files(options: OrganizeOptions) -> Iterator[Path]:

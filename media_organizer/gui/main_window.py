@@ -49,9 +49,6 @@ _SOURCE_LABELS = {
 
 COL_NAME, COL_DATE, COL_SOURCE, COL_DEST, COL_SIZE = range(5)
 
-_STEP_TITLES = ("Choose your folders", "How should we sort them?",
-                "Check the plan")
-
 
 def _fmt_size(n: int) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -70,6 +67,54 @@ def _badge(icon_name: str, badge_px: int = 44, icon_px: int = 20,
     label.setAlignment(Qt.AlignCenter)
     label.setPixmap(icons.pixmap(icon_name, color, icon_px))
     return label
+
+
+class _ElideMiddleDelegate(QStyledItemDelegate):
+    """Paints long paths elided in the middle ('C:\\...\\file.jpg'), never
+    down to a bare drive prefix."""
+
+    def paint(self, painter, option, index):
+        text = index.data(Qt.DisplayRole) or ""
+        metrics = option.fontMetrics
+        width = option.rect.width() - 12
+        option.displayText = metrics.elidedText(text, Qt.ElideMiddle, width)
+        super().paint(painter, option, index)
+
+
+class AboutDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"About {APP_NAME}")
+        self.setMinimumWidth(420)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 22, 24, 18)
+        layout.setSpacing(10)
+        title_row = QHBoxLayout()
+        logo = QLabel()
+        logo.setPixmap(icons.pixmap("diamond", theme.AMBER, 20))
+        title_row.addWidget(logo)
+        title = QLabel(APP_NAME)
+        title.setObjectName("wordmark")
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        layout.addLayout(title_row)
+        ver = QLabel(f"Version {__version__}")
+        ver.setObjectName("muted")
+        layout.addWidget(ver)
+        about = QLabel(
+            "Sorts your photos and videos into tidy folders using their real "
+            "capture dates (EXIF, video metadata, file names) or the place "
+            "they were taken. Duplicates are detected by content "
+            "(SHA-256), never by file name."
+        )
+        about.setWordWrap(True)
+        layout.addWidget(about)
+        license_label = QLabel("License: <commercial license placeholder>")
+        license_label.setObjectName("muted")
+        layout.addWidget(license_label)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(self.accept)
+        layout.addWidget(buttons)
 
 
 class _StepIndicator(QWidget):
@@ -213,54 +258,6 @@ class _StrategyCard(QFrame):
         if event.button() == Qt.LeftButton:
             self.setChecked(True)
         super().mouseReleaseEvent(event)
-
-
-class _ElideMiddleDelegate(QStyledItemDelegate):
-    """Paints long paths elided in the middle ('C:\\...\\file.jpg'), never
-    down to a bare drive prefix."""
-
-    def paint(self, painter, option, index):
-        text = index.data(Qt.DisplayRole) or ""
-        metrics = option.fontMetrics
-        width = option.rect.width() - 12
-        option.displayText = metrics.elidedText(text, Qt.ElideMiddle, width)
-        super().paint(painter, option, index)
-
-
-class AboutDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle(f"About {APP_NAME}")
-        self.setMinimumWidth(420)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 22, 24, 18)
-        layout.setSpacing(10)
-        title_row = QHBoxLayout()
-        logo = QLabel()
-        logo.setPixmap(icons.pixmap("diamond", theme.AMBER, 20))
-        title_row.addWidget(logo)
-        title = QLabel(APP_NAME)
-        title.setObjectName("wordmark")
-        title_row.addWidget(title)
-        title_row.addStretch(1)
-        layout.addLayout(title_row)
-        ver = QLabel(f"Version {__version__}")
-        ver.setObjectName("muted")
-        layout.addWidget(ver)
-        about = QLabel(
-            "Sorts your photos and videos into tidy folders using their real "
-            "capture dates (EXIF, video metadata, file names) or the place "
-            "they were taken. Duplicates are detected by content "
-            "(SHA-256), never by file name."
-        )
-        about.setWordWrap(True)
-        layout.addWidget(about)
-        license_label = QLabel("License: <commercial license placeholder>")
-        license_label.setObjectName("muted")
-        layout.addWidget(license_label)
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
-        buttons.accepted.connect(self.accept)
-        layout.addWidget(buttons)
 
 
 class MainWindow(QMainWindow):
@@ -410,10 +407,13 @@ class MainWindow(QMainWindow):
         return page
 
     def _apply_dest_suggestion(self):
-        text = self.chip.property("suggestedPath") or ""
+        chip = self.dest_card.chip
+        text = chip.property("suggestedPath") or ""
         if text:
             self.dest_card.edit.setText(text)
-            self.dest_card.chip.setVisible(False)
+            chip.setText("Using suggested folder")
+            chip.setIcon(icons.icon("check", theme.GREEN, 13))
+            chip.setEnabled(False)
 
     # ------------------------------------------------------------- step 2
 
@@ -661,10 +661,13 @@ class MainWindow(QMainWindow):
             return
         edit.setText(path)
         if suggest_dest and not self.dest_card.edit.text().strip():
-            suggested = f"{path.rstrip('/\\\\')}_Organized"
-            self.dest_card.chip.setText(f"Use suggested:  {suggested}")
-            self.dest_card.chip.setProperty("suggestedPath", suggested)
-            self.dest_card.chip.setVisible(True)
+            suggested = path.rstrip("/\\") + "_Organized"
+            chip = self.dest_card.chip
+            chip.setEnabled(True)
+            chip.setIcon(icons.icon("sparkles", theme.AMBER_HOVER, 13))
+            chip.setText(f"Use suggested:  {suggested}")
+            chip.setProperty("suggestedPath", suggested)
+            chip.setVisible(True)
 
     def _validate_folders(self) -> bool:
         src = Path(self.source_card.edit.text().strip())
@@ -714,16 +717,37 @@ class MainWindow(QMainWindow):
             return
         self._set_busy(True, "Looking at your photos…")
         self._show_progress_panel("Scanning files…", indeterminate=True)
-        self.progress_status.setText("Reading your photos and videos…")
+        self._throughput.reset()
+        self.progress_status.setText("Counting files…")
         self.progress_detail.setText("")
         self.plan_summary.setText("Building the plan…")
         self.scan_worker = ScanWorker(options, self)
-        self.scan_worker.progress.connect(
-            lambda i, name: self.progress_status.setText(
-                f"Scanning files… {name}"))
+        self.scan_worker.progress.connect(self._on_scan_progress)
         self.scan_worker.finished_plan.connect(self._on_plan_ready)
         self.scan_worker.failed.connect(self._on_worker_failed)
         self.scan_worker.start()
+
+    def _on_scan_progress(self, done: int, total: int, name: str):
+        if total <= 0:
+            # still counting: keep the indeterminate bar
+            self.progress_status.setText(name or "Counting files…")
+            return
+        if self.progress.maximum() == 0:
+            # total known -> switch to a determinate bar
+            self.progress.setRange(0, 100)
+        done = min(done, total)
+        percent = int(100 * done / total) if total else 0
+        self.progress.setValue(percent)
+        self.progress_percent.setText(f"{percent}%")
+        self._throughput.add(done)  # files (works like bytes: just a counter)
+        rate = self._throughput.rate()
+        eta = self._throughput.eta_seconds(max(0, total - done))
+        current = f" · {name}" if name else ""
+        self.progress_status.setText(
+            f"Scanning {done:,} of {total:,} files{current}")
+        rate_txt = f"{rate:,.0f} files/s" if rate > 0 else "—"
+        self.progress_detail.setText(
+            f"{percent}%  ·  {rate_txt}  ·  {format_eta(eta)} left")
 
     def _show_progress_panel(self, title: str, indeterminate: bool = False):
         self.progress_title.setText(title)

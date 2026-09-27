@@ -1,12 +1,8 @@
 .venv/
-build/
-dist/
-installer/dist/
-tools/
-node_modules/
 __pycache__/
 *.pyc
 .pytest_cache/
-website/node_modules/
-website/dist/
-FastDelete/
+build/
+dist/
+installer/dist/
+tools/ui_shots/
