@@ -6,3 +6,5 @@ build/
 dist/
 installer/dist/
 tools/ui_shots/
+
+FastDelete/
