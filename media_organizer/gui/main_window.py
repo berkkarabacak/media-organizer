@@ -1211,7 +1211,11 @@ class MainWindow(QMainWindow):
         done_n = summary["copied"] + summary["moved"]
         folders = len({str(Path(op.destination).parent) for op in log.operations
                        if op.status == "done"})
-        self.status_label.setText(f"Finished: {done_n} {mode}.")
+        if summary.get("dry_run"):
+            self.status_label.setText(
+                f"Dry run finished — nothing was written ({done_n} would copy).")
+        else:
+            self.status_label.setText(f"Finished: {done_n} {mode}.")
 
         box = QMessageBox(self)
         dry = summary.get("dry_run", False)

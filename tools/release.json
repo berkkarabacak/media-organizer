@@ -1,7 +1,7 @@
 {
-  "tag_name": "v1.5.1",
-  "name": "Media Organizer 1.5.1",
-  "body": "**New option: uncertain dates.** When no real capture date can be found (no EXIF, no video metadata, no filename date), the app previously guessed from the file's modified date and sorted the file by it. Now you choose in Advanced options:\n- **Set them aside in an '_uncertain' folder (default)** — guesses never get misfiled into wrong dates\n- Use the file date anyway\n\nAlso fixes folder names showing in lowercase in the plan table on some systems.\n\n179 automated tests + 131 QA scenario checks, all passing.\n\nDownload **MediaOrganizer-Setup-1.5.1.exe** below.",
+  "tag_name": "v1.5.2",
+  "name": "Media Organizer 1.5.2",
+  "body": "**Real-desktop validated release.** The full app flow was driven end-to-end on the real running application (not just simulations): folder picking via the native dialog, suggestion chip, strategy selection, live plan table, filtering, dry run (verified zero writes), real organize (23 files into 15 folders, duplicates skipped, uncertain dates set aside), and undo (everything restored). 28/28 checks passed.\n\nOne small fix found during the drive: the status bar after a dry run now correctly says \"nothing was written\".\n\n179 automated tests + 131 QA scenario checks, all passing.\n\nDownload **MediaOrganizer-Setup-1.5.2.exe** below.",
   "draft": false,
   "prerelease": false
 }
