@@ -1,117 +1,117 @@
 {
-  "started_at": "2026-09-28T15:19:10",
+  "started_at": "2026-09-28T17:18:25",
   "dest_dir": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized",
-  "undone": true,
+  "undone": false,
   "operations": [
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\IMG-20220614-WA0031.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2022\\06 June\\IMG-20220614-WA0031.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2022\\Q2\\06 June\\IMG-20220614-WA0031.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\IMG-20220720-WA0004.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2022\\07 July\\IMG-20220720-WA0004.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2022\\Q3\\07 July\\IMG-20220720-WA0004.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\IMG-20231225-WA0012.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\12 December\\IMG-20231225-WA0012.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\Q4\\12 December\\IMG-20231225-WA0012.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\IMG_0001.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2024\\01 January\\IMG_0001.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2024\\Q1\\01 January\\IMG_0001.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\IMG_1100.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\01 January\\IMG_1100.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\Q1\\01 January\\IMG_1100.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\IMG_2211.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\07 July\\IMG_2211.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\Q3\\07 July\\IMG_2211.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\IMG_4031.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2019\\07 July\\IMG_4031.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2019\\Q3\\07 July\\IMG_4031.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\IMG_4032.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2019\\07 July\\IMG_4032.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2019\\Q3\\07 July\\IMG_4032.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\IMG_5510.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2021\\08 August\\IMG_5510.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2021\\Q3\\08 August\\IMG_5510.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\IMG_7780.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2020\\12 December\\IMG_7780.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2020\\Q4\\12 December\\IMG_7780.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\IMG_9012.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2022\\06 June\\IMG_9012.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2022\\Q2\\06 June\\IMG_9012.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\PXL_20210302_121544.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2021\\03 March\\PXL_20210302_121544.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2021\\Q1\\03 March\\PXL_20210302_121544.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\VID_20201225_094410.mp4",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2020\\12 December\\VID_20201225_094410.mp4",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2020\\Q4\\12 December\\VID_20201225_094410.mp4",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\VID_20230730_221101.mp4",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\07 July\\VID_20230730_221101.mp4",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\Q3\\07 July\\VID_20230730_221101.mp4",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\birthday_party.mp4",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2022\\06 June\\birthday_party.mp4",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2022\\Q2\\06 June\\birthday_party.mp4",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\holiday_final.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2022\\10 October\\holiday_final.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2022\\Q4\\10 October\\holiday_final.jpg",
       "status": "done",
       "error": ""
     },
@@ -125,14 +125,14 @@
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\istanbul_bosphorus.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\05 May\\istanbul_bosphorus.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\Q2\\05 May\\istanbul_bosphorus.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\istanbul_galata.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\05 May\\istanbul_galata.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2023\\Q2\\05 May\\istanbul_galata.jpg",
       "status": "done",
       "error": ""
     },
@@ -153,14 +153,14 @@
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\old phone dump\\camera\\IMG-20210910-WA0007.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2021\\09 September\\IMG-20210910-WA0007.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2021\\Q3\\09 September\\IMG-20210910-WA0007.jpg",
       "status": "done",
       "error": ""
     },
     {
       "action": "copy",
       "source": "C:\\Users\\OdinLocal\\Documents\\kimi\\Workspaces\\MediaOrganizer\\demo-library\\old phone dump\\camera\\IMG_20180822_193012.jpg",
-      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2018\\08 August\\IMG_20180822_193012.jpg",
+      "destination": "C:\\Users\\OdinLocal\\Documents\\Kimi\\Workspaces\\MediaOrganizer\\demo-library_Organized\\2018\\Q3\\08 August\\IMG_20180822_193012.jpg",
       "status": "done",
       "error": ""
     }

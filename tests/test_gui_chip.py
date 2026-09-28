@@ -101,6 +101,56 @@ class TestCorruptSettings:
         w2.deleteLater()
 
 
+class TestStrategyCardAccessibility:
+    def test_cards_are_focusable_buttons(self, window):
+        """Cards must be real focusable controls (a11y fix)."""
+        from PySide6.QtWidgets import QPushButton
+        for card in window.strategy_radios:
+            assert isinstance(card, QPushButton)
+            assert card.focusPolicy() == Qt.StrongFocus
+            assert card.isCheckable()
+
+    def test_tab_reaches_cards_and_space_selects(self, qapp, window):
+        """Keyboard: Tab into the cards, Space selects the focused one."""
+        window._goto_step(1)
+        qapp.processEvents()
+        target = window.strategy_radios[2]  # Year → Quarter
+        # walk the tab chain until a card has focus (bounded)
+        focused = None
+        for _ in range(40):
+            QTest.keyClick(window, Qt.Key_Tab)
+            qapp.processEvents()
+            fw = QApplication.focusWidget()
+            if fw in window.strategy_radios:
+                focused = fw
+                if fw is target:
+                    break
+        assert focused is not None, "Tab never reached a strategy card"
+        # move focus to the target card if needed
+        while QApplication.focusWidget() is not target:
+            QTest.keyClick(window, Qt.Key_Tab)
+            qapp.processEvents()
+        QTest.keyClick(target, Qt.Key_Space)
+        qapp.processEvents()
+        assert target.isChecked()
+        assert window._selected_strategy() == "year_quarter"
+        # radio semantics: others unchecked
+        assert sum(c.isChecked() for c in window.strategy_radios) == 1
+
+    def test_reclick_does_not_deselect(self, qapp, window):
+        card = window.strategy_radios[0]
+        card.click()
+        qapp.processEvents()
+        assert card.isChecked()
+        card.click()  # toggle-off attempt must reselect itself
+        qapp.processEvents()
+        assert card.isChecked()
+
+    def test_ui_texts_expose_accessible_name(self, window):
+        card = window.strategy_radios[0]
+        assert card.accessibleName() == "Year only"
+
+
 class TestSuggestionChip:
     def _show_chip(self, w, suggested="C:/Photos_Organized"):
         """Simulate the state right after the user picked a source folder."""

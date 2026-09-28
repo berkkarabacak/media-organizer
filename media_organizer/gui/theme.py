@@ -93,26 +93,34 @@ QLabel#iconBadge {{
 }}
 
 /* --------------------------------------------------- strategy cards */
-QFrame#strategyCard {{
+QPushButton#strategyCard {{
     background: {BG_PANEL};
     border: 1px solid {BORDER};
     border-radius: 12px;
+    /* neutralize the generic button chrome: the card is a container */
+    min-height: 0px;
+    padding: 0px;
+    font-weight: 400;
+    text-align: left;
 }}
-QFrame#strategyCard:hover {{
+QPushButton#strategyCard:hover {{
     background: {BG_HOVER};
     border-color: #34343C;
 }}
-QFrame#strategyCard[selected="true"] {{
+QPushButton#strategyCard:focus {{
+    border-color: {AMBER_HOVER};
+}}
+QPushButton#strategyCard[selected="true"] {{
     background: {AMBER_TINT};
     border: 1px solid {AMBER};
 }}
-QFrame#strategyCard QLabel {{ background: transparent; }}
+QPushButton#strategyCard QLabel {{ background: transparent; }}
 QLabel#strategyName {{
     font-size: 15px;
     font-weight: 600;
     color: {TEXT};
 }}
-QFrame#strategyCard[selected="true"] QLabel#strategyName {{
+QPushButton#strategyCard[selected="true"] QLabel#strategyName {{
     color: {AMBER_HOVER};
 }}
 QLabel#examplePill {{

@@ -221,23 +221,33 @@ class _FolderCard(QFrame):
         layout.addWidget(self.chip, 0, Qt.AlignLeft)
 
 
-class _StrategyCard(QFrame):
-    """Selectable strategy card with a distinct icon badge."""
+class _StrategyCard(QPushButton):
+    """Checkable strategy card — a real button, so UIAutomation exposes
+    Toggle/Invoke patterns and keyboard focus/Space work (a11y fix).
+
+    Looks identical to the old QFrame card; child labels are transparent to
+    mouse events so clicks anywhere hit the button."""
 
     def __init__(self, strategy, parent=None):
         super().__init__(parent)
         self.setObjectName("strategyCard")
         self.setProperty("strategyKey", strategy.key)
         self.setProperty("selected", False)
+        self.setCheckable(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setAccessibleName(strategy.name)
+        self.setAccessibleDescription(
+            f"Sorting strategy: {strategy.name}. Example: {strategy.example}")
         self.setCursor(Qt.PointingHandCursor)
-        self._checked = False
         self.on_toggled = None  # set by MainWindow
+        self._reselect_guard = False
 
         row = QHBoxLayout(self)
         row.setContentsMargins(16, 12, 18, 12)
         row.setSpacing(14)
-        row.addWidget(_badge(icons.STRATEGY_ICONS.get(strategy.key, "calendar"),
-                             badge_px=42, icon_px=20))
+        badge = _badge(icons.STRATEGY_ICONS.get(strategy.key, "calendar"),
+                       badge_px=42, icon_px=20)
+        row.addWidget(badge)
         text_col = QVBoxLayout()
         text_col.setSpacing(6)
         name = QLabel(strategy.name)
@@ -247,27 +257,27 @@ class _StrategyCard(QFrame):
         # force LTR: mixed-direction glyphs + font fallback produced garbled
         # pills on some scaled displays
         example.setLayoutDirection(Qt.LeftToRight)
+        # let every pixel of the card click through to the button
+        for w in (badge, name, example):
+            w.setAttribute(Qt.WA_TransparentForMouseEvents)
         text_col.addWidget(name)
         text_col.addWidget(example, 0, Qt.AlignLeft)
         row.addLayout(text_col, 1)
 
-    def isChecked(self) -> bool:
-        return self._checked
+        self.toggled.connect(self._on_toggle)
 
-    def setChecked(self, checked: bool):
-        if self._checked == checked:
-            return
-        self._checked = checked
+    def _on_toggle(self, checked: bool):
         self.setProperty("selected", checked)
         self.style().unpolish(self)
         self.style().polish(self)
-        if checked and self.on_toggled:
-            self.on_toggled(self)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() == Qt.LeftButton:
+        if checked:
+            if self.on_toggled:
+                self.on_toggled(self)
+        elif not self._reselect_guard:
+            # radio semantics: a card can't be unselected by re-clicking it
+            self._reselect_guard = True
             self.setChecked(True)
-        super().mouseReleaseEvent(event)
+            self._reselect_guard = False
 
 
 class MainWindow(QMainWindow):

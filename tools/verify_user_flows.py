@@ -51,13 +51,14 @@ def main():
     tmp = Path(tempfile.mkdtemp())
     src = tmp / "photos"
     src.mkdir()
-    # ~15 real EXIF photos padded to ~8 MB so the scan spans several
-    # progress ticks (hashing + metadata reads take measurable time)
+    # ~15 real EXIF photos padded to ~20 MB each so the scan spans several
+    # throttle windows (smaller fixtures finish inside one window and the
+    # rate label legitimately shows "—", which flakes this harness)
     for i in range(15):
         f = make_jpeg_with_exif(src / f"IMG_{i:02d}.jpg",
                                 datetime(2024, 7, 15, 10, i % 60, 0))
         with open(f, "ab") as fh:
-            fh.write(b"\x00" * (8 * 1024 * 1024))
+            fh.write(b"\x00" * (20 * 1024 * 1024))
 
     QSettings("MediaOrganizer", "MediaOrganizer").clear()
     dialog_state = {"shown": False}
@@ -107,7 +108,8 @@ def main():
     pump(app, 0.05)
     saw_determinate.append(w.progress.maximum() == 100)  # final state
     # the worker's final forced progress event is queued behind finished_plan;
-    # sample the labels once more after everything was delivered
+    # give the event loop a second pump and sample the labels after delivery
+    pump(app, 0.2)
     seen_status.append(w.progress_status.text())
     seen_detail.append(w.progress_detail.text())
     seen_status.append(w.status_label.text())

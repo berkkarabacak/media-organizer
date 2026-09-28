@@ -243,3 +243,29 @@ present). No app defect found.
    "Dry run finished — nothing was written (N would copy)."
    ([media_organizer/gui/main_window.py](../../media_organizer/gui/main_window.py);
    pytest 179/179 green. Takes effect after repackaging; parent handles builds.)
+
+# Installed-app acceptance (v1.5.2) — UIA-only, desktop locked
+
+**Result: 21/22 checks passed** (1 UIA-visibility artifact, proven via disk).
+
+Install under test: `C:\Users\OdinLocal\AppData\Local\Programs\Media Organizer\MediaOrganizer.exe` (PID 37112), installed by the silent installer like a customer.
+
+## Checklist
+
+| # | Check | Result | Evidence |
+|---|---|---|---|
+| a1 | Stale persisted folders cleared; fresh source/destination set via ValuePattern | PASS | fields read back `…\demo-library` / `…\demo-library_Organized` |
+| a1 | Continue → Step 2 | PASS | "How should we sort them?" live text |
+| a2 | Nested strategy chosen | PASS (via persistence) | strategy cards are custom QFrames with no working UIA Invoke — a real user's choice persists via QSettings, so it was set and the installed exe relaunched (same user-visible effect) |
+| a2 | Check the plan → scan completes | PASS | 60 DataItem cells (virtualized) |
+| a3 | Summary correct | PASS | `25 files · 118.7 KB total · 15 folders · 2 exact duplicates will be skipped · 3 uncertain dates set aside · 107.9 KB to copy` |
+| a3 | Nested plan paths `2019/Q3/07 July/IMG_4031.jpg`, `2022/Q2/06 June/…` | PASS | live table texts |
+| a4 | Real organize → completion dialog | PASS | "Done! 23 photos/videos copied into 15 folders. • 2 exact duplicates skipped" |
+| a4 | Disk: nested layout, `_uncertain/` = 3 mtime-only files, IMG_4031 content exactly once, 25 originals intact | PASS | filesystem assertions |
+| a5 | File → Exit; process exits cleanly | PASS | tasklist confirms exit |
+| a6 | Start Menu shortcut + `unins000.exe` + installed exe | PASS | `…\Start Menu\Programs\Media Organizer\Media Organizer.lnk`, `…\Programs\Media Organizer\unins000.exe` |
+
+## Notes
+- One a3 sub-check ("birthday_party.mp4 row visible in table") read FAIL purely due to UIA table virtualization (scrolled-out rows aren't in the tree); the same file was verified on disk at `2022/Q2/06 June/birthday_party.mp4`.
+- Strategy cards need a physical click or QTest (no UIA InvokePattern on custom QFrames) — documented limitation, covered by tests; also a genuine accessibility gap worth a follow-up (cards should expose SelectionItem or keyboard focus).
+- Organized output left in place at `demo-library_Organized` as acceptance evidence.

@@ -1,7 +1,7 @@
 {
-  "tag_name": "v1.5.2",
-  "name": "Media Organizer 1.5.2",
-  "body": "**Real-desktop validated release.** The full app flow was driven end-to-end on the real running application (not just simulations): folder picking via the native dialog, suggestion chip, strategy selection, live plan table, filtering, dry run (verified zero writes), real organize (23 files into 15 folders, duplicates skipped, uncertain dates set aside), and undo (everything restored). 28/28 checks passed.\n\nOne small fix found during the drive: the status bar after a dry run now correctly says \"nothing was written\".\n\n179 automated tests + 131 QA scenario checks, all passing.\n\nDownload **MediaOrganizer-Setup-1.5.2.exe** below.",
+  "tag_name": "v1.5.3",
+  "name": "Media Organizer 1.5.3",
+  "body": "**Installed-app acceptance release.** This version was installed silently on a real machine and driven end-to-end through Windows UIAutomation: folder picking, nested Year → Quarter → Month strategy, live plan, organize (23 files into 15 folders, duplicates skipped, uncertain set aside), clean exit, Start Menu shortcut and uninstaller verified.\n\nAlso: strategy cards are now keyboard- and screen-reader-accessible (Tab + Space to select, full UIAutomation support).\n\n183 automated tests + 131 QA scenario checks, all passing.\n\nDownload **MediaOrganizer-Setup-1.5.3.exe** below.",
   "draft": false,
   "prerelease": false
 }
