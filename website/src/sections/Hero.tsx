@@ -90,7 +90,7 @@ export default function Hero() {
         </div>
 
         {heroConfig.ctaText && (
-          <div style={{ display: 'flex', justifyContent: 'center' }} className="pointer-events-auto">
+          <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }} className="pointer-events-auto">
             <LiquidGlassButton
               onClick={() => {
                 window.open('https://github.com/berkkarabacak/media-organizer/releases/latest/download/MediaOrganizer-Setup-1.5.3.exe', '_blank');
@@ -98,6 +98,23 @@ export default function Hero() {
             >
               {heroConfig.ctaText}
             </LiquidGlassButton>
+            {heroConfig.ctaNote && (
+              <p
+                style={{
+                  fontFamily: "'GeistMono', monospace",
+                  fontWeight: 200,
+                  fontSize: '12px',
+                  lineHeight: 1.6,
+                  color: 'rgba(255,255,255,0.65)',
+                  maxWidth: '460px',
+                  textAlign: 'center',
+                  margin: 0,
+                  textShadow: '0 1px 8px rgba(0,0,0,0.6)',
+                }}
+              >
+                {heroConfig.ctaNote}
+              </p>
+            )}
           </div>
         )}
       </div>

@@ -47,6 +47,7 @@ export interface HeroConfig {
   subtitleLine1: string;
   subtitleLine2: string;
   ctaText: string;
+  ctaNote: string;
 }
 
 export const heroConfig: HeroConfig = {
@@ -54,6 +55,7 @@ export const heroConfig: HeroConfig = {
   subtitleLine1: "Auto-sorts photos & videos by true capture date, from EXIF.",
   subtitleLine2: "Dry-run preview. Duplicate detection. One-click undo.",
   ctaText: "Download for Windows",
+  ctaNote: "Windows may show a SmartScreen prompt for new apps — click “More info” → “Run anyway”. The app is 100% offline and fully open source.",
 };
 
 // ============================================================

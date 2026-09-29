@@ -62,6 +62,22 @@ Date detection fallback chain:
   completion dialog's **Undo** button restores it.
 - Corrupt/unreadable files are logged and skipped — the run never crashes.
 
+## Install (Windows)
+
+Download `MediaOrganizer-Setup-1.5.3.exe` from the
+[latest release](https://github.com/berkkarabacak/media-organizer/releases/latest)
+and run it.
+
+**Seeing a blue "Windows protected your PC" (SmartScreen) prompt?** That's
+normal for a new, independently published app — the installer isn't signed
+with a commercial certificate yet. The app is safe: it is 100% offline and
+its entire source code is this repository. Click **More info** →
+**Run anyway** to proceed.
+
+**Something went wrong?** The app writes a crash log to
+`%LOCALAPPDATA%\MediaOrganizer\crash.log` — attach it when reporting an
+issue and it can be diagnosed in minutes.
+
 ## Running from source (developers)
 
 ```bat
