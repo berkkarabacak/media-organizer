@@ -2,6 +2,20 @@
 
 **Current release: v1.5.3** · Repo: https://github.com/berkkarabacak/media-organizer · Site: https://berkkarabacak.github.io/media-organizer/
 
+> ⚠️ **URGENT — release v1.5.4 first.** v1.5.3's accessible strategy cards
+> (QFrame → QPushButton, a11y fix) shipped with a visual defect:
+> `QPushButton.sizeHint()` ignores the widget's own layout, so all 7 strategy
+> cards on step 2 render as 16 px strips in the released build. **Fixed on
+> `main`** (sizeHint override + `tests/test_gui_strategy_cards.py` regression
+> test), but the downloadable v1.5.3 installer is still broken. Rebuild and
+> release v1.5.4 ASAP (bump in 4 places, §3).
+>
+> Also unreleased on `main` (all verified, see git log): crash handler
+> (`crashlog.py` → `%LOCALAPPDATA%\MediaOrganizer\crash.log`), MIT LICENSE,
+> SignPath free-signing prep + dormant workflow, README fixes, and a website
+> overhaul (Pricing/FAQ sections, wired HowItWorks/Screenshots, nav Download
+> bug fix, fresh v1.5.3 screenshots). Investor materials in `docs/`.
+
 A Windows desktop app that organizes photos/videos by their **true capture date** (EXIF → video container metadata → filename patterns → mtime guess), with 7 folder strategies (incl. GPS-location sorting), content-hash duplicate detection, dry-run, undo, crash-resume journaling, free-space preflight, and a guided 3-step dark-themed UI.
 
 ---
@@ -12,6 +26,7 @@ A Windows desktop app that organizes photos/videos by their **true capture date*
 main.py                      # entry point (python main.py)
 media_organizer/
   __init__.py                # __version__ — bump here every release
+  crashlog.py                # sys.excepthook + faulthandler → %LOCALAPPDATA%/MediaOrganizer/crash.log
   core/                      # pure logic, Qt-free, fully unit-tested
     metadata.py              # capture-date extraction (EXIF, mvhd atoms, filenames, mtime)
     organizer.py             # plan building (OrganizeOptions, collisions, strategies)
@@ -27,7 +42,9 @@ media_organizer/
     workers.py               # ScanWorker / OrganizeWorker (QThread, throttled signals)
     theme.py                 # all QSS + palette constants
     icons.py                 # 34 embedded SVG icons → QIcon (recolor, HiDPI)
-tests/                       # 183 pytest tests (Qt-free logic + QTest GUI tests)
+tests/                       # 188 pytest tests (Qt-free logic + QTest GUI tests)
+docs/                        # DEMO.md (investor demo script), INVESTOR_ONEPAGER.md
+.github/workflows/           # sign-release.yml — dormant SignPath signing (no-ops until SIGNPATH_* secrets/vars set)
 tools/
   qa/                        # QA battery: run_all.py → 131 scenario checks
   verify_progress.py         # progress/ETA harness (incl. >2GB regression)
@@ -54,7 +71,7 @@ python -m venv .venv
 .venv\Scripts\python -m pip install PySide6 pyinstaller pytest Pillow pywinauto pyautogui pyperclip
 
 :: full verification — run ALL of these before every release:
-.venv\Scripts\python -m pytest tests\ -q                  :: 183 tests
+.venv\Scripts\python -m pytest tests\ -q                  :: 188 tests
 .venv\Scripts\python tools\qa\run_all.py                  :: 131 scenario checks
 set QT_QPA_PLATFORM=offscreen && .venv\Scripts\python tools\verify_progress.py
 set QT_QPA_PLATFORM=offscreen && .venv\Scripts\python tools\verify_user_flows.py
@@ -64,7 +81,7 @@ set QT_QPA_PLATFORM=offscreen && .venv\Scripts\python tools\verify_user_flows.py
 tools\innosetup6\ISCC.exe installer\setup.iss             :: output: installer\dist\MediaOrganizer-Setup-X.Y.Z.exe
 ```
 
-**Machine quirks:** npm/node live at `C:\Users\OdinLocal\AppData\Local\Programs\kimi-desktop\resources\resources\runtime\` (call `npm.cmd`, not `npm`). Inno Setup 6.7.3 is portable at `tools\innosetup6\` (reinstall: run `tools\innosetup-6.7.3.exe /VERYSILENT /PORTABLE=1 /DIR=...`). Kill any running `MediaOrganizer.exe` before PyInstaller or it locks files and you silently package the OLD build (this actually bit us once).
+**Machine quirks:** npm/node location varies per machine — find it with `where npm.cmd` (on the `berk` machine: `C:\Users\berk\AppData\Local\Programs\Kimi\resources\resources\runtime\npm.cmd`; on the old `OdinLocal` machine it was under `kimi-desktop\resources`). `make_demo_library.py` writes to `<repo>\demo-library\` (repo-relative — do not re-hardcode a user path). Inno Setup 6.7.3 is portable at `tools\innosetup6\` (committed; reinstall: run `tools\innosetup-6.7.3.exe /VERYSILENT /PORTABLE=1 /DIR=...`). Kill any running `MediaOrganizer.exe` before PyInstaller or it locks files and you silently package the OLD build (this actually bit us once). The QA freeze check (worst event-loop tick < 200 ms) is load-sensitive — a single marginal failure (~230 ms) on a busy machine is a flake; re-run before investigating.
 
 ## 3. Release procedure (proven, do exactly this)
 
@@ -109,4 +126,4 @@ tools\innosetup6\ISCC.exe installer\setup.iss             :: output: installer\d
 
 ## 7. Website
 
-React 19 + Vite + Tailwind + shadcn/ui, "digital rain" template. All content in `src/config.ts`. Sections in `src/sections/`. Images in `public/images/` (AI-generated thematic JPGs + real app screenshots captured via `tools/capture_ui.py`). Uses **HashRouter** (BrowserRouter breaks on GitHub Pages subpaths — this caused a black-screen incident). Dev preview: `npm.cmd run dev` (port 3000 default).
+React 19 + Vite + Tailwind + shadcn/ui, "digital rain" template. All content in `src/config.ts`. Sections in `src/sections/` — all wired into `App.tsx`: Hero, CinematicVision, HowItWorks, Curriculum (features), Screenshots, **Pricing**, **FAQ**, AlumniArchives, Footer. **Pricing placeholders**: `STORE_URL` (Gumroad) and `PRICE_DISPLAY` at the top of the Pricing block in `config.ts` — set both when the store exists. Images in `public/images/` (AI-generated thematic JPGs + real app screenshots captured via `tools/capture_ui.py` — regenerate at every release so screenshots match the shipped UI; v1.3.1 screenshots survived until v1.5.3 once). Uses **HashRouter** (BrowserRouter breaks on GitHub Pages subpaths — this caused a black-screen incident). Dev preview: `npm.cmd run dev` (port 3000 default).
