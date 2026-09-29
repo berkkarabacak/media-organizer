@@ -17,7 +17,8 @@ from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QTableWidgetIte
 
 from media_organizer.core.metadata import CaptureDate, Confidence, DateSource
 from media_organizer.core.organizer import PlannedFile
-from media_organizer.core.plan import Operation, RunLog
+from media_organizer.core.display import finished_run_lines
+from media_organizer.core.plan import UNDO_STACK_LIMIT, Operation, RunLog
 
 
 @pytest.fixture(scope="session")
@@ -179,10 +180,50 @@ class TestMoveAndUncertainWording:
 
 
 class TestUndoLimitationIsVisible:
-    def test_step3_says_only_the_latest_run_can_be_undone(self, qapp, window):
+    def test_step3_says_how_many_recent_runs_can_be_undone(self, qapp, window):
         window._goto_step(2)
         qapp.processEvents()
-        text = _labels(window).lower()
-        assert "most recent" in text or "latest" in text
-        assert "cannot be undone" in text or "replaces" in text
-        assert "only" in text and "copy" in text
+        text = _labels(window)
+        lowered = text.lower()
+        assert str(UNDO_STACK_LIMIT) in text
+        assert "newest first" in lowered
+        assert "keeps those undo logs" in lowered
+        assert "only remaining copy" in lowered
+        assert "replaces the undo log" not in lowered
+        assert "replaces this undo log" not in lowered
+
+    def test_finished_dialog_names_the_same_undo_stack(
+            self, qapp, window, monkeypatch):
+        captured = {}
+
+        def fake_exec(self):
+            captured["text"] = self.text()
+            return None
+
+        monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+        monkeypatch.setattr(QMessageBox, "clickedButton", lambda self: None)
+        log = RunLog(started_at="2024-07-15T10:00:00", dest_dir="/dst",
+                     operations=[
+                         Operation("copy", "/src/a.jpg", "/dst/2024/a.jpg",
+                                   status="done"),
+                     ])
+        summary = {
+            "copied": 1,
+            "moved": 0,
+            "skipped_duplicates": 0,
+            "undated": 0,
+            "uncertain": 0,
+            "errors": 0,
+            "cancelled": False,
+            "dry_run": False,
+            "action": "copy",
+        }
+        window._last_active_bytes = 1024
+        window._on_run_finished(log, summary)
+        text = captured["text"]
+        _status, plain = finished_run_lines(
+            summary, folders=1, total_bytes=1024)
+        assert f"last {UNDO_STACK_LIMIT} organize runs" in text
+        assert f"last {UNDO_STACK_LIMIT} organize runs" in plain
+        assert "newest first" in text.lower()
+        assert "replaces" not in text.lower()

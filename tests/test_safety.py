@@ -54,9 +54,22 @@ class TestFreeSpace:
         assert s["drive"]
 
     def test_nonexistent_drive_does_not_crash(self):
-        # regression: preflight raised FileNotFoundError on a missing drive
-        s = free_space_status("Q:/definitely_not_a_real_drive_xyz/o", 1024)
-        assert s["ok"] is True and s["unknown"] is True
+        """A missing Windows drive is unknown, including on Linux.
+
+        ``Q:/...`` is a relative path outside Windows. Climbing it used to
+        reach the current directory and report that disk as a real preflight
+        (``unknown`` false). ``ok`` stays true so the run is not blocked;
+        ``free`` is -1 so it is not that disk's free space.
+        """
+        for raw in (
+            "Q:/definitely_not_a_real_drive_xyz/o",
+            "Q:\\definitely_not_a_real_drive_xyz\\o",
+        ):
+            s = free_space_status(raw, 1024)
+            assert s["ok"] is True
+            assert s["unknown"] is True
+            assert s["free"] == -1
+            assert s["tight"] is False
 
 
 class TestAtomicCopy:

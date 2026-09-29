@@ -9,6 +9,8 @@ Safety features:
 
 from __future__ import annotations
 
+import os
+import re
 import shutil
 from pathlib import Path
 from typing import Callable, Optional
@@ -20,6 +22,22 @@ from .plan import Operation, RunLog, new_log, save_log
 
 #: warn when the copy would consume all but this fraction of free space
 TIGHT_MARGIN = 0.05
+
+# "Q:/photos" is a drive on Windows. On other systems it is a relative path,
+# and walking up from it lands in the current directory.
+_WINDOWS_DRIVE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _unknown_free_space(needed_bytes: int, drive: str) -> dict:
+    """Preflight could not read a disk. ``ok`` means do not block the run."""
+    return {
+        "free": -1,
+        "needed": needed_bytes,
+        "ok": True,
+        "tight": False,
+        "drive": drive,
+        "unknown": True,
+    }
 
 
 def _final_destination(dest: Path) -> Path:
@@ -38,9 +56,15 @@ def _final_destination(dest: Path) -> Path:
 def free_space_status(dest_dir: Path | str, needed_bytes: int) -> dict:
     """Free-space preflight for the destination drive.
 
-    Returns {free, needed, ok, tight, drive}. `ok` False means the copy
-    cannot fit; `tight` means it fits with less than 5% margin left.
+    Returns {free, needed, ok, tight, drive, unknown}. `ok` False means the
+    copy cannot fit; `tight` means it fits with less than 5% margin left.
+    `unknown` means the disk could not be read. `ok` is then true so this
+    check does not block the run, and `free` is -1.
     """
+    raw = os.fspath(dest_dir)
+    if os.name != "nt" and _WINDOWS_DRIVE.match(raw.replace("\\", "/")):
+        # Do not climb into the current directory and report its free space.
+        return _unknown_free_space(needed_bytes, raw[:2] + "\\")
     p = Path(dest_dir)
     while not p.exists() and p != p.parent:
         p = p.parent
@@ -49,8 +73,7 @@ def free_space_status(dest_dir: Path | str, needed_bytes: int) -> dict:
     except OSError:
         # drive missing/unreadable (e.g. unplugged): can't preflight — let the
         # executor's per-file error handling report it instead of crashing
-        return {"free": -1, "needed": needed_bytes, "ok": True,
-                "tight": False, "drive": p.anchor or str(p), "unknown": True}
+        return _unknown_free_space(needed_bytes, p.anchor or str(p))
     free = usage.free
     return {
         "free": free,

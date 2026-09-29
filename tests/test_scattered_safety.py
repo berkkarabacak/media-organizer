@@ -8,6 +8,7 @@ parser that round-trips through the machine's local timezone cannot pass.
 from __future__ import annotations
 
 import calendar
+import json
 import os
 import struct
 import time
@@ -21,7 +22,10 @@ from media_organizer.core.metadata import (
     QT_EPOCH_OFFSET, DateSource, extract_capture_date,
 )
 from media_organizer.core.organizer import OrganizeOptions, build_plan, scan_media_files
-from media_organizer.core.plan import load_log, undo_log
+from media_organizer.core.plan import (
+    UNDO_STACK_LIMIT, list_run_logs, load_log, load_undoable_log, log_path_for,
+    undo_log,
+)
 from tests.helpers import _box, make_jpeg_with_exif
 
 
@@ -411,10 +415,9 @@ class TestUndoDoesNotDestroyTheOnlyCopy:
         assert result["undone"] == 0
 
     def test_undoing_the_latest_run_leaves_the_earlier_copy(self, tmp_path):
-        """A second organize replaces the only undo log.
+        """Undoing the latest run removes only that run's copies.
 
-        Undoing that log must not delete the copy the first run wrote.
-        There is no history to undo the first run; the UI says so.
+        The first run's destination and its undo log both stay.
         """
         src, dst, _photo, first = _one_photo_run(tmp_path)
         make_jpeg_with_exif(src / "IMG_2.jpg", datetime(2024, 8, 1, 9, 0, 0))
@@ -422,9 +425,154 @@ class TestUndoDoesNotDestroyTheOnlyCopy:
         execute_plan(build_plan(options), options)
         second = dst / "2024" / "07 July" / "IMG_1_1.jpg"
         assert first.exists() and second.exists()
+        earlier_id = list_run_logs(dst)[1].run_id
         undo_log(load_log(dst), dst)
         assert first.exists()
         assert not second.exists()
+        still = [log for log in list_run_logs(dst) if log.run_id == earlier_id]
+        assert len(still) == 1 and not still[0].undone
+
+
+class TestUndoHistory:
+    def test_second_run_archives_the_first_log_unchanged(self, tmp_path):
+        src, dst, _photo, first = _one_photo_run(tmp_path)
+        original = log_path_for(dst).read_bytes()
+        assert original
+        make_jpeg_with_exif(src / "IMG_2.jpg", datetime(2024, 8, 1, 9, 0, 0))
+        execute_plan(build_plan(OrganizeOptions(source_dir=src, dest_dir=dst)),
+                     OrganizeOptions(source_dir=src, dest_dir=dst))
+        archived = list((dst / ".media_organizer" / "history").glob("*.json"))
+        assert len(archived) == 1
+        assert archived[0].read_bytes() == original
+        logs = list_run_logs(dst)
+        assert len(logs) == 2
+        assert logs[1].operations[0].destination == str(first)
+        assert Path(logs[0].operations[0].destination) != first
+
+    def test_legacy_log_without_run_id_is_not_wiped(self, tmp_path):
+        src, dst, _photo, first = _one_photo_run(tmp_path)
+        path = log_path_for(dst)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("run_id", None)
+        original = json.dumps(data)
+        path.write_text(original, encoding="utf-8")
+        make_jpeg_with_exif(src / "IMG_2.jpg", datetime(2024, 8, 1, 9, 0, 0))
+        execute_plan(build_plan(OrganizeOptions(source_dir=src, dest_dir=dst)),
+                     OrganizeOptions(source_dir=src, dest_dir=dst))
+        archived = list((dst / ".media_organizer" / "history").glob("*.json"))
+        assert len(archived) == 1
+        assert archived[0].read_text(encoding="utf-8") == original
+        older = list_run_logs(dst)[-1]
+        assert older.run_id == ""
+        assert not older.undone
+        assert older.operations[0].destination == str(first)
+
+    def test_undo_latest_then_the_earlier_run(self, tmp_path):
+        src, dst, photo, first = _one_photo_run(tmp_path)
+        make_jpeg_with_exif(src / "IMG_2.jpg", datetime(2024, 8, 1, 9, 0, 0))
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        execute_plan(build_plan(options), options)
+        second = dst / "2024" / "08 August" / "IMG_2.jpg"
+        recopy = dst / "2024" / "07 July" / "IMG_1_1.jpg"
+        assert first.exists() and second.exists() and recopy.exists()
+        history = next((dst / ".media_organizer" / "history").glob("*.json"))
+        preserved = history.read_bytes()
+
+        latest = undo_log(load_log(dst), dst)
+        assert latest["undone"] >= 1
+        assert latest["remaining"] == 1
+        assert first.exists()
+        assert not second.exists()
+        assert not recopy.exists()
+        assert history.read_bytes() == preserved
+
+        earlier = load_undoable_log(dst)
+        assert earlier is not None and not earlier.undone
+        again = undo_log(earlier, dst)
+        assert again["undone"] == 1
+        assert again["remaining"] == 0
+        assert not first.exists()
+        assert photo.exists()
+        assert (src / "IMG_2.jpg").exists()
+
+    def test_undo_older_run_while_the_newer_one_remains(self, tmp_path):
+        src, dst, photo, first = _one_photo_run(tmp_path)
+        make_jpeg_with_exif(src / "IMG_2.jpg", datetime(2024, 8, 1, 9, 0, 0))
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        execute_plan(build_plan(options), options)
+        logs = list_run_logs(dst)
+        newer, older = logs[0], logs[1]
+        newer_dests = [Path(op.destination) for op in newer.operations
+                       if op.status == "done"]
+        assert newer_dests
+        result = undo_log(older, dst)
+        assert result["undone"] == 1
+        assert result["remaining"] == 1
+        assert not first.exists()
+        assert photo.exists()
+        for path in newer_dests:
+            assert path.exists()
+        reloaded = list_run_logs(dst)
+        assert len(reloaded) == 2
+        assert reloaded[0].run_id == newer.run_id
+        assert not reloaded[0].undone
+        assert [op.destination for op in reloaded[0].operations] == \
+            [op.destination for op in newer.operations]
+        assert reloaded[1].undone
+
+    def test_undo_latest_move_leaves_the_earlier_move(self, tmp_path):
+        src, dst, photo, first = _one_photo_run(tmp_path, copy_mode=False)
+        payload = first.read_bytes()
+        assert not photo.exists() and first.exists()
+        photo2 = make_jpeg_with_exif(
+            src / "IMG_2.jpg", datetime(2024, 8, 1, 9, 0, 0))
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        execute_plan(build_plan(options), options)
+        second = dst / "2024" / "08 August" / "IMG_2.jpg"
+        assert second.exists() and not photo2.exists()
+
+        result = undo_log(load_log(dst), dst)
+        assert result["undone"] == 1
+        assert result["remaining"] == 1
+        assert first.read_bytes() == payload
+        assert not photo.exists()
+        assert photo2.read_bytes()
+        assert not second.exists()
+
+        earlier = load_undoable_log(dst)
+        assert earlier is not None
+        again = undo_log(earlier, dst)
+        assert again["undone"] == 1
+        assert not first.exists()
+        assert photo.read_bytes() == payload
+
+    def test_filling_the_stack_retires_the_oldest_log_without_deleting_it(
+            self, tmp_path):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        first_bytes = b""
+        first_id = ""
+        for i in range(UNDO_STACK_LIMIT + 1):
+            make_jpeg_with_exif(
+                src / f"IMG_{i}.jpg", datetime(2020, 1, 1, 0, i, 0))
+            options = OrganizeOptions(source_dir=src, dest_dir=dst)
+            execute_plan(build_plan(options), options)
+            if i == 0:
+                first_bytes = log_path_for(dst).read_bytes()
+                first_id = load_log(dst).run_id
+            if i + 1 == UNDO_STACK_LIMIT:
+                assert len(list_run_logs(dst)) == UNDO_STACK_LIMIT
+                retired_dir = dst / ".media_organizer" / "history" / "retired"
+                assert not retired_dir.exists()
+        logs = list_run_logs(dst)
+        assert len(logs) == UNDO_STACK_LIMIT
+        assert first_id not in {log.run_id for log in logs}
+        retired = list(
+            (dst / ".media_organizer" / "history" / "retired").glob("*.json"))
+        assert len(retired) == 1
+        assert retired[0].read_bytes() == first_bytes
+        assert retired[0].stat().st_size > 0
 
 
 class TestRunWording:

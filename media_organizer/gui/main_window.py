@@ -32,7 +32,8 @@ from ..core.journal import (completed_sources, discard_journal,
                             find_unfinished_journal)
 from ..core.metadata import Confidence, DateSource
 from ..core.organizer import STRATEGIES, OrganizeOptions, destination_blocks_scan
-from ..core.plan import UNDO_LIMITATION, load_log, undo_log, undo_result_message
+from ..core.plan import (UNDO_LIMITATION, list_run_logs, undo_log,
+                         undo_result_message)
 from ..core.strategies import DEFAULT_STRATEGY_KEY
 from . import icons, theme
 from .workers import OrganizeWorker, ScanWorker
@@ -1373,10 +1374,16 @@ class MainWindow(QMainWindow):
                 self, APP_NAME,
                 "Choose the destination folder used by the run first.")
             return
-        log = load_log(dst)
-        if log is None:
+        logs = list_run_logs(dst)
+        if not logs:
             QMessageBox.information(self, APP_NAME,
                                     "No operation log found in that folder.")
+            return
+        log = next((item for item in logs if not item.undone), None)
+        if log is None:
+            QMessageBox.information(
+                self, APP_NAME,
+                "The runs saved in that folder have already been undone.")
             return
         self._undo_log(log, dst)
 
@@ -1387,8 +1394,9 @@ class MainWindow(QMainWindow):
             return
         answer = QMessageBox.question(
             self, APP_NAME,
-            f"Undo the latest run from {log.started_at} "
-            f"({len(log.operations)} operations)?\n\n"
+            f"Undo the newest run that can still be undone?\n\n"
+            f"It started at {log.started_at} "
+            f"({len(log.operations)} operations).\n\n"
             f"{UNDO_LIMITATION}",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer != QMessageBox.Yes:

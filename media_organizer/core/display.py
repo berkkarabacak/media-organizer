@@ -5,6 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from .plan import UNDO_STACK_LIMIT
+
 
 def finished_run_lines(summary: dict, *, folders: int, total_bytes: int
                        ) -> tuple[str, str]:
@@ -56,8 +58,8 @@ def finished_run_lines(summary: dict, *, folders: int, total_bytes: int
         text += "\n\n" + "\n".join(f"• {d}" for d in details)
     if not dry:
         text += (
-            "\n\nOnly the latest run can be undone. Organizing again "
-            "replaces this undo log, and the earlier run cannot be undone."
+            f"\n\nThe last {UNDO_STACK_LIMIT} organize runs in this folder "
+            "can be undone, newest first."
         )
     return status, text
 
