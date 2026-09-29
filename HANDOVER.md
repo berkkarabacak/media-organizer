@@ -102,7 +102,7 @@ tools\innosetup6\ISCC.exe installer\setup.iss             :: output: installer\d
 ## 6. Known limitations / roadmap ideas
 
 - Location sorting needs EXIF GPS (photos only; videos rarely have it). City DB = 584 cities, 250 km cutoff → `_unknown-location/` beyond that.
-- Installer is unsigned → SmartScreen warning. Buying a code-signing cert (~$200-400/yr) is the #1 commercial next step.
+- Installer is unsigned → SmartScreen warning. Free path chosen over a paid cert: **SignPath Foundation OSS program** (signpath.org — free OV-level cert for open-source projects; publisher shows as "SignPath Foundation"). Prep is done: MIT LICENSE, "Code signing policy" section in README (required attribution + roles + privacy line), footer link on the website, and a dormant `.github/workflows/sign-release.yml` (manual trigger, no-ops until SIGNPATH_* secrets/vars are set). Remaining: apply at signpath.org (repo URL + download page URL), confirm GitHub 2FA is on, wait for review, then set secrets. Fallback if declined: Microsoft WDSI file submission each release (free, builds SmartScreen reputation) — the site/README already explain the "More info → Run anyway" click-through.
 - HEIC/RAW dates read only if EXIF parses via Pillow; otherwise filename/mtime fallback.
 - No cloud/network features at all (by design — "100% offline" is a selling point).
 - Ideas: thumbnail previews in the table, light theme, pause/resume, Watch-folder mode, context-menu ("Send to → Media Organizer"), localization (owner speaks Turkish), Gumroad/Lemon Squeezy license keys.

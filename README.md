@@ -78,6 +78,19 @@ its entire source code is this repository. Click **More info** →
 `%LOCALAPPDATA%\MediaOrganizer\crash.log` — attach it when reporting an
 issue and it can be diagnosed in minutes.
 
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://signpath.io),
+certificate by [SignPath Foundation](https://signpath.org).
+
+- **Committers and reviewers:** [@berkkarabacak](https://github.com/berkkarabacak)
+- **Approvers (signing requests):** [@berkkarabacak](https://github.com/berkkarabacak)
+
+**Privacy policy:** This program will not transfer any information to other
+networked systems unless specifically requested by the user or the person
+installing or operating it. Media Organizer is 100% offline by design —
+there are no accounts, no telemetry, and no network features.
+
 ## Running from source (developers)
 
 ```bat

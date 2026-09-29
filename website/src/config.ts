@@ -300,5 +300,6 @@ export const footerConfig: FooterConfig = {
     { label: "Privacy Policy", href: "#" },
     { label: "Terms of Use", href: "#" },
     { label: "EULA", href: "#" },
+    { label: "Code signing policy", href: "https://github.com/berkkarabacak/media-organizer#code-signing-policy" },
   ],
 };

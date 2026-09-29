@@ -1,0 +1,50 @@
+# Sign a built installer via SignPath (free OSS code signing).
+#
+# DORMANT until SignPath approves the project and these are configured:
+#   Secrets: SIGNPATH_API_TOKEN
+#   Vars:    SIGNPATH_ENABLED=true, SIGNPATH_ORGANIZATION_ID,
+#            SIGNPATH_PROJECT_SLUG, SIGNPATH_SIGNING_POLICY_SLUG (e.g. "release-signing")
+# Until then every run exits early with a notice and does nothing.
+#
+# Usage: Actions → "Sign installer with SignPath" → Run workflow →
+#        enter the installer artifact name from a prior build.
+
+name: Sign installer (SignPath)
+
+on:
+  workflow_dispatch:
+    inputs:
+      artifact_name:
+        description: "GitHub artifact name containing the unsigned installer .exe"
+        required: true
+        default: "installer-unsigned"
+
+jobs:
+  sign:
+    runs-on: windows-latest
+    steps:
+      - name: Guard — skip until SignPath is configured
+        if: vars.SIGNPATH_ENABLED != 'true'
+        run: |
+          echo "SignPath not configured yet (SIGNPATH_ENABLED != true)."
+          echo "Apply at https://signpath.org, then set repo secrets/vars. See HANDOVER.md."
+          exit 0
+
+      - name: Submit signing request to SignPath
+        if: vars.SIGNPATH_ENABLED == 'true'
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          github-artifact-name: ${{ inputs.artifact_name }}
+          wait-for-completion: true
+          output-artifact-directory: signed
+
+      - name: Upload signed installer
+        if: vars.SIGNPATH_ENABLED == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-signed
+          path: signed/**/*.exe
