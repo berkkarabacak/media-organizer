@@ -377,13 +377,16 @@ def undo_result_message(result: dict) -> str:
             "there. If this file is the only copy left, or it no longer "
             "matches what the run wrote, it stays."
         )
-    remaining = int(result.get("remaining") or 0)
-    if remaining == 1:
-        msg += "\n\n1 earlier run can still be undone."
-    elif remaining > 1:
-        msg += (
-            f"\n\n{remaining} earlier runs can still be undone, newest first."
-        )
+    # Counted only after this run is fully undone, so a run that had to
+    # leave files in place does not claim the older logs are next.
+    if result.get("closed"):
+        remaining = int(result.get("remaining") or 0)
+        if remaining == 1:
+            msg += "\n\n1 other run can still be undone, newest first."
+        elif remaining > 1:
+            msg += (
+                f"\n\n{remaining} other runs can still be undone, newest first."
+            )
     return msg
 
 
@@ -439,11 +442,16 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
             failed += 1
     log.undone = kept == 0 and failed == 0
     save_log(log, dest_dir)
-    remaining = sum(1 for item in list_run_logs(dest_dir) if not item.undone)
+    key = _stable_key(log)
+    remaining = sum(
+        1 for item in list_run_logs(dest_dir)
+        if not item.undone and _stable_key(item) != key
+    )
     return {
         "undone": undone,
         "skipped": skipped,
         "failed": failed,
         "kept": kept,
         "remaining": remaining,
+        "closed": log.undone,
     }
