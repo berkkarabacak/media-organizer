@@ -263,12 +263,126 @@ export const researchConfig: ResearchConfig = {
 };
 
 // ============================================================
+// Pricing
+// ============================================================
+
+// PLACEHOLDER — create the Gumroad/Lemon Squeezy product and keep this in sync.
+export const STORE_URL =
+  "https://berkkarabacak.gumroad.com/l/media-organizer";
+// PLACEHOLDER — launch price, one-time payment.
+export const PRICE_DISPLAY = "$19";
+
+export interface PricingTier {
+  name: string;
+  price: string;
+  tagline: string;
+  features: string[];
+  ctaText: string;
+  ctaHref: string;
+  highlighted: boolean;
+}
+
+export interface PricingConfig {
+  kicker: string;
+  heading: string;
+  tiers: PricingTier[];
+}
+
+export const pricingConfig: PricingConfig = {
+  kicker: "Pricing",
+  heading: "Pay once. Own it forever.",
+  tiers: [
+    {
+      name: "Download",
+      price: "Free",
+      tagline: "Full app during launch",
+      features: [
+        "All 7 folder strategies",
+        "Dry-run preview & undo",
+        "Duplicate detection",
+        "100% offline, no account",
+      ],
+      ctaText: "Download for Windows",
+      ctaHref:
+        "https://github.com/berkkarabacak/media-organizer/releases/latest/download/MediaOrganizer-Setup-1.5.3.exe",
+      highlighted: false,
+    },
+    {
+      name: "Lifetime license",
+      price: PRICE_DISPLAY,
+      tagline: "One-time payment — launch pricing",
+      features: [
+        "Everything in Free",
+        "All future updates included",
+        "Priority support",
+        "Supports independent development",
+      ],
+      ctaText: "Buy lifetime license",
+      ctaHref: STORE_URL,
+      highlighted: true,
+    },
+  ],
+};
+
+// ============================================================
+// FAQ
+// ============================================================
+
+export interface FaqItem {
+  question: string;
+  answer: string;
+}
+
+export interface FaqConfig {
+  kicker: string;
+  heading: string;
+  items: FaqItem[];
+}
+
+export const faqConfig: FaqConfig = {
+  kicker: "FAQ",
+  heading: "Questions, answered.",
+  items: [
+    {
+      question: "Is my photo library safe?",
+      answer:
+        "Yes. Copy mode is the default — your originals stay untouched unless you explicitly opt into move mode. The app never overwrites files, shows you the complete plan before anything happens, and every run can be undone with one click.",
+    },
+    {
+      question: "Is it really 100% offline?",
+      answer:
+        "Yes — by design. No accounts, no telemetry, no cloud. Dates are read from EXIF and video metadata on your own machine, and location sorting uses a bundled offline city database.",
+    },
+    {
+      question: "Windows shows a SmartScreen warning — is that normal?",
+      answer:
+        "Yes, for a new independently published app. The installer isn't code-signed yet (free signing via SignPath is in progress). Click “More info” → “Run anyway”. The full source code is public on GitHub.",
+    },
+    {
+      question: "What files does it understand?",
+      answer:
+        "Photos (JPEG, PNG, HEIC, TIFF, common RAW) and videos (MP4, MOV, AVI and more). Dates come from EXIF, video container metadata, filename patterns, and — as a last resort — file dates, always marked by confidence.",
+    },
+    {
+      question: "Which Windows versions are supported?",
+      answer:
+        "Windows 10 and 11, 64-bit. The installer is a standard setup.exe — no admin rights beyond a normal install, and it uninstalls cleanly.",
+    },
+  ],
+};
+
+// ============================================================
 // Footer
 // ============================================================
 
+export interface FooterLink {
+  label: string;
+  href: string;
+}
+
 export interface FooterLinkColumn {
   title: string;
-  links: string[];
+  links: FooterLink[];
 }
 
 export interface FooterBottomLink {
@@ -288,18 +402,26 @@ export const footerConfig: FooterConfig = {
   columns: [
     {
       title: "Product",
-      links: ["Download", "Features", "Pricing", "Changelog"],
+      links: [
+        { label: "Download", href: "https://github.com/berkkarabacak/media-organizer/releases/latest/download/MediaOrganizer-Setup-1.5.3.exe" },
+        { label: "Features", href: "#curriculum" },
+        { label: "Pricing", href: "#pricing" },
+        { label: "Changelog", href: "https://github.com/berkkarabacak/media-organizer/releases" },
+      ],
     },
     {
       title: "Support",
-      links: ["FAQ", "User Guide", "Contact", "Refund Policy"],
+      links: [
+        { label: "FAQ", href: "#faq" },
+        { label: "User Guide", href: "https://github.com/berkkarabacak/media-organizer#readme" },
+        { label: "Report an Issue", href: "https://github.com/berkkarabacak/media-organizer/issues" },
+      ],
     },
   ],
-  copyright: "© 2026 Media Organizer. All rights reserved. (Placeholder)",
+  copyright: "© 2026 Berk Karabacak. All rights reserved.",
   bottomLinks: [
-    { label: "Privacy Policy", href: "#" },
-    { label: "Terms of Use", href: "#" },
-    { label: "EULA", href: "#" },
+    { label: "Privacy Policy", href: "https://github.com/berkkarabacak/media-organizer#code-signing-policy" },
+    { label: "License (MIT)", href: "https://github.com/berkkarabacak/media-organizer/blob/main/LICENSE" },
     { label: "Code signing policy", href: "https://github.com/berkkarabacak/media-organizer#code-signing-policy" },
   ],
 };

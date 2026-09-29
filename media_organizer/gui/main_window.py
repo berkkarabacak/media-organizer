@@ -266,6 +266,16 @@ class _StrategyCard(QPushButton):
 
         self.toggled.connect(self._on_toggle)
 
+    def sizeHint(self):
+        # QPushButton::sizeHint ignores the widget's own layout and returns a
+        # text-based hint (~16 px for a textless button), which collapsed the
+        # cards to thin strips (v1.5.3 regression). QFrame consulted its
+        # layout; the button must do so explicitly.
+        layout = self.layout()
+        if layout is not None:
+            return layout.sizeHint()
+        return super().sizeHint()
+
     def _on_toggle(self, checked: bool):
         self.setProperty("selected", checked)
         self.style().unpolish(self)

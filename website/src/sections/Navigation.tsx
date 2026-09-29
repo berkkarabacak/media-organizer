@@ -65,7 +65,8 @@ export default function Navigation() {
       {navigationConfig.ctaText && (
         <a
           href="https://github.com/berkkarabacak/media-organizer/releases/latest/download/MediaOrganizer-Setup-1.5.3.exe"
-          onClick={(e) => handleClick(e, '#footer')}
+          target="_blank"
+          rel="noopener noreferrer"
           className="nav-link hidden md:inline-block"
         >
           {navigationConfig.ctaText}

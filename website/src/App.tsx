@@ -1,7 +1,11 @@
 import { Routes, Route } from 'react-router-dom';
 import Navigation from './sections/Navigation';
 import Hero from './sections/Hero';
+import HowItWorks from './sections/HowItWorks';
 import Curriculum from './sections/Curriculum';
+import Screenshots from './sections/Screenshots';
+import Pricing from './sections/Pricing';
+import Faq from './sections/Faq';
 import CinematicVision from './sections/CinematicVision';
 import AlumniArchives from './sections/AlumniArchives';
 import Footer from './sections/Footer';
@@ -20,8 +24,12 @@ function HomePage() {
 
       <main>
         <Hero />
-        <Curriculum />
         <CinematicVision />
+        <HowItWorks />
+        <Curriculum />
+        <Screenshots />
+        <Pricing />
+        <Faq />
         <AlumniArchives />
         <Footer />
       </main>

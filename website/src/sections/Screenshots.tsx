@@ -1,11 +1,21 @@
 const shots = [
   {
+    src: 'images/screenshot-step1.png',
+    alt: 'Media Organizer — choosing source and destination folders',
+    caption: 'Point it at the mess — with a smart destination suggestion.',
+  },
+  {
     src: 'images/screenshot-main.png',
     alt: 'Media Organizer — choosing a folder strategy in the guided 3-step flow',
     caption: 'Pick a strategy — year, quarter, month, flat or by GPS location — with live examples.',
   },
   {
     src: 'images/screenshot-preview.png',
+    alt: 'Media Organizer — reviewing the full organize plan before anything moves',
+    caption: 'Review every file, its detected date and destination — before anything moves.',
+  },
+  {
+    src: 'images/screenshot-progress.png',
     alt: 'Media Organizer organizing files with live progress bar and ETA',
     caption: 'Real progress — percent, speed and ETA while your library sorts itself.',
   },

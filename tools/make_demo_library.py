@@ -3,7 +3,7 @@ import os, random, struct, zlib
 from pathlib import Path
 from PIL import Image
 
-DEST = Path(r"C:\Users\OdinLocal\Documents\Kimi\Workspaces\MediaOrganizer\demo-library")
+DEST = Path(__file__).resolve().parent.parent / "demo-library"
 
 def jpeg_with_exif(path, dt, gps=None, seed=0):
     im = Image.new("RGB", (640, 480), ((seed * 37) % 255, (seed * 91) % 255, (seed * 53) % 255))
