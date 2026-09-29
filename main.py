@@ -7,6 +7,9 @@ def main() -> int:
     import multiprocessing
     multiprocessing.freeze_support()  # needed when frozen by PyInstaller
 
+    from media_organizer.crashlog import install_crash_handling
+    install_crash_handling()  # windowed build has no console — log crashes to disk
+
     from PySide6.QtWidgets import QApplication
 
     from media_organizer import APP_NAME, __version__
