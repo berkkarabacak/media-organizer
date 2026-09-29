@@ -31,8 +31,44 @@ __all__ = [
     "STRATEGIES", "UNDATED_FOLDER", "UNKNOWN_LOCATION_FOLDER",
     "DEFAULT_STRATEGY_KEY", "get_strategy", "quarter_of",
     "PlannedFile", "OrganizeOptions", "scan_media_files", "count_media_files",
-    "build_plan",
+    "build_plan", "destination_blocks_scan",
 ]
+
+
+def destination_blocks_scan(source: os.PathLike | str,
+                           dest: os.PathLike | str) -> Optional[str]:
+    """Why this destination cannot be scanned, or None if it is usable.
+
+    The scan skips every file that already lives inside the destination.
+    That is right when the destination is a folder *inside* the source
+    (the usual "Organized" folder). It finds nothing — with no other
+    signal — when the destination *is* the source, or is a parent of it,
+    because the whole source is then inside the destination.
+
+    Returns a sentence the UI can show before anything is moved.
+    """
+    try:
+        src = Path(source).resolve()
+        dst = Path(dest).resolve()
+    except OSError:
+        return None
+    src_n = os.path.normcase(os.path.normpath(str(src)))
+    dst_n = os.path.normcase(os.path.normpath(str(dst)))
+    if src_n == dst_n:
+        return (
+            "The destination is the same folder as the source. "
+            "Files that already live in the destination are left alone, "
+            "so this scan would find nothing and nothing would be organized. "
+            "Choose a different folder before you continue."
+        )
+    if src_n.startswith(dst_n + os.sep):
+        return (
+            "The destination is a parent of the source folder. "
+            "Every file is already inside the destination, so this scan "
+            "would find nothing and nothing would be organized. "
+            "Choose a folder that is not above your photos."
+        )
+    return None
 
 
 @dataclass

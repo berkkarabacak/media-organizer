@@ -86,11 +86,13 @@ class TestAtomicCopy:
 
     def test_cleanup_stale_parts(self, tmp_path):
         (tmp_path / "a").mkdir()
-        (tmp_path / "a" / "x.jpg.part").write_bytes(b"")
-        (tmp_path / "y.jpg.part").write_bytes(b"")
+        (tmp_path / "a" / f"x.jpg{PART_SUFFIX}").write_bytes(b"")
+        (tmp_path / f"y.jpg{PART_SUFFIX}").write_bytes(b"")
         (tmp_path / "keep.jpg").write_bytes(b"")
+        (tmp_path / "notes.part").write_bytes(b"user")
         assert cleanup_stale_parts(tmp_path) == 2
         assert (tmp_path / "keep.jpg").exists()
+        assert (tmp_path / "notes.part").read_bytes() == b"user"
 
 
 class TestJournal:

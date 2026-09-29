@@ -10,28 +10,29 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings, QRectF, QTimer
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QUrl
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QRadioButton,
-    QStackedWidget, QStyledItemDelegate, QTableWidget, QTableWidgetItem,
+    QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QRadioButton, QStackedWidget, QStyledItemDelegate, QTableView,
     QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import APP_NAME, __version__
-from ..core.display import (elide_middle, format_bytes, relative_destination,
-                            relative_destination_fast, sorted_plan_items)
+from ..core.display import (elide_middle, finished_run_lines, format_bytes,
+                            relative_destination, relative_destination_fast,
+                            sorted_plan_items)
 from ..core.eta import ThroughputEstimator, format_eta, format_rate
 from ..core.executor import free_space_status
 from ..core.journal import (completed_sources, discard_journal,
                             find_unfinished_journal)
 from ..core.metadata import Confidence, DateSource
-from ..core.organizer import STRATEGIES, OrganizeOptions
-from ..core.plan import load_log, undo_log
+from ..core.organizer import STRATEGIES, OrganizeOptions, destination_blocks_scan
+from ..core.plan import UNDO_LIMITATION, load_log, undo_log, undo_result_message
 from ..core.strategies import DEFAULT_STRATEGY_KEY
 from . import icons, theme
 from .workers import OrganizeWorker, ScanWorker
@@ -74,6 +75,110 @@ def _badge(icon_name: str, badge_px: int = 44, icon_px: int = 20,
     label.setAlignment(Qt.AlignCenter)
     label.setPixmap(icons.pixmap(icon_name, color, icon_px))
     return label
+
+
+class _Cell:
+    """Stand-in for QTableWidgetItem so existing callers can read .text()."""
+
+    def __init__(self, model: "_PlanModel", row: int, column: int):
+        self._model = model
+        self._row = row
+        self._column = column
+
+    def text(self) -> str:
+        value = self._model.data(
+            self._model.index(self._row, self._column), Qt.DisplayRole)
+        return "" if value is None else str(value)
+
+    def data(self, role):
+        return self._model.data(self._model.index(self._row, self._column), role)
+
+
+class _PlanModel(QAbstractTableModel):
+    """Plan rows for the preview. The view asks only for cells it paints.
+
+    Building a QTableWidgetItem per cell froze the window after a few
+    thousand files. Strings are prepared once; icons are created when a
+    visible cell is painted.
+    """
+
+    HEADERS = ["FILE", "DATE TAKEN", "FOUND VIA", "NEW LOCATION", "SIZE"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: list[dict] = []
+
+    def rowCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return 5
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if (role == Qt.DisplayRole and orientation == Qt.Horizontal
+                and 0 <= section < 5):
+            return self.HEADERS[section]
+        return None
+
+    def set_rows(self, rows: list[dict]) -> None:
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+    def haystack(self, row: int) -> str:
+        if 0 <= row < len(self._rows):
+            return self._rows[row].get("hay") or ""
+        return ""
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        row = index.row()
+        col = index.column()
+        if not (0 <= row < len(self._rows) and 0 <= col < 5):
+            return None
+        item = self._rows[row]
+        if role == Qt.DisplayRole:
+            return item["text"][col]
+        if role == Qt.ToolTipRole:
+            return item["tips"][col] or None
+        if role == Qt.UserRole and col == COL_NAME:
+            return item["hay"]
+        if role == Qt.TextAlignmentRole and col == COL_SIZE:
+            return int(Qt.AlignRight | Qt.AlignVCenter)
+        if role == Qt.ForegroundRole:
+            if item["dim"]:
+                return QColor(theme.TEXT_FAINT)
+            if col == COL_SOURCE:
+                return QColor(item["src_color"])
+            return None
+        if role == Qt.DecorationRole:
+            if col == COL_NAME:
+                color = theme.TEXT_FAINT if item["dim"] else theme.TEXT_DIM
+                return icons.icon(item["name_icon"], color, 14)
+            if col == COL_SOURCE:
+                return icons.icon(item["src_icon"], item["src_color"], 13)
+        return None
+
+
+class PlanTableView(QTableView):
+    """QTableView with the small QTableWidget reads the rest of the app uses."""
+
+    def rowCount(self) -> int:
+        model = self.model()
+        return 0 if model is None else model.rowCount()
+
+    def item(self, row: int, column: int):
+        model = self.model()
+        if model is None or row < 0 or column < 0:
+            return None
+        if row >= model.rowCount() or column >= model.columnCount():
+            return None
+        return _Cell(model, row, column)
 
 
 class _ElideMiddleDelegate(QStyledItemDelegate):
@@ -617,9 +722,9 @@ class MainWindow(QMainWindow):
         top.addWidget(self.filter_edit)
         layout.addLayout(top)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["FILE", "DATE TAKEN", "FOUND VIA", "NEW LOCATION", "SIZE"])
+        self._plan_model = _PlanModel(self)
+        self.table = PlanTableView()
+        self.table.setModel(self._plan_model)
         header = self.table.horizontalHeader()
         # user-resizable columns; the destination column absorbs extra width
         for col in range(5):
@@ -635,8 +740,11 @@ class MainWindow(QMainWindow):
         self.table.setItemDelegateForColumn(COL_DEST, _ElideMiddleDelegate(self.table))
         self.table.setSortingEnabled(False)  # custom typed sorting instead
         self.table.setAlternatingRowColors(True)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setWordWrap(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.table.verticalHeader().setDefaultSectionSize(28)
         self.table.setShowGrid(False)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_row_menu)
@@ -681,6 +789,11 @@ class MainWindow(QMainWindow):
         pp.addLayout(eta_row)
         self.progress_panel.setVisible(False)
         layout.addWidget(self.progress_panel)
+
+        self.undo_limit_label = QLabel(UNDO_LIMITATION)
+        self.undo_limit_label.setObjectName("muted")
+        self.undo_limit_label.setWordWrap(True)
+        layout.addWidget(self.undo_limit_label)
 
         actions = QHBoxLayout()
         self.dry_run_step3 = QCheckBox("Dry run (simulate)")
@@ -804,7 +917,25 @@ class MainWindow(QMainWindow):
                 self, APP_NAME,
                 "Please choose where the organized copies should go.")
             return False
+        blocked = destination_blocks_scan(src, dst)
+        if blocked:
+            self._explain_blocked_destination(blocked)
+            return False
         return True
+
+    def _explain_blocked_destination(self, reason: str) -> None:
+        """Tell the user why this destination would scan nothing.
+
+        Happens before any copy or move. The sentence stays in the plan
+        summary after the dialog is dismissed.
+        """
+        self.plan = []
+        self.excluded.clear()
+        self._refresh_table()
+        self.plan_summary.setText(reason)
+        self.status_label.setText(reason)
+        self.organize_btn.setEnabled(False)
+        QMessageBox.warning(self, APP_NAME, reason)
 
     def _options(self) -> OrganizeOptions | None:
         if not self._validate_folders():
@@ -937,7 +1068,8 @@ class MainWindow(QMainWindow):
                 + ("set aside" if aside else "used (file date)"))
         if excl:
             parts.append(f"{excl} excluded")
-        parts.append(f"{format_bytes(copy_bytes)} to copy")
+        verb = "move" if self.move_radio.isChecked() else "copy"
+        parts.append(f"{format_bytes(copy_bytes)} to {verb}")
         self.plan_summary.setText("  ·  ".join(parts))
 
     # ----------------------------------------------------- sorting & columns
@@ -1023,11 +1155,11 @@ class MainWindow(QMainWindow):
             self._set_excluded(item, not is_excluded)
 
     def _refresh_table(self):
-        """(Re)fill the preview table in the current sort/view order.
+        """Point the preview at the current sort order.
 
-        GUI-thread cost is bounded: painting is suspended during the fill and
-        each row's filter text is precomputed once (see _apply_filter), so a
-        10k-row plan does not freeze the UI.
+        The view is a table model: it does not build a widget for every
+        file, so a few thousand rows stay responsive. Filter text is
+        precomputed once per row.
         """
         plan = self.plan
         if 0 <= self._sort_col < 5 and plan:
@@ -1040,28 +1172,15 @@ class MainWindow(QMainWindow):
         dest_root = self.dest_card.edit.text().strip()
         root_norm = (os.path.normcase(os.path.normpath(dest_root))
                      if dest_root else None)
-        dim = QColor(theme.TEXT_FAINT)
-        self.table.setUpdatesEnabled(True)  # in case a previous fill crashed
-        self.table.setUpdatesEnabled(False)
-        try:
-            self.table.setRowCount(0)
-            self.table.setRowCount(len(view))
-            for row, item in enumerate(view):
-                self._fill_row(row, item, root_norm, dim)
-        finally:
-            self.table.setUpdatesEnabled(True)
+        self._plan_model.set_rows(
+            [self._row_presentation(item, root_norm) for item in view])
         self._apply_filter(self.filter_edit.text())
 
-    def _fill_row(self, row, item, root_norm, dim):
+    def _row_presentation(self, item, root_norm) -> dict:
         is_excluded = str(item.source) in self.excluded
         kind_icon = "film" if item.kind == "video" else "image"
-        name_item = QTableWidgetItem(item.source.name)
-        name_item.setIcon(icons.icon(
-            kind_icon, theme.TEXT_FAINT if is_excluded else theme.TEXT_DIM, 14))
-        name_item.setToolTip(str(item.source) +
-                             ("\n(excluded from plan)" if is_excluded else ""))
-        self.table.setItem(row, COL_NAME, name_item)
-
+        name_tip = str(item.source) + (
+            "\n(excluded from plan)" if is_excluded else "")
         if item.is_duplicate:
             date_text, src_text = "duplicate", "exact duplicate (same content)"
             conf = Confidence.LOW
@@ -1075,37 +1194,23 @@ class MainWindow(QMainWindow):
         else:
             date_text, src_text, conf = "—", "no date found", Confidence.LOW
             src_icon = "alert-triangle"
-        self.table.setItem(row, COL_DATE, QTableWidgetItem(date_text))
-
-        src_item = QTableWidgetItem(src_text)
-        src_item.setIcon(icons.icon(src_icon, _CONFIDENCE_COLORS[conf], 13))
-        src_item.setForeground(QColor(_CONFIDENCE_COLORS[conf]))
-        src_item.setToolTip(item.capture.detail)
-        self.table.setItem(row, COL_SOURCE, src_item)
-
-        # Show the path relative to the destination root; full path in tooltip
-        # (string-only relative computation — resolve() per row froze the UI)
+        # String-only relative path — resolve() per row froze the UI.
         rel = relative_destination_fast(item.destination, root_norm)
-        dest_item = QTableWidgetItem(elide_middle(rel, 120))
-        if item.destination:
-            dest_item.setToolTip(str(item.destination))
-        self.table.setItem(row, COL_DEST, dest_item)
-
-        size_item = QTableWidgetItem(_fmt_size(item.size))
-        size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.table.setItem(row, COL_SIZE, size_item)
-
-        # precomputed lowercase haystack for fast filtering (once per row)
+        dest_text = elide_middle(rel, 120)
+        dest_tip = str(item.destination) if item.destination else ""
+        size_text = _fmt_size(item.size)
         haystack = " ".join(
-            (item.source.name, date_text, src_text, rel,
-             _fmt_size(item.size))).lower()
-        name_item.setData(Qt.UserRole, haystack)
-
-        if is_excluded:
-            for col in range(5):
-                cell = self.table.item(row, col)
-                if cell:
-                    cell.setForeground(dim)
+            (item.source.name, date_text, src_text, rel, size_text)).lower()
+        tips = (name_tip, "", item.capture.detail or "", dest_tip, "")
+        return {
+            "text": (item.source.name, date_text, src_text, dest_text, size_text),
+            "tips": tips,
+            "name_icon": kind_icon,
+            "src_icon": src_icon,
+            "src_color": _CONFIDENCE_COLORS[conf],
+            "hay": haystack,
+            "dim": is_excluded,
+        }
 
     # backwards-compatible alias (used by older tools/tests)
     def _populate_table(self, plan: list):
@@ -1113,16 +1218,19 @@ class MainWindow(QMainWindow):
         self._refresh_table()
 
     def _apply_filter(self, text: str):
-        """Show/hide rows by substring match against the precomputed haystack
-        (one O(1) lookup per row — no per-cell string rebuilding)."""
+        """Show/hide rows by substring match against the precomputed haystack."""
         needle = text.strip().lower()
-        for row in range(self.table.rowCount()):
-            if not needle:
-                self.table.setRowHidden(row, False)
-                continue
-            cell = self.table.item(row, COL_NAME)
-            hay = cell.data(Qt.UserRole) if cell else ""
-            self.table.setRowHidden(row, needle not in (hay or ""))
+        model = self._plan_model
+        self.table.setUpdatesEnabled(False)
+        try:
+            for row in range(model.rowCount()):
+                if not needle:
+                    self.table.setRowHidden(row, False)
+                    continue
+                hay = model.haystack(row)
+                self.table.setRowHidden(row, needle not in (hay or ""))
+        finally:
+            self.table.setUpdatesEnabled(True)
 
     # ---------------------------------------------------------- organize
 
@@ -1227,15 +1335,11 @@ class MainWindow(QMainWindow):
         dest_dir = self.dest_card.edit.text().strip()
         self._last_run = (log, dest_dir, summary)
 
-        mode = "copied" if summary["copied"] or not summary["moved"] else "moved"
-        done_n = summary["copied"] + summary["moved"]
         folders = len({str(Path(op.destination).parent) for op in log.operations
                        if op.status == "done"})
-        if summary.get("dry_run"):
-            self.status_label.setText(
-                f"Dry run finished — nothing was written ({done_n} would copy).")
-        else:
-            self.status_label.setText(f"Finished: {done_n} {mode}.")
+        status, text = finished_run_lines(
+            summary, folders=folders, total_bytes=self._last_active_bytes)
+        self.status_label.setText(status)
 
         box = QMessageBox(self)
         dry = summary.get("dry_run", False)
@@ -1243,24 +1347,6 @@ class MainWindow(QMainWindow):
         box.setIconPixmap(icons.pixmap(
             "scan" if dry else "check-circle",
             theme.AMBER if dry else theme.GREEN, 44))
-        if dry:
-            text = (f"Dry run complete — nothing was written.\n\n"
-                    f"Would copy {done_n:,} files "
-                    f"({format_bytes(self._last_active_bytes)}) "
-                    f"into {folders} folders")
-        else:
-            text = f"Done! {done_n} photos/videos {mode} into {folders} folders."
-        details = []
-        if summary["skipped_duplicates"]:
-            details.append(f"{summary['skipped_duplicates']} exact duplicates skipped")
-        if summary["undated"]:
-            details.append(f"{summary['undated']} without a date (in _undated)")
-        if summary["errors"]:
-            details.append(f"{summary['errors']} couldn't be read (skipped)")
-        if summary["cancelled"]:
-            details.append("the run was cancelled part-way")
-        if details:
-            text += "\n\n" + "\n".join(f"• {d}" for d in details)
         box.setText(text)
         open_btn = box.addButton("Open folder", QMessageBox.AcceptRole)
         open_btn.setIcon(icons.icon("external-link", theme.TEXT, 14))
@@ -1301,16 +1387,14 @@ class MainWindow(QMainWindow):
             return
         answer = QMessageBox.question(
             self, APP_NAME,
-            f"Undo the run from {log.started_at} "
-            f"({len(log.operations)} operations)?",
+            f"Undo the latest run from {log.started_at} "
+            f"({len(log.operations)} operations)?\n\n"
+            f"{UNDO_LIMITATION}",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer != QMessageBox.Yes:
             return
         result = undo_log(log, dst)
-        QMessageBox.information(
-            self, APP_NAME,
-            f"Undo complete: {result['undone']} files restored, "
-            f"{result['skipped']} skipped, {result['failed']} failed.")
+        QMessageBox.information(self, APP_NAME, undo_result_message(result))
 
     # -------------------------------------------------------------- helpers
 

@@ -6,6 +6,62 @@ from pathlib import Path
 from typing import Optional
 
 
+def finished_run_lines(summary: dict, *, folders: int, total_bytes: int
+                       ) -> tuple[str, str]:
+    """Status-bar line and dialog body for a finished organize run.
+
+    ``summary['action']`` is ``"copy"`` or ``"move"``. Dry-run text uses
+    that verb. mtime-only files are mentioned separately from files that
+    had no date at all (those go to ``_undated``).
+    """
+    action = summary.get("action")
+    if action not in ("copy", "move"):
+        action = ("move" if summary.get("moved") and not summary.get("copied")
+                  else "copy")
+    past = "moved" if action == "move" else "copied"
+    dry = bool(summary.get("dry_run"))
+    done_n = int(summary.get("copied") or 0) + int(summary.get("moved") or 0)
+    if dry:
+        status = (
+            f"Dry run finished — nothing was written "
+            f"({done_n:,} would {action})."
+        )
+        text = (
+            f"Dry run complete — nothing was written.\n\n"
+            f"Would {action} {done_n:,} files "
+            f"({format_bytes(total_bytes)}) "
+            f"into {folders} folders"
+        )
+    else:
+        status = f"Finished: {done_n} {past}."
+        text = f"Done! {done_n} photos/videos {past} into {folders} folders."
+    details = []
+    if summary.get("skipped_duplicates"):
+        details.append(f"{summary['skipped_duplicates']} exact duplicates skipped")
+    if summary.get("undated"):
+        details.append(f"{summary['undated']} without a date (in _undated)")
+    if summary.get("uncertain"):
+        if summary.get("uncertain_aside", True):
+            where = "in _uncertain"
+        else:
+            where = "filed by that file date"
+        details.append(
+            f"{summary['uncertain']} with only a file date ({where})"
+        )
+    if summary.get("errors"):
+        details.append(f"{summary['errors']} couldn't be read (skipped)")
+    if summary.get("cancelled"):
+        details.append("the run was cancelled part-way")
+    if details:
+        text += "\n\n" + "\n".join(f"• {d}" for d in details)
+    if not dry:
+        text += (
+            "\n\nOnly the latest run can be undone. Organizing again "
+            "replaces this undo log, and the earlier run cannot be undone."
+        )
+    return status, text
+
+
 def format_bytes(n: float) -> str:
     """Human size with 1 decimal: '812.5 KB', '3.9 MB', '48.2 GB'."""
     if n < 0:

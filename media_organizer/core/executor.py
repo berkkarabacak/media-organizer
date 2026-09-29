@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .journal import JournalWriter, atomic_copy, atomic_move, cleanup_stale_parts
+from .metadata import DateSource
 from .organizer import OrganizeOptions, PlannedFile
 from .plan import Operation, RunLog, new_log, save_log
 
@@ -75,8 +76,10 @@ def execute_plan(
     dry_run = getattr(options, "dry_run", False)
     log = new_log(options.dest_dir)
     summary = {"copied": 0, "moved": 0, "skipped_duplicates": 0,
-               "undated": 0, "errors": 0, "cancelled": False,
-               "dry_run": dry_run}
+               "undated": 0, "uncertain": 0, "errors": 0, "cancelled": False,
+               "dry_run": dry_run,
+               "action": "copy" if options.copy_mode else "move",
+               "uncertain_aside": getattr(options, "uncertain", "aside") == "aside"}
     total = len(plan)
     total_bytes = sum(item.size for item in plan if not item.is_duplicate
                       and item.destination is not None and not item.error)
@@ -103,6 +106,10 @@ def execute_plan(
                 continue
             if not item.capture.found:
                 summary["undated"] += 1
+            elif item.capture.source is DateSource.MTIME:
+                # Readable files almost always have an mtime, so "no date"
+                # is rare. The default is to file these in _uncertain.
+                summary["uncertain"] += 1
 
             action = "copy" if options.copy_mode else "move"
             op = Operation(action=action, source=str(item.source),
@@ -118,11 +125,16 @@ def execute_plan(
                 else:
                     final.parent.mkdir(parents=True, exist_ok=True)
                     if options.copy_mode:
-                        atomic_copy(item.source, final)
+                        digest = atomic_copy(item.source, final)
                         summary["copied"] += 1
                     else:
-                        atomic_move(item.source, final)
+                        digest = atomic_move(item.source, final)
                         summary["moved"] += 1
+                    op.sha256 = digest
+                    try:
+                        op.size = final.stat().st_size
+                    except OSError:
+                        op.size = item.size
                     op.status = "done"
                     bytes_done += item.size
                     journal.record(action, str(item.source), str(final))

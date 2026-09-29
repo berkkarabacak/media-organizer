@@ -8,6 +8,7 @@ name. Pure logic, no Qt.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -16,7 +17,9 @@ from typing import Iterator, Optional
 
 JOURNAL_DIRNAME = ".mediaorganizer-journal"
 JOURNAL_FILENAME = "operations.jsonl"
-PART_SUFFIX = ".part"
+# Distinct from a user file that merely ends in ".part". Incomplete copies
+# are named "<final name>.mediaorganizer.part" and only those are deleted.
+PART_SUFFIX = ".mediaorganizer.part"
 
 
 def journal_path_for(dest_dir: Path | str) -> Path:
@@ -103,38 +106,65 @@ def discard_journal(dest_dir: Path | str) -> None:
         pass
 
 
-def atomic_copy(source: Path, final: Path) -> None:
-    """Copy via temp name + atomic rename.
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    A crash mid-copy leaves only a `.part` file, never a truncated file at
-    the final name. Stale `.part` files from previous crashes are replaced.
+
+def atomic_copy(source: Path, final: Path) -> str:
+    """Copy via temp name + atomic rename. Returns the sha256 of the bytes.
+
+    A crash mid-copy leaves only a ``.mediaorganizer.part`` file, never a
+    truncated file at the final name. A stale part for this same destination
+    is replaced; other ``*.part`` files are not touched.
     """
     part = final.with_name(final.name + PART_SUFFIX)
     try:
         part.unlink()
     except OSError:
         pass
-    shutil.copy2(source, part)
+    digest = hashlib.sha256()
+    with open(source, "rb") as src, open(part, "wb") as out:
+        for chunk in iter(lambda: src.read(1024 * 1024), b""):
+            digest.update(chunk)
+            out.write(chunk)
+    shutil.copystat(source, part)
     os.replace(part, final)
+    return digest.hexdigest()
 
 
-def atomic_move(source: Path, final: Path) -> None:
-    """Move with crash safety: atomic same-volume when possible, else
-    copy-to-.part + rename + delete source."""
+def atomic_move(source: Path, final: Path) -> str:
+    """Move with crash safety. Returns the sha256 of the bytes now at `final`.
+
+    Same-volume renames are atomic. Across volumes the file is copied to a
+    ``.mediaorganizer.part`` name, renamed, then the source is removed.
+    """
     try:
         os.replace(source, final)  # same volume: truly atomic
     except OSError:
-        atomic_copy(source, final)
+        digest = atomic_copy(source, final)
         source.unlink()
+        return digest
+    return _sha256(final)
 
 
 def cleanup_stale_parts(dest_dir: Path | str) -> int:
-    """Remove leftover .part files from crashed runs. Returns count."""
+    """Remove this app's incomplete copies left by a crashed run.
+
+    Only names ending in ``.mediaorganizer.part`` are removed. A file the
+    user named ``notes.part`` or ``clip.mp4.part`` is left alone.
+    Returns how many files were removed.
+    """
     root = Path(dest_dir)
     n = 0
     if not root.is_dir():
         return 0
     for p in root.rglob(f"*{PART_SUFFIX}"):
+        if not p.is_file() or not p.name.endswith(PART_SUFFIX):
+            continue
         try:
             p.unlink()
             n += 1

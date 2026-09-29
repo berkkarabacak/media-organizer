@@ -3,7 +3,8 @@
 Order of attempts:
   1. EXIF DateTimeOriginal / DateTimeDigitized / DateTime (JPEG, TIFF, HEIC-adjacent)
   2. PNG text chunks (tEXt / zTXt containing a creation time)
-  3. Video container creation time (MP4/MOV/M4V/3GP mvhd/mdhd atoms, pure-Python)
+  3. Video container creation time (MP4/MOV/M4V/3GP mvhd/mdhd as UTC;
+     AVI/MKV/WEBM/WMV/FLV in containers.py)
   4. Filename date patterns
   5. Filesystem mtime (low confidence)
 """
@@ -15,10 +16,12 @@ import re
 import struct
 import zlib
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+from .containers import container_creation_date
 
 # Seconds between 1904-01-01 (QuickTime/MP4 epoch) and 1970-01-01 (Unix epoch).
 QT_EPOCH_OFFSET = 2082844800
@@ -226,7 +229,11 @@ def _qt_time_to_datetime(raw: int) -> Optional[datetime]:
     if ts < 0:
         return None
     try:
-        dt = datetime.fromtimestamp(ts)
+        # mvhd/mdhd creation_time is seconds since 1904-01-01 UTC (ISO BMFF).
+        # fromtimestamp() without a timezone would read that instant in the
+        # machine's local zone, so a clip just before midnight UTC lands on
+        # the next day (or month) on a computer east of UTC.
+        dt = datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None)
     except (OverflowError, OSError, ValueError):
         return None
     # sanity window: nothing before 1980, nothing in the far future
@@ -509,11 +516,19 @@ def extract_capture_date(path: os.PathLike | str, *, include_mtime: bool = True)
         if dt:
             return CaptureDate(dt, DateSource.PNG_TEXT, Confidence.HIGH, "PNG text chunk")
 
-    # 3. Video container creation time
+    # 3. Video container creation time.
+    # MP4/MOV/M4V/3GP are QuickTime atoms (above). AVI/MKV/WEBM/WMV/FLV are
+    # accepted as video too; their dates live in containers.py.
     if ext in ("mp4", "mov", "m4v", "3gp"):
         dt = _video_creation_date(path)
         if dt:
-            return CaptureDate(dt, DateSource.VIDEO, Confidence.HIGH, "video container metadata")
+            return CaptureDate(dt, DateSource.VIDEO, Confidence.HIGH,
+                               "video container metadata")
+    elif ext in ("avi", "mkv", "webm", "wmv", "flv"):
+        dt = container_creation_date(path, ext)
+        if dt:
+            return CaptureDate(dt, DateSource.VIDEO, Confidence.HIGH,
+                               "video container metadata")
 
     # 4. Filename patterns
     dt = _filename_date(path.name)
