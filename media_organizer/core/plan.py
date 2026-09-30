@@ -24,7 +24,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .journal import files_identical, path_identity
+from .journal import (completed_sources, discard_journal, files_identical,
+                      find_unfinished_journal, path_identity)
 
 LOG_DIRNAME = ".media_organizer"
 LOG_FILENAME = "operation_log.json"
@@ -414,6 +415,26 @@ def _leave_in_place(op: Operation) -> None:
     op.status = "kept"
 
 
+def _discard_journal_if_restored(dest_dir: Path, sources: list[str]) -> None:
+    """Drop an open crash journal that still lists a source this undo put back.
+
+    Resume skips ``completed_sources``. After those files are restored, that
+    skip would leave them out of the date folders and the run would still
+    look successful. Comparison uses :func:`path_identity`, the same key
+    resume uses, so slash style does not hide a match. An older run whose
+    restored sources are not in the open journal is left alone: that journal
+    belongs to a different organize.
+    """
+    if not sources:
+        return
+    journal = find_unfinished_journal(dest_dir)
+    if journal is None:
+        return
+    done = {path_identity(source) for source in completed_sources(journal)}
+    if any(path_identity(source) in done for source in sources):
+        discard_journal(dest_dir)
+
+
 def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
     """Undo every successful operation in the log. Returns a summary dict.
 
@@ -429,12 +450,20 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
     place does not block an older run. A failure leaves that operation
     ``done`` so another undo can try it, and this run stays at the front
     until then.
+
+    Sources that were actually restored are checked against an unfinished
+    journal for this destination. If any of them is still listed there,
+    the journal is discarded. Otherwise Resume would treat those files as
+    already organized and skip them. A file left in place or not restored
+    does not count. Undoing an older run that does not overlap the open
+    journal does not discard it.
     """
     dest_dir = Path(dest_dir)
     # Resolve the file before statuses change. A legacy log's identity
     # includes operation status, so a later lookup would miss it.
     saved_path = _find_saved_path(log, dest_dir)
     undone = skipped = failed = kept = 0
+    restored: list[str] = []
     # Reverse order so suffix chains unwind cleanly
     for op in reversed(log.operations):
         if op.status != "done":
@@ -459,6 +488,7 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
                     continue
                 if _discard_copied_file(dest):
                     undone += 1
+                    restored.append(op.source)
                 else:
                     failed += 1
             elif op.action == "move":
@@ -471,6 +501,7 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
                     continue
                 _move_back(src, dest)
                 undone += 1
+                restored.append(op.source)
             else:
                 skipped += 1
         except OSError:
@@ -482,6 +513,9 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
         _write_log(log, saved_path)
     else:
         save_log(log, dest_dir)
+    # After the files are back. A caller that never opens the GUI (and the
+    # GUI itself) both go through here, so Resume cannot skip a restored file.
+    _discard_journal_if_restored(dest_dir, restored)
     key = _stable_key(log)
     remaining = sum(
         1 for item in list_run_logs(dest_dir)

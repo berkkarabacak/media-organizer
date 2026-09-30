@@ -20,6 +20,7 @@ from media_organizer.core.metadata import (
     extract_capture_date, extract_gps,
 )
 from media_organizer.core.organizer import OrganizeOptions, PlannedFile, build_plan
+from media_organizer.core.plan import Operation, list_run_logs, new_log, undo_log
 from tests.helpers import make_jpeg_with_exif, make_jpeg_with_gps
 
 
@@ -704,6 +705,190 @@ class TestJournal:
         assert path_identity(messy) == path_identity(path)
         other = path.parent / "B.JPG"
         assert path_identity(other) != path_identity(path)
+
+
+def _resume_plan(plan, dest):
+    """Sources a Resume click would still organize.
+
+    Mirrors ``start_organize``: an open journal's ``completed_sources`` are
+    removed; no journal means the whole plan stays.
+    """
+    journal = find_unfinished_journal(dest)
+    if journal is None:
+        return list(plan)
+    return exclude_completed_sources(plan, completed_sources(journal))
+
+
+class TestUndoDiscardsOverlappingJournal:
+    """Undo of a cancelled run must not leave Resume skipping restored files.
+
+    ``execute_plan`` saves a log on cancel, so Undo is offered, and it
+    leaves the crash journal unfinished. Resume trusts ``completed_sources``
+    and would otherwise report success while those files stay out of the
+    date folders.
+    """
+
+    def test_undo_after_cancel_discards_unfinished_journal(self, tmp_path):
+        src, dst = _setup(tmp_path, n=4)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        calls = {"n": 0}
+
+        def cancel_after_two():
+            calls["n"] += 1
+            return calls["n"] > 2
+
+        log, summary = execute_plan(_plan(src, dst), options,
+                                    cancel=cancel_after_two)
+        assert summary["cancelled"]
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        done = completed_sources(journal)
+        assert done
+        copied = list(dst.rglob("*.jpg"))
+        assert len(copied) == len(done)
+
+        result = undo_log(log, dst)
+
+        assert result["undone"] == len(done)
+        assert result["failed"] == 0
+        assert not list(dst.rglob("*.jpg"))
+        for source in done:
+            assert Path(source).is_file()
+        assert find_unfinished_journal(dst) is None
+        assert not journal_path_for(dst).exists()
+
+    def test_undo_after_cancel_resume_recopies_restored_sources(self, tmp_path):
+        src, dst = _setup(tmp_path, n=4)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        plan = _plan(src, dst)
+        natural = {path_identity(item.source): item.destination for item in plan}
+        calls = {"n": 0}
+
+        def cancel_after_two():
+            calls["n"] += 1
+            return calls["n"] > 2
+
+        log, summary = execute_plan(plan, options, cancel=cancel_after_two)
+        assert summary["cancelled"]
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        done = completed_sources(journal)
+        done_ids = {path_identity(source) for source in done}
+        assert done_ids
+        # The bug: Resume would drop exactly the files Undo is about to put back.
+        skipped = exclude_completed_sources(plan, done)
+        assert done_ids.isdisjoint(path_identity(item.source) for item in skipped)
+        assert len(skipped) < len(plan)
+
+        result = undo_log(log, dst)
+        assert result["undone"] == len(done)
+        assert result["failed"] == 0
+        assert not list(dst.rglob("*.jpg"))
+        assert find_unfinished_journal(dst) is None
+
+        fresh = _plan(src, dst)
+        assert {path_identity(item.source): item.destination
+                for item in fresh} == natural
+        resumed = _resume_plan(fresh, dst)
+        resumed_ids = {path_identity(item.source) for item in resumed}
+        assert done_ids <= resumed_ids
+        assert resumed_ids == set(natural)
+
+        log2, summary2 = execute_plan(resumed, options)
+        assert summary2["cancelled"] is False
+        assert summary2["copied"] == len(plan)
+        assert summary2["errors"] == 0
+        assert find_unfinished_journal(dst) is None
+        copied = list(dst.rglob("*.jpg"))
+        assert sorted(copied) == sorted(natural.values())
+        for item in resumed:
+            dest = natural[path_identity(item.source)]
+            assert item.destination == dest
+            assert dest.is_file()
+            assert dest.read_bytes() == item.source.read_bytes()
+            assert item.source.is_file()
+        assert all(op.status == "done" for op in log2.operations)
+        assert {path_identity(op.source) for op in log2.operations} == resumed_ids
+
+    def test_undo_of_unrelated_older_log_keeps_open_journal(self, tmp_path):
+        src_old = tmp_path / "old"
+        dst = tmp_path / "dst"
+        src_old.mkdir()
+        make_jpeg_with_exif(src_old / "OLD_0.jpg", datetime(2023, 1, 2, 3, 4, 5))
+        make_jpeg_with_exif(src_old / "OLD_1.jpg", datetime(2023, 1, 2, 3, 5, 5))
+        options_old = OrganizeOptions(source_dir=src_old, dest_dir=dst)
+        log_old, summary_old = execute_plan(_plan(src_old, dst), options_old)
+        assert summary_old["copied"] == 2
+        assert find_unfinished_journal(dst) is None
+
+        src_new = tmp_path / "new"
+        src_new.mkdir()
+        for i in range(4):
+            make_jpeg_with_exif(src_new / f"NEW_{i}.jpg",
+                                datetime(2024, 6, 1, 12, i, 0))
+        options_new = OrganizeOptions(source_dir=src_new, dest_dir=dst)
+        calls = {"n": 0}
+
+        def cancel_after_two():
+            calls["n"] += 1
+            return calls["n"] > 2
+
+        log_new, summary_new = execute_plan(
+            _plan(src_new, dst), options_new, cancel=cancel_after_two)
+        assert summary_new["cancelled"]
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        done = completed_sources(journal)
+        assert done
+        assert done.isdisjoint(str(path) for path in src_old.glob("*.jpg"))
+        journal_text = journal.read_text(encoding="utf-8")
+        new_copies = sorted(p.relative_to(dst) for p in dst.rglob("NEW_*.jpg"))
+        assert new_copies
+
+        logs = list_run_logs(dst)
+        assert [item.run_id for item in logs] == [log_new.run_id, log_old.run_id]
+        result = undo_log(logs[1], dst)
+
+        assert result["undone"] == 2
+        assert result["failed"] == 0
+        assert not list(dst.rglob("OLD_*.jpg"))
+        assert sorted(p.relative_to(dst) for p in dst.rglob("NEW_*.jpg")) == new_copies
+        still = find_unfinished_journal(dst)
+        assert still is not None
+        assert completed_sources(still) == done
+        assert still.read_text(encoding="utf-8") == journal_text
+
+    def test_undo_matches_journal_sources_by_path_identity(self, tmp_path):
+        """A spelling-only difference still counts as the same restored file."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        source = src / "IMG.jpg"
+        payload = b"same-bytes-for-identity"
+        source.write_bytes(payload)
+        final = dst / "2024" / "IMG.jpg"
+        final.parent.mkdir(parents=True)
+        final.write_bytes(payload)
+        messy = str(source.parent) + os.sep + os.sep + source.name
+        assert messy != str(source)
+        assert path_identity(messy) == path_identity(source)
+        with JournalWriter(dst) as writer:
+            writer.record("copy", messy, str(final))
+        assert completed_sources(journal_path_for(dst)) == {messy}
+        assert str(source) not in completed_sources(journal_path_for(dst))
+
+        log = new_log(dst)
+        log.operations.append(Operation(
+            action="copy", source=str(source), destination=str(final),
+            status="done", size=len(payload)))
+        result = undo_log(log, dst)
+
+        assert result["undone"] == 1
+        assert result["failed"] == 0
+        assert not final.exists()
+        assert source.read_bytes() == payload
+        assert find_unfinished_journal(dst) is None
+        assert not journal_path_for(dst).exists()
 
 
 def _unfinished_without(dest: Path, source: Path) -> None:
