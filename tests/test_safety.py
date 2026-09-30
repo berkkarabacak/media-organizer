@@ -163,6 +163,116 @@ class TestJournal:
         assert completed_sources(jp) == {"a"}
         assert find_unfinished_journal(tmp_path) is not None
 
+    def test_second_run_interrupt_is_resumable_without_first_run(self, tmp_path):
+        """A finished organize must not hide a later interrupted one.
+
+        The journal used to stay append-only, so the first run's complete
+        marker made ``find_unfinished_journal`` return None for every later
+        crash into the same destination.
+        """
+        src_a, dst = _setup(tmp_path, n=2)
+        options_a = OrganizeOptions(source_dir=src_a, dest_dir=dst)
+        plan_a = _plan(src_a, dst)
+        execute_plan(plan_a, options_a)
+        assert find_unfinished_journal(dst) is None
+        run_a = {str(p.source) for p in plan_a}
+        kept = sorted(p.relative_to(dst) for p in dst.rglob("*.jpg"))
+        assert kept
+
+        src_b = tmp_path / "src_b"
+        src_b.mkdir()
+        for i in range(4):
+            make_jpeg_with_exif(src_b / f"B_{i}.jpg",
+                                datetime(2024, 8, 2, 11, i, 0))
+        options_b = OrganizeOptions(source_dir=src_b, dest_dir=dst)
+        plan_b = _plan(src_b, dst)
+        calls = {"n": 0}
+
+        def cancel_after_two():
+            calls["n"] += 1
+            return calls["n"] > 2
+
+        _log, summary = execute_plan(plan_b, options_b, cancel=cancel_after_two)
+        assert summary["cancelled"]
+        jp = find_unfinished_journal(dst)
+        assert jp is not None
+        done = completed_sources(jp)
+        assert len(done) == 2
+        assert done.isdisjoint(run_a)
+        assert done <= {str(p.source) for p in plan_b}
+        # The finished run was replaced, not left sitting above this one.
+        assert '"run": "complete"' not in jp.read_text(encoding="utf-8")
+        assert sorted(p.relative_to(dst) for p in dst.rglob("*.jpg")
+                      if "B_" not in p.name) == kept
+
+        remaining = [p for p in plan_b if str(p.source) not in done]
+        assert len(remaining) == 2
+        execute_plan(remaining, options_b)
+        assert find_unfinished_journal(dst) is None
+        assert len(list(dst.rglob("B_*.jpg"))) == 4
+        assert sorted(p.relative_to(dst) for p in dst.rglob("*.jpg")
+                      if "B_" not in p.name) == kept
+
+    def test_discard_clears_interrupted_second_run(self, tmp_path):
+        src_a, dst = _setup(tmp_path, n=1)
+        execute_plan(_plan(src_a, dst),
+                     OrganizeOptions(source_dir=src_a, dest_dir=dst))
+        assert find_unfinished_journal(dst) is None
+        first = next(dst.rglob("*.jpg"))
+
+        src_b = tmp_path / "src_b"
+        src_b.mkdir()
+        make_jpeg_with_exif(src_b / "B_0.jpg", datetime(2024, 9, 1, 8, 0, 0))
+        make_jpeg_with_exif(src_b / "B_1.jpg", datetime(2024, 9, 1, 8, 1, 0))
+        options_b = OrganizeOptions(source_dir=src_b, dest_dir=dst)
+        calls = {"n": 0}
+
+        def cancel_after_one():
+            calls["n"] += 1
+            return calls["n"] > 1
+
+        _log, summary = execute_plan(_plan(src_b, dst), options_b,
+                                     cancel=cancel_after_one)
+        assert summary["cancelled"]
+        assert find_unfinished_journal(dst) is not None
+        assert completed_sources(find_unfinished_journal(dst))
+        discard_journal(dst)
+        assert find_unfinished_journal(dst) is None
+        assert not journal_path_for(dst).exists()
+        assert first.exists() and first.read_bytes()
+
+    def test_open_segment_after_complete_marker_is_the_unfinished_run(
+            self, tmp_path):
+        """A journal appended after complete (older builds) still resumes.
+
+        Records before the last complete marker are a finished run. Resume
+        continues the tail instead of replacing it.
+        """
+        jp = journal_path_for(tmp_path)
+        jp.parent.mkdir(parents=True)
+        jp.write_text(
+            '{"action": "copy", "source": "run-a", "destination": "da",'
+            ' "status": "done"}\n'
+            '{"run": "complete"}\n'
+            '{"action": "copy", "source": "run-b1", "destination": "db1",'
+            ' "status": "done"}\n',
+            encoding="utf-8",
+        )
+        assert find_unfinished_journal(tmp_path) == jp
+        assert completed_sources(jp) == {"run-b1"}
+
+        with JournalWriter(tmp_path) as writer:
+            writer.record("copy", "run-b2", "db2")
+        assert completed_sources(jp) == {"run-b1", "run-b2"}
+        text = jp.read_text(encoding="utf-8")
+        assert "run-a" in text
+        assert find_unfinished_journal(tmp_path) is not None
+
+        with JournalWriter(tmp_path) as writer:
+            writer.complete()
+        assert find_unfinished_journal(tmp_path) is None
+        assert completed_sources(jp) == set()
+
 
 class TestDryRun:
     def test_dry_run_writes_nothing(self, tmp_path):

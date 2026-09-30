@@ -3,7 +3,8 @@
 Safety features:
 - dry_run: full pipeline simulation, writes nothing
 - crash journal: every completed file is journaled (JSONL) so an interrupted
-  run can be resumed; copies go through temp-name + atomic rename
+  run can be resumed. A new organize replaces a finished journal; a resume
+  appends to the unfinished one. Copies go through temp-name + atomic rename
 - free-space preflight helper
 """
 
@@ -111,6 +112,8 @@ def execute_plan(
     journal: Optional[JournalWriter] = None
     if not dry_run:
         cleanup_stale_parts(options.dest_dir)
+        # Replaces a finished journal. Continues one that is still open, which
+        # is how resume keeps the files already organized in this run.
         journal = JournalWriter(options.dest_dir)
 
     try:

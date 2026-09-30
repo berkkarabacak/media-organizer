@@ -1,9 +1,10 @@
-"""Crash-resilience journal: append-only JSONL per run in the destination.
+"""Crash-resilience journal: one JSONL file per destination.
 
 Each completed file operation is journaled immediately, so a power cut or
-crash mid-run leaves a resumable record. Copies are written to a temp name
-and atomically renamed, so a half-written file never appears at its final
-name. Pure logic, no Qt.
+crash mid-run leaves a resumable record. A new organize replaces that file.
+Resuming an interrupted run appends to the same file until it is marked
+complete. Copies are written to a temp name and atomically renamed, so a
+half-written file never appears at its final name. Pure logic, no Qt.
 """
 
 from __future__ import annotations
@@ -27,12 +28,23 @@ def journal_path_for(dest_dir: Path | str) -> Path:
 
 
 class JournalWriter:
-    """Append-only JSONL journal for one run."""
+    """JSONL journal for one organize run in the destination.
 
-    def __init__(self, dest_dir: Path | str):
+    A new run truncates ``operations.jsonl``. An interrupted run is continued
+    by appending; ``complete()`` is what closes it. Pass ``resume`` to force
+    either mode. When it is omitted, an existing unfinished journal is
+    continued and anything else (missing file, or a run that already
+    completed) is replaced.
+    """
+
+    def __init__(self, dest_dir: Path | str, *, resume: bool | None = None):
         self.path = journal_path_for(dest_dir)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._fh = open(self.path, "a", encoding="utf-8")
+        if resume is None:
+            resume = find_unfinished_journal(dest_dir) is not None
+        # "w" drops a finished journal so a later interrupt is not hidden by
+        # an older complete marker. "a" keeps the open run's records.
+        self._fh = open(self.path, "a" if resume else "w", encoding="utf-8")
 
     def record(self, action: str, source: str, destination: str) -> None:
         self._fh.write(json.dumps(
@@ -70,26 +82,57 @@ def _journal_entries(path: Path) -> Iterator[dict]:
         return
 
 
+def _open_run(path: Path) -> tuple[list[dict], bool]:
+    """Return ``(entries after the last complete marker, run is finished)``.
+
+    Only that tail is the current run. An earlier ``{"run": "complete"}``
+    closes the previous segment and does not finish a later one. A file with
+    no parsed records is unfinished: the writer was opened and the run
+    stopped before a complete marker (cancel, or a crash on the first line).
+    """
+    current: list[dict] = []
+    finished = False
+    saw = False
+    for entry in _journal_entries(path):
+        saw = True
+        if entry.get("run") == "complete":
+            current = []
+            finished = True
+        else:
+            current.append(entry)
+            finished = False
+    if not saw:
+        return [], False
+    return current, finished
+
+
 def find_unfinished_journal(dest_dir: Path | str) -> Optional[Path]:
-    """Return the journal path if a previous run was interrupted."""
+    """Return the journal path if the latest run was interrupted.
+
+    A destination can be organized more than once. A complete marker from an
+    earlier run does not hide a later run that stopped before ``complete()``.
+    """
     path = journal_path_for(dest_dir)
     if not path.exists():
         return None
-    completed = False
-    for entry in _journal_entries(path):
-        if entry.get("run") == "complete":
-            completed = True
-    return None if completed else path
+    _entries, finished = _open_run(path)
+    return None if finished else path
 
 
 def completed_sources(journal_path: Path | str) -> set[str]:
-    """Sources fully written in the interrupted run (safe to skip on resume)."""
-    return {e["source"] for e in _journal_entries(Path(journal_path))
+    """Sources fully written in the interrupted run (safe to skip on resume).
+
+    Sources from a run that already wrote ``{"run": "complete"}`` are not
+    included. Those files belong to a finished organize, not this resume.
+    """
+    entries, _finished = _open_run(Path(journal_path))
+    return {e["source"] for e in entries
             if e.get("status") == "done" and e.get("source")}
 
 
 def completed_destinations(journal_path: Path | str) -> set[str]:
-    return {e["destination"] for e in _journal_entries(Path(journal_path))
+    entries, _finished = _open_run(Path(journal_path))
+    return {e["destination"] for e in entries
             if e.get("status") == "done" and e.get("destination")}
 
 
