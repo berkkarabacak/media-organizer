@@ -120,9 +120,12 @@ main.py                     entry point
 media_organizer/
   core/                     pure logic (no Qt): metadata, organizer,
                             strategies, geodata, duplicates, executor,
-                            eta, display, plan (undo log)
+                            eta, display, plan (undo log), drive_sync
+                            (local Drive sync record; no network)
   gui/                      PySide6 UI: main window, workers, theme, icons
 tests/                      pytest suite for all core logic + GUI clicks
+docs/drive-incremental-upload.md
+                            design for a later Google Drive upload
 tools/
   capture_ui.py             offscreen screenshot harness (ui_shots/)
   verify_progress.py        offscreen progress/ETA verification

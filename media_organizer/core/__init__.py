@@ -1,1 +1,1 @@
-"""Core logic: metadata, planning, strategies, geodata, execution. Qt-free."""
+"""Core logic: metadata, planning, strategies, geodata, execution, local Drive sync record. Qt-free."""

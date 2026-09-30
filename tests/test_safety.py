@@ -53,6 +53,7 @@ class TestFreeSpace:
         s = free_space_status(tmp_path, 1024)
         assert s["drive"]
 
+    @pytest.mark.skipif(os.name != "nt", reason="Q: is a drive letter only on Windows")
     def test_nonexistent_drive_does_not_crash(self):
         # regression: preflight raised FileNotFoundError on a missing drive
         s = free_space_status("Q:/definitely_not_a_real_drive_xyz/o", 1024)
