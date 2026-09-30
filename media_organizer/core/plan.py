@@ -14,7 +14,6 @@ keep the run at the front of the stack, so an older run can be undone next.
 
 from __future__ import annotations
 
-import filecmp
 import json
 import os
 import shutil
@@ -24,6 +23,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+from .journal import files_identical, path_identity
 
 LOG_DIRNAME = ".media_organizer"
 LOG_FILENAME = "operation_log.json"
@@ -160,6 +161,22 @@ def list_run_logs(dest_dir: Path | str) -> list[RunLog]:
         if log is not None:
             logs.append(log)
     return logs
+
+
+def saved_run_destinations(dest_dir: Path | str) -> set[str]:
+    """Identity keys of destinations a saved organize run already recorded.
+
+    A crash after the final name is published does not reach ``save_log``,
+    so that file is not here. A later plan must not adopt a path this set
+    already owns: that copy belongs to the saved run, and undo of a newer
+    run has to leave it in place.
+    """
+    keys: set[str] = set()
+    for log in list_run_logs(dest_dir):
+        for op in log.operations:
+            if op.destination and op.status in ("done", "kept"):
+                keys.add(path_identity(op.destination))
+    return keys
 
 
 def load_log(dest_dir: Path | str) -> Optional[RunLog]:
@@ -319,14 +336,7 @@ def _same_path(src: Path, dest: Path) -> bool:
 
 def _identical(src: Path, dest: Path) -> bool:
     """True when `dest` is still a byte-for-byte copy of `src`."""
-    try:
-        if not src.is_file() or not dest.is_file():
-            return False
-        if src.stat().st_size != dest.stat().st_size:
-            return False
-        return filecmp.cmp(src, dest, shallow=False)
-    except OSError:
-        return False
+    return files_identical(src, dest)
 
 
 def _sha256(path: Path) -> str:

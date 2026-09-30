@@ -6,7 +6,9 @@ Safety features:
   run can be resumed. A new organize replaces a finished journal; a resume
   appends to the unfinished one. Copies are fsynced to a temp name, then
   atomically renamed. A cross-volume move journals that copy before the
-  source is removed.
+  source is removed. A destination that already holds this source's bytes
+  is journaled and not copied again. A different file at that path still
+  gets a collision suffix.
 - free-space preflight helper
 """
 
@@ -18,7 +20,8 @@ import shutil
 from pathlib import Path
 from typing import Callable, Optional
 
-from .journal import JournalWriter, atomic_copy, atomic_move, cleanup_stale_parts
+from .journal import (JournalWriter, atomic_copy, atomic_move,
+                       cleanup_stale_parts, file_sha256, files_identical)
 from .metadata import DateSource
 from .organizer import OrganizeOptions, PlannedFile
 from .plan import Operation, RunLog, new_log, save_log
@@ -54,6 +57,14 @@ def _final_destination(dest: Path) -> Path:
         n += 1
         candidate = dest.with_name(f"{stem}_{n}{suffix}")
     return candidate
+
+
+def _same_file(src: Path, dest: Path) -> bool:
+    """True when both paths are the same directory entry."""
+    try:
+        return src.samefile(dest)
+    except OSError:
+        return False
 
 
 def free_space_status(dest_dir: Path | str, needed_bytes: int) -> dict:
@@ -153,7 +164,14 @@ def execute_plan(
             op = Operation(action=action, source=str(item.source),
                            destination=str(item.destination))
             try:
-                final = _final_destination(item.destination)
+                # Published already, and still this source: do not copy a
+                # second file to name_1. A different occupant falls through
+                # to the collision suffix.
+                reused = files_identical(item.source, item.destination)
+                if reused:
+                    final = item.destination
+                else:
+                    final = _final_destination(item.destination)
                 op.destination = str(final)
                 if dry_run:
                     # simulate: no filesystem writes at all
@@ -165,9 +183,17 @@ def execute_plan(
                     # Copy keeps the source. Same-volume move renames it
                     # away inside atomic_move. Cross-volume move copies and
                     # leaves the source until the journal line below is
-                    # durable; only then is the source unlinked.
+                    # durable; only then is the source unlinked. A file that
+                    # is already at ``final`` takes the same order: journal,
+                    # then unlink, and only when it is not the same file.
                     unlink_source_after_journal = False
-                    if options.copy_mode:
+                    if reused:
+                        digest = file_sha256(final)
+                        summary["copied" if options.copy_mode else "moved"] += 1
+                        if (not options.copy_mode
+                                and not _same_file(item.source, final)):
+                            unlink_source_after_journal = True
+                    elif options.copy_mode:
                         digest = atomic_copy(item.source, final)
                         summary["copied"] += 1
                     else:

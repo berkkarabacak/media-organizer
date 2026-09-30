@@ -11,6 +11,7 @@ Pure logic, no Qt.
 
 from __future__ import annotations
 
+import filecmp
 import hashlib
 import json
 import ntpath
@@ -207,6 +208,30 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def file_sha256(path: Path) -> str:
+    """SHA-256 of the file's bytes."""
+    return _sha256(path)
+
+
+def files_identical(source: Path, dest: Path) -> bool:
+    """True when ``dest`` is a byte-for-byte match of ``source``.
+
+    Both paths must be regular files of the same size. The comparison reads
+    the contents (``filecmp`` with ``shallow=False``), so a same-size file
+    with different bytes is not a match. A missing path, a directory, or an
+    unreadable file is not a match: callers then keep the never-overwrite
+    collision suffix.
+    """
+    try:
+        if not source.is_file() or not dest.is_file():
+            return False
+        if source.stat().st_size != dest.stat().st_size:
+            return False
+        return filecmp.cmp(source, dest, shallow=False)
+    except OSError:
+        return False
+
+
 def atomic_copy(source: Path, final: Path) -> str:
     """Copy via temp name + atomic rename. Returns the sha256 of the bytes.
 
@@ -261,10 +286,13 @@ def atomic_move(source: Path, final: Path) -> tuple[str, bool]:
     Across volumes ``os.replace`` fails. The file is copied durably
     (``atomic_copy`` fsyncs the part file before rename) and the source is
     left in place. The flag is true: the caller must journal the move,
-    then unlink the source. Unlinking first can delete the only copy. The
-    part bytes are on disk, but the rename into ``final`` is a directory
-    entry this platform does not fsync, and a crash before the journal
-    line leaves nothing for resume to trust.
+    then unlink the source. Unlinking first can delete the only copy.
+
+    If the process dies after that rename and before the journal line, the
+    bytes are already at ``final`` and the source is still there. Resume
+    keeps that path when the bytes still match, instead of copying to a
+    collision name. A crash before the rename still leaves only the part
+    file.
     """
     try:
         os.replace(source, final)  # same volume: truly atomic

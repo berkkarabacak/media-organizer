@@ -706,6 +706,221 @@ class TestJournal:
         assert path_identity(other) != path_identity(path)
 
 
+def _unfinished_without(dest: Path, source: Path) -> None:
+    """Leave an interrupted journal that does not list ``source`` as done."""
+    jp = journal_path_for(dest)
+    jp.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps({
+        "action": "copy",
+        "source": str(dest / "not-the-source.jpg"),
+        "destination": str(dest / "already-journaled.jpg"),
+        "status": "done",
+    })
+    with open(jp, "a", encoding="utf-8") as fh:
+        fh.write(line + "\n")
+    assert find_unfinished_journal(dest) == jp
+    assert str(source) not in completed_sources(jp)
+
+
+class TestResumePublishedDestination:
+    """Crash after the final name is published and before the journal line.
+
+    ``cleanup_stale_parts`` only sees a ``.mediaorganizer.part``. Once
+    ``os.replace`` has published the final name, resume must not invent
+    ``name_1``.
+    """
+
+    def test_resume_keeps_final_name_published_before_journal(
+            self, tmp_path, monkeypatch):
+        src, dst = _setup(tmp_path, n=1)
+        source = src / "IMG_0.jpg"
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        planned = _plan(src, dst)[0].destination
+        assert planned.name == "IMG_0.jpg"
+        planned.parent.mkdir(parents=True)
+        atomic_copy(source, planned)
+        # A second copy would refresh this mtime from the source.
+        published = 1_000_000_000
+        os.utime(planned, (published, published))
+        os.utime(source, (published + 50, published + 50))
+        _unfinished_without(dst, source)
+
+        plan = _plan(src, dst)
+        assert plan[0].destination == planned
+        remaining = exclude_completed_sources(
+            plan, completed_sources(journal_path_for(dst)))
+        assert [item.source for item in remaining] == [source]
+
+        def fail_copy(*_args, **_kwargs):
+            raise AssertionError(
+                "resume copied a file that was already published")
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor.atomic_copy", fail_copy)
+        log, summary = execute_plan(remaining, options)
+
+        assert summary["copied"] == 1
+        assert summary["errors"] == 0
+        assert sorted(p.name for p in dst.rglob("*.jpg")) == ["IMG_0.jpg"]
+        assert planned.read_bytes() == source.read_bytes()
+        assert planned.stat().st_mtime == published
+        assert source.exists()
+        done = [op for op in log.operations if op.status == "done"]
+        assert [(op.action, op.source, op.destination) for op in done] == [
+            ("copy", str(source), str(planned))]
+        text = journal_path_for(dst).read_text(encoding="utf-8")
+        assert str(source) in text
+        assert text.strip().splitlines()[-1] == '{"run": "complete"}'
+        assert find_unfinished_journal(dst) is None
+
+    def test_cross_volume_resume_unlinks_source_after_journal(
+            self, tmp_path, monkeypatch):
+        src, dst = _setup(tmp_path, n=1)
+        source = src / "IMG_0.jpg"
+        payload = source.read_bytes()
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        planned = _plan(src, dst)[0].destination
+        planned.parent.mkdir(parents=True)
+        atomic_copy(source, planned)
+        published = 1_000_000_000
+        os.utime(planned, (published, published))
+        _unfinished_without(dst, source)
+        plan = _plan(src, dst)
+        assert plan[0].destination == planned
+        remaining = exclude_completed_sources(
+            plan, completed_sources(journal_path_for(dst)))
+
+        order = []
+        real_record = JournalWriter.record
+        real_unlink = Path.unlink
+
+        def spy_record(self, action, source_text, destination):
+            order.append("journal")
+            assert source.exists()
+            return real_record(self, action, source_text, destination)
+
+        def spy_unlink(self, *args, **kwargs):
+            if self == source:
+                order.append("unlink")
+                text = journal_path_for(dst).read_text(encoding="utf-8")
+                assert str(source) in text
+            return real_unlink(self, *args, **kwargs)
+
+        def fail_transfer(*_args, **_kwargs):
+            raise AssertionError(
+                "resume transferred a file that was already published")
+
+        monkeypatch.setattr(JournalWriter, "record", spy_record)
+        monkeypatch.setattr(Path, "unlink", spy_unlink)
+        monkeypatch.setattr(
+            "media_organizer.core.executor.atomic_move", fail_transfer)
+        monkeypatch.setattr(
+            "media_organizer.core.executor.atomic_copy", fail_transfer)
+
+        log, summary = execute_plan(remaining, options)
+
+        assert summary["moved"] == 1
+        assert summary["errors"] == 0
+        assert order == ["journal", "unlink"]
+        assert not source.exists()
+        assert planned.read_bytes() == payload
+        assert planned.stat().st_mtime == published
+        assert not list(dst.rglob("IMG_0_1.jpg"))
+        assert [(op.action, op.source, op.destination, op.status)
+                for op in log.operations] == [
+            ("move", str(source), str(planned), "done")]
+
+    def test_reused_destination_is_taken_for_a_later_row(self, tmp_path):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        (src / "a").mkdir(parents=True)
+        (src / "b").mkdir()
+        when = datetime(2024, 7, 15, 10, 0, 0)
+        first = make_jpeg_with_exif(src / "a" / "photo.jpg", when)
+        second = make_jpeg_with_exif(src / "b" / "photo.jpg", when)
+        second.write_bytes(second.read_bytes() + b"\x00extra")
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        natural = build_plan(options, files=[first])[0].destination
+        natural.parent.mkdir(parents=True)
+        atomic_copy(first, natural)
+        _unfinished_without(dst, first)
+
+        plan = build_plan(options, files=[first, second])
+
+        assert plan[0].destination == natural
+        assert plan[1].destination == natural.with_name("photo_1.jpg")
+        assert plan[0].destination.parent == plan[1].destination.parent
+
+    def test_different_bytes_still_get_collision_suffix(self, tmp_path):
+        src, dst = _setup(tmp_path, n=1)
+        source = src / "IMG_0.jpg"
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        natural = _plan(src, dst)[0].destination
+        natural.parent.mkdir(parents=True)
+        mutated = bytearray(source.read_bytes())
+        mutated[-1] ^= 0xFF
+        assert bytes(mutated) != source.read_bytes()
+        assert len(mutated) == source.stat().st_size
+        natural.write_bytes(bytes(mutated))
+        _unfinished_without(dst, source)
+
+        plan = _plan(src, dst)
+        assert plan[0].destination == natural.with_name("IMG_0_1.jpg")
+        log, summary = execute_plan(plan, options)
+
+        assert summary["copied"] == 1
+        assert summary["errors"] == 0
+        assert natural.read_bytes() == bytes(mutated)
+        assert plan[0].destination.read_bytes() == source.read_bytes()
+        assert log.operations[0].destination == str(plan[0].destination)
+        assert log.operations[0].status == "done"
+        assert source.exists()
+
+    def test_saved_run_is_not_adopted_during_a_later_interrupt(self, tmp_path):
+        """A finished run's copy stays a collision for the next plan.
+
+        Adopting it would make undo of the newer run delete the earlier one.
+        """
+        src, dst = _setup(tmp_path, n=1)
+        source = src / "IMG_0.jpg"
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        execute_plan(_plan(src, dst), options)
+        natural = dst / "2024" / "07 July" / "IMG_0.jpg"
+        original = natural.read_bytes()
+        assert original == source.read_bytes()
+        assert find_unfinished_journal(dst) is None
+        _unfinished_without(dst, source)
+
+        plan = _plan(src, dst)
+        assert plan[0].destination.name == "IMG_0_1.jpg"
+        log, summary = execute_plan(plan, options)
+
+        assert summary["copied"] == 1
+        assert summary["errors"] == 0
+        assert natural.read_bytes() == original
+        assert plan[0].destination.read_bytes() == source.read_bytes()
+        assert log.operations[0].destination == str(plan[0].destination)
+
+    def test_happy_path_uses_natural_name_once(self, tmp_path):
+        src, dst = _setup(tmp_path, n=1)
+        source = src / "IMG_0.jpg"
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        plan = _plan(src, dst)
+        assert plan[0].destination == dst / "2024" / "07 July" / "IMG_0.jpg"
+
+        log, summary = execute_plan(plan, options)
+
+        assert summary["copied"] == 1
+        assert summary["errors"] == 0
+        copied = list(dst.rglob("*.jpg"))
+        assert copied == [plan[0].destination]
+        assert copied[0].read_bytes() == source.read_bytes()
+        assert source.exists()
+        assert find_unfinished_journal(dst) is None
+        assert log.operations[0].status == "done"
+        assert log.operations[0].destination == str(plan[0].destination)
+
+
 class TestDryRun:
     def test_dry_run_writes_nothing(self, tmp_path):
         src, dst = _setup(tmp_path)

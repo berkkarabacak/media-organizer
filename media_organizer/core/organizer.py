@@ -13,8 +13,10 @@ from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 from .geodata import location_label
+from .journal import files_identical, find_unfinished_journal, path_identity
 from .metadata import (CaptureDate, DateSource, extract_capture_date,
                        extract_gps)
+from .plan import saved_run_destinations
 from .strategies import (DEFAULT_STRATEGY_KEY, STRATEGIES, UNCERTAIN_FOLDER,
                          UNDATED_FOLDER, UNKNOWN_LOCATION_FOLDER,
                          get_strategy, quarter_of)
@@ -285,6 +287,30 @@ def _unique_destination(dest_dir: Path, filename: str, taken: set[str]) -> Path:
     return candidate
 
 
+def _planned_destination(dest_dir: Path, src: Path, taken: set[str], *,
+                         reuse_identical: bool, owned: set[str]) -> Path:
+    """Destination for ``src``, reusing a published match on resume.
+
+    The crash window is a final name already on disk with no journal line
+    for this source. When those bytes still match, keep ``dest_dir/src.name``
+    instead of ``name_1``. Mark it taken so a later row cannot share it.
+
+    A path a saved run already logged is not reused. That copy belongs to
+    the earlier run, so a newer organize still gets a collision suffix and
+    undo of the newer run can leave the earlier file in place. A file that
+    merely exists and does not match is never overwritten.
+    """
+    natural = dest_dir / src.name
+    key = str(natural).lower()
+    if (reuse_identical
+            and key not in taken
+            and path_identity(natural) not in owned
+            and files_identical(src, natural)):
+        taken.add(key)
+        return natural
+    return _unique_destination(dest_dir, src.name, taken)
+
+
 def _location_for(src: Path, cache: dict[tuple[float, float], Optional[str]]
                   ) -> Optional[str]:
     """Resolve a file's GPS coordinates to a place label (cached)."""
@@ -299,7 +325,11 @@ def build_plan(
     files: Optional[list[Path]] = None,
     analysis: Optional[dict] = None,
 ) -> list[PlannedFile]:
-    """Build the full organise plan (dry run). Pure: touches nothing.
+    """Build the full organise plan (dry run). Does not write or rename.
+
+    On resume, a natural destination that is still a byte-for-byte match of
+    its source is kept. That is the crash after the final name was published
+    and before the journal line. Any other occupant gets a collision suffix.
 
     `files` and `analysis` ({path: (CaptureDate, gps)}) let the caller reuse
     an already-listed/parallel-analyzed batch (the GUI scan does this).
@@ -307,6 +337,11 @@ def build_plan(
     duplicates = duplicates or set()
     plan: list[PlannedFile] = []
     taken: set[str] = set()
+    # Only an interrupted run should adopt a file it already published.
+    # A finished journal means the next organize is a new run.
+    resuming = find_unfinished_journal(options.dest_dir) is not None
+    owned = (saved_run_destinations(options.dest_dir)
+             if resuming else set())
     strategy = get_strategy(options.strategy)
     geo_cache: dict[tuple[float, float], Optional[str]] = {}
     analysis = analysis or {}
@@ -350,7 +385,8 @@ def build_plan(
             rel = strategy.relative_path(capture, location)
         dest_dir = Path(options.dest_dir).joinpath(*rel.split("/"))
 
-        dest = _unique_destination(dest_dir, src.name, taken)
+        dest = _planned_destination(
+            dest_dir, src, taken, reuse_identical=resuming, owned=owned)
         plan.append(PlannedFile(src, dest, size, capture, kind,
                                 location=location))
 
