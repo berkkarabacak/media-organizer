@@ -7,6 +7,7 @@ strategies resolve coordinates through geodata.py. Pure logic, no Qt.
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Optional
@@ -109,20 +110,141 @@ class OrganizeOptions:
         return frozenset(exts)
 
 
+# Directory reparse points (junctions, mount points, symlink dirs). Windows
+# sets this even when os.path.islink is false, which is why os.walk follows
+# junctions with followlinks left at the default.
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def _normalized(path: str | os.PathLike) -> str:
+    return os.path.normcase(os.path.normpath(os.fspath(path)))
+
+
+def _is_same_or_inside(path_norm: str, root_norm: str) -> bool:
+    return path_norm == root_norm or path_norm.startswith(root_norm + os.sep)
+
+
+def _stat_is_non_descendable_dir(st: object, path: str) -> bool:
+    """True for a directory symlink, or a Windows junction / reparse directory.
+
+    `path` is only used for the isjunction fallback when the stat result has
+    no file-attribute field. A Windows stat that includes the field is
+    authoritative, so ordinary directories do not pay for a second check.
+    """
+    if stat.S_ISLNK(getattr(st, "st_mode", 0)):
+        return True
+    attrs = getattr(st, "st_file_attributes", None)
+    if attrs is not None and attrs & _REPARSE_POINT:
+        return True
+    if attrs is not None or os.name != "nt":
+        return False
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is None:
+        return False
+    try:
+        return bool(isjunction(path))
+    except OSError:
+        return False
+
+
+def _is_non_descendable_dir(path: str) -> bool:
+    """Directory symlink on any platform, or a Windows directory reparse point.
+
+    os.walk(followlinks=False) already skips directory symlinks, but a
+    junction is not a symlink: islink() is false and the walk follows it.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return _stat_is_non_descendable_dir(st, path)
+
+
+def _under_resolved_dest(dirpath: str, dest_norm: str,
+                         link_dirs: dict[str, bool]) -> bool:
+    """Whether this walk directory is the destination or already inside it.
+
+    The walk path is compared first, with no syscall. A junction or symlink
+    is resolved only when that string is a different path from the real
+    folder — never once per file.
+    """
+    if _is_same_or_inside(_normalized(dirpath), dest_norm):
+        return True
+    key = _normalized(dirpath)
+    if key not in link_dirs:
+        link_dirs[key] = _is_non_descendable_dir(dirpath)
+    if not link_dirs[key]:
+        return False
+    try:
+        resolved = _normalized(Path(dirpath).resolve())
+    except OSError:
+        return False
+    return _is_same_or_inside(resolved, dest_norm)
+
+
+def _drop_non_descendable(dirpath: str, dirnames: list[str],
+                          link_dirs: dict[str, bool]) -> None:
+    """Remove symlink and junction directories from dirnames, in place.
+
+    os.walk reads this same list after the yield to decide where to go
+    next, so replacing the list object would not stop the descent.
+    """
+    kept: list[str] = []
+    for name in dirnames:
+        child = os.path.join(dirpath, name)
+        key = _normalized(child)
+        if key not in link_dirs:
+            link_dirs[key] = _is_non_descendable_dir(child)
+        if link_dirs[key]:
+            continue
+        kept.append(name)
+    if len(kept) != len(dirnames):
+        dirnames[:] = kept
+
+
+def _iter_candidate_dirs(options: OrganizeOptions
+                         ) -> Iterator[tuple[str, list[str]]]:
+    """Yield (dirpath, filenames) for both the scan and the progress count.
+
+    The resolved destination tree is skipped. Directory symlinks and Windows
+    junction / reparse-point directories are not descended into, so a
+    destination created with mklink /J, or a junction that loops back into
+    the source, is not scanned.
+    """
+    root = Path(options.source_dir).resolve()
+    dest_norm = _normalized(Path(options.dest_dir).resolve())
+    link_dirs: dict[str, bool] = {}
+
+    if options.recursive:
+        walker = os.walk(root, followlinks=False)
+    else:
+        try:
+            names = os.listdir(root) if root.is_dir() else []
+        except OSError:
+            names = []
+        walker = [(os.fspath(root), [], names)]
+
+    for dirpath, dirnames, filenames in walker:
+        if _under_resolved_dest(dirpath, dest_norm, link_dirs):
+            # In-place: os.walk must not descend into the destination.
+            dirnames[:] = []
+            continue
+        if options.recursive:
+            _drop_non_descendable(dirpath, dirnames, link_dirs)
+        yield dirpath, filenames
+
+
 def count_media_files(options: OrganizeOptions) -> int:
     """Fast pre-count of candidate media files (extension match only).
 
-    Used to make scan progress determinate: no per-file stat/metadata reads,
-    just one directory walk. Cheap even on large trees.
+    Uses the same directories as the scan, including the destination prune
+    and the refusal to follow junctions or directory symlinks, so a progress
+    total matches the files the scan will yield. No per-file stat or
+    metadata read.
     """
-    root = Path(options.source_dir)
     exts = options.effective_extensions()
     count = 0
-    if options.recursive:
-        walker = os.walk(root)
-    else:
-        walker = [(str(root), [], os.listdir(root) if root.is_dir() else [])]
-    for _dirpath, _dirnames, filenames in walker:
+    for _dirpath, filenames in _iter_candidate_dirs(options):
         for name in filenames:
             if Path(name).suffix.lower().lstrip(".") in exts:
                 count += 1
@@ -132,26 +254,12 @@ def count_media_files(options: OrganizeOptions) -> int:
 def scan_media_files(options: OrganizeOptions) -> Iterator[Path]:
     """Yield candidate media files under source_dir.
 
-    The destination tree is pruned at the directory level (no per-file
-    resolve() — that was the scan bottleneck on large trees).
+    The destination tree is pruned at the directory level. resolve() runs
+    on the source, the destination, and a walk directory only when that
+    directory is itself a symlink or junction — not on every file.
     """
-    root = Path(options.source_dir).resolve()  # resolved once so the
-    # dirpath strings from os.walk compare cleanly against dest_str
     exts = options.effective_extensions()
-    dest_root = Path(options.dest_dir).resolve()
-    dest_str = os.path.normcase(os.path.normpath(str(dest_root)))
-
-    if options.recursive:
-        walker = os.walk(root)
-    else:
-        walker = [(str(root), [], os.listdir(root) if root.is_dir() else [])]
-
-    for dirpath, dirnames, filenames in walker:
-        dp = os.path.normcase(os.path.normpath(dirpath))
-        if dp == dest_str or dp.startswith(dest_str + os.sep):
-            # Never organise files that already live inside the destination
-            dirnames[:] = []
-            continue
+    for dirpath, filenames in _iter_candidate_dirs(options):
         for name in sorted(filenames):
             p = Path(dirpath) / name
             if p.suffix.lower().lstrip(".") not in exts:

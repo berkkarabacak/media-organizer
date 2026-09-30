@@ -10,10 +10,12 @@ from __future__ import annotations
 import calendar
 import json
 import os
+import stat
 import struct
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -22,7 +24,10 @@ from media_organizer.core.journal import PART_SUFFIX, cleanup_stale_parts
 from media_organizer.core.metadata import (
     QT_EPOCH_OFFSET, DateSource, extract_capture_date,
 )
-from media_organizer.core.organizer import OrganizeOptions, build_plan, scan_media_files
+from media_organizer.core.organizer import (
+    OrganizeOptions, build_plan, count_media_files, scan_media_files,
+    _is_non_descendable_dir, _stat_is_non_descendable_dir,
+)
 from media_organizer.core.plan import (
     UNDO_STACK_LIMIT, list_run_logs, load_log, load_undoable_log, log_path_for,
     undo_log,
@@ -263,8 +268,10 @@ class TestDestinationOverlap:
         reason = destination_blocks_scan(src, src)
         assert reason
         assert "same folder" in reason.lower()
-        found = list(scan_media_files(OrganizeOptions(source_dir=src, dest_dir=src)))
+        options = OrganizeOptions(source_dir=src, dest_dir=src)
+        found = list(scan_media_files(options))
         assert found == []
+        assert count_media_files(options) == 0
 
     def test_parent_destination_scans_nothing_and_explains(self, tmp_path):
         from media_organizer.core.organizer import destination_blocks_scan
@@ -278,9 +285,10 @@ class TestDestinationOverlap:
         reason = destination_blocks_scan(src, parent)
         assert reason
         assert "parent" in reason.lower()
-        found = list(scan_media_files(
-            OrganizeOptions(source_dir=src, dest_dir=parent)))
+        options = OrganizeOptions(source_dir=src, dest_dir=parent)
+        found = list(scan_media_files(options))
         assert found == []
+        assert count_media_files(options) == 0
 
     def test_destination_inside_source_still_scans(self, tmp_path):
         from media_organizer.core.organizer import destination_blocks_scan
@@ -288,10 +296,14 @@ class TestDestinationOverlap:
         src = tmp_path / "photos"
         dst = src / "Organized"
         src.mkdir()
+        dst.mkdir()
         (src / "a.jpg").write_bytes(b"jpeg")
+        (dst / "already.jpg").write_bytes(b"jpeg")
         assert destination_blocks_scan(src, dst) is None
-        found = list(scan_media_files(OrganizeOptions(source_dir=src, dest_dir=dst)))
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        found = list(scan_media_files(options))
         assert [p.name for p in found] == ["a.jpg"]
+        assert count_media_files(options) == 1
 
     def test_symlink_to_source_is_the_same_folder(self, tmp_path):
         from media_organizer.core.organizer import destination_blocks_scan
@@ -606,33 +618,303 @@ class TestRunWording:
         assert not dst.exists() or not any(dst.rglob("*.jpg"))
 
 
+def _path_key(path) -> str:
+    return os.path.normcase(os.path.normpath(os.path.abspath(os.fspath(path))))
+
+
+class _ReparseStat:
+    """Real stat plus the Windows reparse-point attribute.
+
+    Linux stat results cannot store st_file_attributes, so detection tests
+    hand this stand-in to os.lstat for the junction path only.
+    """
+
+    def __init__(self, st):
+        self._st = st
+        self.st_file_attributes = getattr(
+            stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+    def __getattr__(self, name):
+        return getattr(self._st, name)
+
+
+def _patch_lstat_reparse(monkeypatch, junction: Path):
+    real_lstat = os.lstat
+    junction_key = _path_key(junction)
+
+    def fake_lstat(path, *args, **kwargs):
+        st = real_lstat(path, *args, **kwargs)
+        if _path_key(path) == junction_key:
+            return _ReparseStat(st)
+        return st
+
+    monkeypatch.setattr(os, "lstat", fake_lstat)
+
+
+def _following_walk(top, topdown=True, onerror=None, followlinks=False):
+    """os.walk that follows directory links unless dirnames is edited.
+
+    A budget turns a junction/symlink loop into a test failure instead of
+    a hang. followlinks is ignored on purpose: Windows follows junctions
+    even when that flag is false.
+    """
+    budget = {"n": 0}
+
+    def rec(path):
+        budget["n"] += 1
+        if budget["n"] > 40:
+            raise RuntimeError("directory link was followed")
+        dirs: list[str] = []
+        files: list[str] = []
+        try:
+            with os.scandir(path) as it:
+                for entry in it:
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=True)
+                    except OSError:
+                        is_dir = False
+                    if is_dir:
+                        dirs.append(entry.name)
+                    else:
+                        files.append(entry.name)
+        except OSError:
+            return
+        yield path, dirs, files
+        for name in dirs:
+            yield from rec(os.path.join(path, name))
+
+    yield from rec(os.fspath(top))
+
+
 class TestWindowsJunctions:
+    def test_reparse_attribute_and_symlink_and_isjunction(self, tmp_path, monkeypatch):
+        ordinary = SimpleNamespace(st_mode=stat.S_IFDIR, st_file_attributes=0x10)
+        reparse = SimpleNamespace(
+            st_mode=stat.S_IFDIR,
+            st_file_attributes=getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400),
+        )
+        symlink = SimpleNamespace(st_mode=stat.S_IFLNK | 0o777)
+        assert _stat_is_non_descendable_dir(ordinary, "photos") is False
+        assert _stat_is_non_descendable_dir(reparse, "Organized") is True
+        assert _stat_is_non_descendable_dir(symlink, "alias") is True
+
+        # A Windows stat that carries the attribute field is enough. Do not
+        # call isjunction for every normal directory on a large library.
+        monkeypatch.setattr(os, "name", "nt")
+
+        def unexpected(path):
+            raise AssertionError(f"isjunction was called for {path}")
+
+        monkeypatch.setattr(os.path, "isjunction", unexpected, raising=False)
+        assert _stat_is_non_descendable_dir(ordinary, "photos") is False
+
+        bare = SimpleNamespace(st_mode=stat.S_IFDIR)  # no attribute field
+        monkeypatch.setattr(
+            os.path, "isjunction", lambda path: path == "J", raising=False)
+        assert _stat_is_non_descendable_dir(bare, "J") is True
+        assert _stat_is_non_descendable_dir(bare, "other") is False
+
+        folder = tmp_path / "folder"
+        folder.mkdir()
+        target = tmp_path / "target"
+        target.mkdir()
+        link = tmp_path / "link"
+        link.symlink_to(target, target_is_directory=True)
+        assert _is_non_descendable_dir(str(folder)) is False
+        assert _is_non_descendable_dir(str(link)) is True
+
+    def test_reparse_point_directory_is_not_scanned_or_counted(
+            self, tmp_path, monkeypatch):
+        root = tmp_path.resolve() / "photos"
+        junction = root / "Organized"
+        nested = root / "sub"
+        root.mkdir()
+        junction.mkdir()
+        nested.mkdir()
+        (root / "a.jpg").write_bytes(b"a")
+        (nested / "b.jpg").write_bytes(b"b")
+        (junction / "via.jpg").write_bytes(b"v")
+        (junction / "deep").mkdir()
+        (junction / "deep" / "c.jpg").write_bytes(b"c")
+        _patch_lstat_reparse(monkeypatch, junction)
+
+        options = OrganizeOptions(source_dir=root, dest_dir=tmp_path / "out")
+        found = list(scan_media_files(options))
+        assert sorted(p.name for p in found) == ["a.jpg", "b.jpg"]
+        assert count_media_files(options) == len(found)
+
+    def test_directory_symlink_is_not_followed(self, tmp_path, monkeypatch):
+        root = tmp_path.resolve() / "photos"
+        outside = tmp_path.resolve() / "outside"
+        root.mkdir()
+        outside.mkdir()
+        (root / "a.jpg").write_bytes(b"a")
+        (root / "sub").mkdir()
+        (root / "sub" / "c.jpg").write_bytes(b"c")
+        (outside / "b.jpg").write_bytes(b"b")
+        link = root / "loop"
+        link.symlink_to(root, target_is_directory=True)
+        other = root / "alias"
+        other.symlink_to(outside, target_is_directory=True)
+        assert link.is_dir() and other.is_dir()
+
+        monkeypatch.setattr(os, "walk", _following_walk)
+        options = OrganizeOptions(source_dir=root, dest_dir=tmp_path / "out")
+        found = list(scan_media_files(options))
+        assert sorted(p.name for p in found) == ["a.jpg", "c.jpg"]
+        assert count_media_files(options) == len(found)
+
+    def test_symlink_loop_is_followed_when_detection_is_off(
+            self, tmp_path, monkeypatch):
+        root = tmp_path.resolve() / "photos"
+        root.mkdir()
+        (root / "a.jpg").write_bytes(b"a")
+        link = root / "loop"
+        link.symlink_to(root, target_is_directory=True)
+        monkeypatch.setattr(os, "walk", _following_walk)
+        monkeypatch.setattr(
+            "media_organizer.core.organizer._is_non_descendable_dir",
+            lambda path: False,
+        )
+        with pytest.raises(RuntimeError, match="directory link was followed"):
+            list(scan_media_files(
+                OrganizeOptions(source_dir=root, dest_dir=tmp_path / "out")))
+
+    def test_entered_junction_is_pruned_by_resolved_path(
+            self, tmp_path, monkeypatch):
+        """A junction path string is not the resolved destination.
+
+        Windows os.walk can already be inside the junction before the scan
+        decides whether to prune. The files in that directory belong to the
+        destination and must be skipped, without resolve() on each file.
+        """
+        root = tmp_path.resolve() / "photos"
+        outside = tmp_path.resolve() / "elsewhere"
+        junction = root / "Organized"
+        root.mkdir()
+        outside.mkdir()
+        junction.mkdir()
+        (root / "a.jpg").write_bytes(b"a")
+        (root / "sub").mkdir()
+        (root / "sub" / "b.jpg").write_bytes(b"b")
+        (junction / "already.jpg").write_bytes(b"already")
+        (junction / "nested").mkdir()
+        (junction / "nested" / "deep.jpg").write_bytes(b"deep")
+        (outside / "marker.txt").write_bytes(b"x")
+
+        resolved: list[Path] = []
+        real_resolve = Path.resolve
+
+        def fake_resolve(self, *args, **kwargs):
+            resolved.append(Path(self))
+            if _path_key(self) == _path_key(junction):
+                return real_resolve(outside)
+            return real_resolve(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "resolve", fake_resolve)
+        _patch_lstat_reparse(monkeypatch, junction)
+
+        def fake_walk(top, topdown=True, onerror=None, followlinks=False):
+            junction_dirs = ["nested"]
+            yield os.fspath(junction), junction_dirs, ["already.jpg"]
+            if "nested" in junction_dirs:
+                yield os.fspath(junction / "nested"), [], ["deep.jpg"]
+            source_dirs = ["sub", "Organized"]
+            yield os.fspath(root), source_dirs, ["a.jpg"]
+            if "sub" in source_dirs:
+                yield os.fspath(root / "sub"), [], ["b.jpg"]
+            if "Organized" in source_dirs:
+                yield os.fspath(junction), [], ["already.jpg"]
+
+        monkeypatch.setattr(os, "walk", fake_walk)
+        options = OrganizeOptions(source_dir=root, dest_dir=junction)
+        found = list(scan_media_files(options))
+        assert sorted(p.name for p in found) == ["a.jpg", "b.jpg"]
+        assert count_media_files(options) == len(found)
+        assert resolved
+        assert not any(path.suffix.lower() == ".jpg" for path in resolved)
+
+    def test_symlink_to_a_media_file_is_still_scanned(self, tmp_path):
+        root = tmp_path / "photos"
+        root.mkdir()
+        real = root / "real.jpg"
+        real.write_bytes(b"jpeg")
+        alias = root / "alias.jpg"
+        alias.symlink_to(real)
+        options = OrganizeOptions(source_dir=root, dest_dir=tmp_path / "out")
+        found = sorted(p.name for p in scan_media_files(options))
+        assert found == ["alias.jpg", "real.jpg"]
+        assert count_media_files(options) == 2
+
     @pytest.mark.skipif(
         os.name != "nt",
         reason=(
-            "Windows directory junctions cannot be created on this machine "
-            "(no mklink /J). Not verified, and no scan change was made for it: "
-            "scan_media_files compares os.walk paths to the resolved destination "
-            "string, while os.walk follows junctions on some Windows Python "
-            "versions even with followlinks left at the default. A junction "
-            "used as the destination inside the source, or a junction that "
-            "loops back into the source, could be scanned, skipped entirely, "
-            "or walked without end. This skip is not a pass."
+            "mklink /J creates a directory junction only on Windows. "
+            "This Linux run does not create one; detection and pruning "
+            "are covered by the reparse-attribute and symlink tests above."
         ),
     )
     def test_junction_destination_inside_source_is_pruned(self, tmp_path):
         import subprocess
 
-        src = tmp_path / "photos"
+        root = tmp_path / "photos"
         target = tmp_path / "elsewhere"
-        link = src / "Organized"
-        src.mkdir()
+        link = root / "Organized"
+        loop = root / "loop"
+        root.mkdir()
         target.mkdir()
-        (src / "a.jpg").write_bytes(b"jpeg")
+        (root / "a.jpg").write_bytes(b"jpeg")
+        (root / "sub").mkdir()
+        (root / "sub" / "b.jpg").write_bytes(b"jpeg")
         (target / "already.jpg").write_bytes(b"jpeg")
-        subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(target)],
-                       check=True)
-        found = list(scan_media_files(
-            OrganizeOptions(source_dir=src, dest_dir=link)))
-        names = sorted(p.name for p in found)
-        assert names == ["a.jpg"]
+        (target / "nested").mkdir()
+        (target / "nested" / "deep.jpg").write_bytes(b"jpeg")
+        created = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True, text=True,
+        )
+        if created.returncode != 0 or not link.exists():
+            pytest.skip(
+                "mklink /J could not create a directory junction: "
+                + (created.stderr or created.stdout or "no output").strip()
+            )
+        looped = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(loop), str(root)],
+            capture_output=True, text=True,
+        )
+        if looped.returncode != 0 or not loop.exists():
+            pytest.skip(
+                "mklink /J could not create a loop junction: "
+                + (looped.stderr or looped.stdout or "no output").strip()
+            )
+        options = OrganizeOptions(source_dir=root, dest_dir=link)
+        # os.walk has no visited set. A junction back into the source is a
+        # different path each time, so a missed filter grows the stack
+        # without end. Stop on the second visit to the same directory inode.
+        real_walk = os.walk
+
+        def guarded_walk(top, topdown=True, onerror=None, followlinks=False):
+            seen: dict[tuple, int] = {}
+            for dirpath, dirnames, filenames in real_walk(
+                    top, topdown=topdown, onerror=onerror,
+                    followlinks=followlinks):
+                try:
+                    st = os.stat(dirpath)
+                    key = (st.st_dev, st.st_ino)
+                except OSError:
+                    key = (dirpath,)
+                seen[key] = seen.get(key, 0) + 1
+                if seen[key] > 1:
+                    raise RuntimeError(
+                        "walk revisited a directory; junction loop was followed"
+                    )
+                yield dirpath, dirnames, filenames
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(os, "walk", guarded_walk)
+        try:
+            found = list(scan_media_files(options))
+            assert sorted(p.name for p in found) == ["a.jpg", "b.jpg"]
+            assert count_media_files(options) == len(found)
+        finally:
+            monkeypatch.undo()
