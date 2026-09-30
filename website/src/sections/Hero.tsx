@@ -93,7 +93,7 @@ export default function Hero() {
           <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '14px' }} className="pointer-events-auto">
             <LiquidGlassButton
               onClick={() => {
-                window.open('https://github.com/berkkarabacak/media-organizer/releases/latest/download/MediaOrganizer-Setup-1.5.3.exe', '_blank');
+                window.open('https://github.com/berkkarabacak/media-organizer/releases/latest/download/MediaOrganizer-Setup-1.5.4.exe', '_blank');
               }}
             >
               {heroConfig.ctaText}
