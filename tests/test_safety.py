@@ -183,7 +183,9 @@ class TestAtomicCopy:
             order.append(("replace", Path(src_path), Path(dst_path)))
             return real_replace(src_path, dst_path)
 
-        monkeypatch.setattr("media_organizer.core.journal.open", spy_open)
+        # ``open`` is a builtin, not a module global, until the spy is installed.
+        monkeypatch.setattr(
+            "media_organizer.core.journal.open", spy_open, raising=False)
         monkeypatch.setattr(
             "media_organizer.core.journal.os.fsync", spy_fsync)
         monkeypatch.setattr(
