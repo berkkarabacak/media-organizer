@@ -5,7 +5,8 @@ Safety features:
 - crash journal: every completed file is journaled (JSONL) so an interrupted
   run can be resumed. A new organize replaces a finished journal; a resume
   appends to the unfinished one. Copies are fsynced to a temp name, then
-  atomically renamed
+  atomically renamed. A cross-volume move journals that copy before the
+  source is removed.
 - free-space preflight helper
 """
 
@@ -112,6 +113,8 @@ def execute_plan(
 
     journal: Optional[JournalWriter] = None
     if not dry_run:
+        # Promote an orphan part onto its final name before a new copy can
+        # land beside it. A part whose final name already exists is removed.
         cleanup_stale_parts(options.dest_dir)
         # Replaces a finished journal. Continues one that is still open, which
         # is how resume keeps the files already organized in this run.
@@ -159,11 +162,17 @@ def execute_plan(
                     bytes_done += item.size
                 else:
                     final.parent.mkdir(parents=True, exist_ok=True)
+                    # Copy keeps the source. Same-volume move renames it
+                    # away inside atomic_move. Cross-volume move copies and
+                    # leaves the source until the journal line below is
+                    # durable; only then is the source unlinked.
+                    unlink_source_after_journal = False
                     if options.copy_mode:
                         digest = atomic_copy(item.source, final)
                         summary["copied"] += 1
                     else:
-                        digest = atomic_move(item.source, final)
+                        digest, unlink_source_after_journal = atomic_move(
+                            item.source, final)
                         summary["moved"] += 1
                     op.sha256 = digest
                     try:
@@ -173,6 +182,11 @@ def execute_plan(
                     op.status = "done"
                     bytes_done += item.size
                     journal.record(action, str(item.source), str(final))
+                    if unlink_source_after_journal:
+                        try:
+                            item.source.unlink()
+                        except FileNotFoundError:
+                            pass
             except OSError as exc:
                 op.status = "error"
                 op.error = str(exc)

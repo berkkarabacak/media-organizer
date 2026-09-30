@@ -127,8 +127,10 @@ class TestAtomicCopy:
         src, _ = _setup(tmp_path)
         f = src / "IMG_1.jpg"
         final = tmp_path / "moved.jpg"
-        atomic_move(f, final)
+        digest, unlink_after = atomic_move(f, final)
+        assert unlink_after is False
         assert final.exists() and not f.exists()
+        assert digest == hashlib.sha256(final.read_bytes()).hexdigest()
 
     def test_part_file_is_fsynced_before_replace(self, tmp_path, monkeypatch):
         """Part-file bytes are fsynced before that name becomes final.
@@ -208,7 +210,11 @@ class TestAtomicCopy:
 
     def test_cross_volume_move_fsyncs_part_before_replace(
             self, tmp_path, monkeypatch):
-        """A failed same-volume rename uses the durable copy path."""
+        """A failed same-volume rename uses the durable copy path.
+
+        The source stays. ``execute_plan`` journals the move and only then
+        unlinks it. Deleting here, before that record, is the data-loss window.
+        """
         src = _setup(tmp_path)[0] / "IMG_1.jpg"
         payload = src.read_bytes()
         final = tmp_path / "moved.jpg"
@@ -233,9 +239,10 @@ class TestAtomicCopy:
         monkeypatch.setattr(
             "media_organizer.core.journal.os.replace", spy_replace)
 
-        digest = atomic_move(src, final)
+        digest, unlink_after = atomic_move(src, final)
 
-        assert not src.exists()
+        assert unlink_after is True
+        assert src.read_bytes() == payload
         assert final.read_bytes() == payload
         assert digest == hashlib.sha256(payload).hexdigest()
         kinds = [kind for kind, *_rest in order]
@@ -255,18 +262,146 @@ class TestAtomicCopy:
             raise AssertionError("same-volume rename must not fsync")
 
         monkeypatch.setattr("media_organizer.core.journal.os.fsync", boom)
-        atomic_move(f, final)
+        _digest, unlink_after = atomic_move(f, final)
+        assert unlink_after is False
         assert final.exists() and not f.exists()
+
+    def test_cross_volume_move_journals_before_source_unlink(
+            self, tmp_path, monkeypatch):
+        """Cross-volume move records the journal line before unlinking.
+
+        The same-volume ``os.replace`` is failed once, as in the fsync
+        test, so the copy path runs on one filesystem. The source must
+        still exist when ``JournalWriter.record`` returns (that call
+        fsyncs the done line), and only then be removed.
+        """
+        src, dst = _setup(tmp_path, n=1)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        source = plan[0].source
+        payload = source.read_bytes()
+        source_key = os.path.normcase(os.path.abspath(source))
+        order = []
+        real_replace = os.replace
+        real_record = JournalWriter.record
+        real_unlink = Path.unlink
+        replaces = {"n": 0}
+
+        def spy_replace(src_path, dst_path):
+            replaces["n"] += 1
+            if replaces["n"] == 1:
+                order.append("replace-cross")
+                raise OSError("simulated cross-volume rename")
+            order.append("replace-part")
+            return real_replace(src_path, dst_path)
+
+        def spy_record(self, action, source_s, destination):
+            assert os.path.normcase(os.path.abspath(source_s)) == source_key
+            assert Path(source_s).is_file()
+            assert Path(destination).is_file()
+            assert Path(destination).read_bytes() == payload
+            result = real_record(self, action, source_s, destination)
+            order.append("journal")
+            return result
+
+        def spy_unlink(self, missing_ok=False):
+            if os.path.normcase(os.path.abspath(self)) == source_key:
+                text = journal_path_for(dst).read_text(encoding="utf-8")
+                assert str(source) in text
+                assert '"status": "done"' in text
+                assert self.is_file()
+                order.append("unlink")
+            return real_unlink(self, missing_ok=missing_ok)
+
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.replace", spy_replace)
+        monkeypatch.setattr(JournalWriter, "record", spy_record)
+        monkeypatch.setattr(Path, "unlink", spy_unlink)
+
+        log, summary = execute_plan(plan, options)
+
+        assert summary["moved"] == 1
+        assert summary["errors"] == 0
+        assert not source.exists()
+        final = Path(log.operations[0].destination)
+        assert final.read_bytes() == payload
+        assert order.index("replace-cross") < order.index("replace-part")
+        assert order.index("replace-part") < order.index("journal")
+        assert order.index("journal") < order.index("unlink")
+        assert order.count("unlink") == 1
+
+    def test_cross_volume_move_keeps_source_when_journal_fails(
+            self, tmp_path, monkeypatch):
+        """A journal failure must not drop the cross-volume source."""
+        src, dst = _setup(tmp_path, n=1)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        source = plan[0].source
+        payload = source.read_bytes()
+        real_replace = os.replace
+        replaces = {"n": 0}
+
+        def spy_replace(src_path, dst_path):
+            replaces["n"] += 1
+            if replaces["n"] == 1:
+                raise OSError("simulated cross-volume rename")
+            return real_replace(src_path, dst_path)
+
+        def boom(self, action, source_s, destination):
+            assert Path(source_s).is_file()
+            assert Path(source_s).read_bytes() == payload
+            raise OSError("journal write failed")
+
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.replace", spy_replace)
+        monkeypatch.setattr(JournalWriter, "record", boom)
+
+        log, summary = execute_plan(plan, options)
+
+        assert summary["errors"] == 1
+        assert source.is_file()
+        assert source.read_bytes() == payload
+        assert log.operations[0].status == "error"
+        copied = list(dst.rglob("*.jpg"))
+        assert len(copied) == 1
+        assert copied[0].read_bytes() == payload
+        text = journal_path_for(dst).read_text(encoding="utf-8")
+        assert str(source) not in text
 
     def test_cleanup_stale_parts(self, tmp_path):
         (tmp_path / "a").mkdir()
-        (tmp_path / "a" / f"x.jpg{PART_SUFFIX}").write_bytes(b"")
-        (tmp_path / f"y.jpg{PART_SUFFIX}").write_bytes(b"")
+        (tmp_path / "a" / f"x.jpg{PART_SUFFIX}").write_bytes(b"x-bytes")
+        (tmp_path / f"y.jpg{PART_SUFFIX}").write_bytes(b"y-bytes")
         (tmp_path / "keep.jpg").write_bytes(b"")
         (tmp_path / "notes.part").write_bytes(b"user")
         assert cleanup_stale_parts(tmp_path) == 2
-        assert (tmp_path / "keep.jpg").exists()
+        assert (tmp_path / "a" / "x.jpg").read_bytes() == b"x-bytes"
+        assert not (tmp_path / "a" / f"x.jpg{PART_SUFFIX}").exists()
+        assert (tmp_path / "y.jpg").read_bytes() == b"y-bytes"
+        assert not (tmp_path / f"y.jpg{PART_SUFFIX}").exists()
+        assert (tmp_path / "keep.jpg").read_bytes() == b""
         assert (tmp_path / "notes.part").read_bytes() == b"user"
+
+    def test_cleanup_promotes_orphan_part_and_drops_stale_part(self, tmp_path):
+        """An orphan part becomes the final file; a finished final drops the part."""
+        orphan = tmp_path / f"photo.jpg{PART_SUFFIX}"
+        orphan.write_bytes(b"only copy")
+        final = tmp_path / "photo.jpg"
+        kept = tmp_path / "keep.jpg"
+        kept.write_bytes(b"already final")
+        stale = tmp_path / f"keep.jpg{PART_SUFFIX}"
+        stale.write_bytes(b"leftover")
+        (tmp_path / "notes.part").write_bytes(b"user")
+        (tmp_path / "clip.mp4.part").write_bytes(b"clip")
+
+        assert cleanup_stale_parts(tmp_path) == 2
+
+        assert final.read_bytes() == b"only copy"
+        assert not orphan.exists()
+        assert kept.read_bytes() == b"already final"
+        assert not stale.exists()
+        assert (tmp_path / "notes.part").read_bytes() == b"user"
+        assert (tmp_path / "clip.mp4.part").read_bytes() == b"clip"
 
 
 class TestJournal:

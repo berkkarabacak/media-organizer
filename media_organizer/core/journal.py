@@ -21,7 +21,9 @@ from typing import Iterator, Optional
 JOURNAL_DIRNAME = ".mediaorganizer-journal"
 JOURNAL_FILENAME = "operations.jsonl"
 # Distinct from a user file that merely ends in ".part". Incomplete copies
-# are named "<final name>.mediaorganizer.part" and only those are deleted.
+# are named "<final name>.mediaorganizer.part". Cleanup promotes that file
+# when the final name is missing, and deletes it only when the final name
+# is already there.
 PART_SUFFIX = ".mediaorganizer.part"
 
 
@@ -169,8 +171,9 @@ def atomic_copy(source: Path, final: Path) -> str:
     The part file is flushed and ``os.fsync``'d before ``os.replace``. The
     journal records the copy only after this returns, so a power cut cannot
     leave a durable "done" line for bytes that never reached disk. Resume
-    would otherwise skip that source, and a cross-volume move may already
-    have removed it.
+    would otherwise skip that source. A cross-volume move must not remove
+    the source until that journal line is durable; ``atomic_move`` leaves
+    the source in place so the caller can journal first.
 
     The parent directory is not fsynced after the rename. That call is not
     portable: on Windows ``os.open`` of a directory raises ``PermissionError``
@@ -200,29 +203,46 @@ def atomic_copy(source: Path, final: Path) -> str:
     return digest.hexdigest()
 
 
-def atomic_move(source: Path, final: Path) -> str:
-    """Move with crash safety. Returns the sha256 of the bytes now at `final`.
+def atomic_move(source: Path, final: Path) -> tuple[str, bool]:
+    """Move with crash safety.
 
-    Same-volume renames are atomic: ``os.replace`` of a file that already
-    exists on that volume. Across volumes the file is copied durably
-    (``atomic_copy`` fsyncs the part file before rename), then the source
-    is removed.
+    Returns ``(sha256, unlink_source_after_journal)``.
+
+    Same-volume renames are atomic: ``os.replace`` places the file at
+    ``final`` and removes the source name in one step. The flag is false.
+    The caller still journals after this returns.
+
+    Across volumes ``os.replace`` fails. The file is copied durably
+    (``atomic_copy`` fsyncs the part file before rename) and the source is
+    left in place. The flag is true: the caller must journal the move,
+    then unlink the source. Unlinking first can delete the only copy. The
+    part bytes are on disk, but the rename into ``final`` is a directory
+    entry this platform does not fsync, and a crash before the journal
+    line leaves nothing for resume to trust.
     """
     try:
         os.replace(source, final)  # same volume: truly atomic
     except OSError:
-        digest = atomic_copy(source, final)
-        source.unlink()
-        return digest
-    return _sha256(final)
+        return atomic_copy(source, final), True
+    return _sha256(final), False
 
 
 def cleanup_stale_parts(dest_dir: Path | str) -> int:
-    """Remove this app's incomplete copies left by a crashed run.
+    """Resolve this app's ``.mediaorganizer.part`` files left by a crash.
 
-    Only names ending in ``.mediaorganizer.part`` are removed. A file the
+    Only names ending in ``.mediaorganizer.part`` are touched. A file the
     user named ``notes.part`` or ``clip.mp4.part`` is left alone.
-    Returns how many files were removed.
+
+    When the final name (the part name with that suffix removed) is
+    missing, the part is renamed onto it. Those bytes may be the only
+    surviving copy: the part file was fsynced, then a crash lost the
+    rename's directory entry. Deleting the part in that case would
+    destroy them.
+
+    When the final name already exists, the part is a leftover from a
+    copy that finished the rename, and it is removed.
+
+    Returns how many part files were promoted or removed.
     """
     root = Path(dest_dir)
     n = 0
@@ -231,8 +251,15 @@ def cleanup_stale_parts(dest_dir: Path | str) -> int:
     for p in root.rglob(f"*{PART_SUFFIX}"):
         if not p.is_file() or not p.name.endswith(PART_SUFFIX):
             continue
+        final_name = p.name[:-len(PART_SUFFIX)]
+        if not final_name or final_name in (".", ".."):
+            continue
+        final = p.with_name(final_name)
         try:
-            p.unlink()
+            if final.exists():
+                p.unlink()
+            else:
+                os.replace(p, final)
             n += 1
         except OSError:
             pass
