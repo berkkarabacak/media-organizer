@@ -981,6 +981,7 @@ class MainWindow(QMainWindow):
         self.scan_worker = ScanWorker(options, self)
         self.scan_worker.progress.connect(self._on_scan_progress)
         self.scan_worker.finished_plan.connect(self._on_plan_ready)
+        self.scan_worker.cancelled.connect(self._on_scan_cancelled)
         self.scan_worker.failed.connect(self._on_worker_failed)
         self.scan_worker.start()
 
@@ -1031,6 +1032,22 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Plan ready — take a look, then press "
                                   "\"Organize now\".")
         self.organize_btn.setEnabled(bool(self._active_plan()))
+
+    def _on_scan_cancelled(self):
+        """A cancelled scan is not an empty library and not a finished plan.
+
+        Organize stays off. A partial duplicate set or a half-built plan is
+        dropped, including a plan left over from an earlier scan.
+        """
+        QApplication.restoreOverrideCursor()
+        self.plan = []
+        self.excluded.clear()
+        self._set_busy(False)
+        self._hide_progress_panel()
+        self._refresh_table()
+        self.plan_summary.setText("Scan cancelled — no plan was kept.")
+        self.status_label.setText("Scan cancelled.")
+        self.organize_btn.setEnabled(False)
 
     def _active_plan(self) -> list:
         """Plan rows not excluded by the user (duplicates already flagged)."""
