@@ -7,6 +7,9 @@ One destination keeps a stack of recent runs. Organizing again archives the
 previous log instead of replacing it. The newest ``UNDO_STACK_LIMIT`` runs
 can be undone, newest first. Anything older is moved aside under
 ``history/retired`` and is not offered for undo; those files are not deleted.
+
+A file undo has to leave in place is marked on that operation. It does not
+keep the run at the front of the stack, so an older run can be undone next.
 """
 
 from __future__ import annotations
@@ -35,7 +38,8 @@ UNDO_LIMITATION = (
     f"The last {UNDO_STACK_LIMIT} organize runs in this folder can be undone, "
     "newest first. Organizing again keeps those undo logs. "
     "A run older than that stays on disk but cannot be undone from here. "
-    "Undo will not delete the only remaining copy of a file."
+    "Undo will not delete the only remaining copy of a file. "
+    "If a file has to stay where it is, you can still undo an older run afterward."
 )
 
 
@@ -44,7 +48,7 @@ class Operation:
     action: str  # "copy" | "move"
     source: str
     destination: str
-    status: str = "pending"  # pending | done | skipped | error
+    status: str = "pending"  # pending | done | skipped | error | kept
     error: str = ""
     size: int = -1          # bytes written; -1 on logs from older versions
     sha256: str = ""        # of the bytes written; empty on older logs
@@ -374,11 +378,16 @@ def undo_result_message(result: dict) -> str:
         msg += (
             f"\n\n{kept} left in place so a file would not be lost. "
             "A copy is removed only when an identical original is still "
-            "there. If this file is the only copy left, or it no longer "
+            "there. If a file is the only copy left, or it no longer "
             "matches what the run wrote, it stays."
         )
-    # Counted only after this run is fully undone, so a run that had to
-    # leave files in place does not claim the older logs are next.
+        if result.get("closed"):
+            msg += (
+                " Files left in place on purpose do not block undoing "
+                "an older run."
+            )
+    # Once this run is closed — including when some files were left in
+    # place — say how many older runs are still waiting.
     if result.get("closed"):
         remaining = int(result.get("remaining") or 0)
         if remaining == 1:
@@ -390,6 +399,11 @@ def undo_result_message(result: dict) -> str:
     return msg
 
 
+def _leave_in_place(op: Operation) -> None:
+    """Record that undo cannot safely reverse `op`, and must not try again."""
+    op.status = "kept"
+
+
 def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
     """Undo every successful operation in the log. Returns a summary dict.
 
@@ -399,9 +413,17 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
     the Recycle Bin. A moved file is moved back only when it is still the
     file this run wrote.
 
-    ``kept`` counts files left in place on purpose. The log stays available
-    for another attempt when anything was kept or failed.
+    ``kept`` counts files left in place on purpose. Those operations are
+    marked ``kept`` so a later undo does not treat them as work still to
+    reverse. The run is closed when nothing failed, so a file left in
+    place does not block an older run. A failure leaves that operation
+    ``done`` so another undo can try it, and this run stays at the front
+    until then.
     """
+    dest_dir = Path(dest_dir)
+    # Resolve the file before statuses change. A legacy log's identity
+    # includes operation status, so a later lookup would miss it.
+    saved_path = _find_saved_path(log, dest_dir)
     undone = skipped = failed = kept = 0
     # Reverse order so suffix chains unwind cleanly
     for op in reversed(log.operations):
@@ -417,10 +439,12 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
                 # Source and destination are the same file. Removing it would
                 # delete the only copy.
                 if _same_path(src, dest):
+                    _leave_in_place(op)
                     kept += 1
                     continue
                 if not _identical(src, dest):
                     # Original is gone, or one of the two files has changed.
+                    _leave_in_place(op)
                     kept += 1
                     continue
                 if _discard_copied_file(dest):
@@ -432,6 +456,7 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
                     skipped += 1
                     continue
                 if not _still_the_moved_file(dest, op):
+                    _leave_in_place(op)
                     kept += 1
                     continue
                 _move_back(src, dest)
@@ -440,8 +465,13 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
                 skipped += 1
         except OSError:
             failed += 1
-    log.undone = kept == 0 and failed == 0
-    save_log(log, dest_dir)
+    # Files left in place are ``kept``, so they are not ``done`` work.
+    # A failure is the only thing that still needs another attempt.
+    log.undone = failed == 0
+    if saved_path is not None:
+        _write_log(log, saved_path)
+    else:
+        save_log(log, dest_dir)
     key = _stable_key(log)
     remaining = sum(
         1 for item in list_run_logs(dest_dir)

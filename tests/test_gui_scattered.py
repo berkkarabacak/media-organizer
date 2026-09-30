@@ -189,6 +189,7 @@ class TestUndoLimitationIsVisible:
         assert "newest first" in lowered
         assert "keeps those undo logs" in lowered
         assert "only remaining copy" in lowered
+        assert "older run" in lowered
         assert "replaces the undo log" not in lowered
         assert "replaces this undo log" not in lowered
 

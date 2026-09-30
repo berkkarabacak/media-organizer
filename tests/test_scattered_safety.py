@@ -29,8 +29,9 @@ from media_organizer.core.organizer import (
     _is_non_descendable_dir, _stat_is_non_descendable_dir,
 )
 from media_organizer.core.plan import (
-    UNDO_STACK_LIMIT, list_run_logs, load_log, load_undoable_log, log_path_for,
-    undo_log,
+    UNDO_LIMITATION, UNDO_STACK_LIMIT, Operation, list_run_logs, load_log,
+    load_undoable_log, log_path_for, new_log, save_log, undo_log,
+    undo_result_message,
 )
 from tests.helpers import _box, make_jpeg_with_exif
 
@@ -586,6 +587,200 @@ class TestUndoHistory:
         assert len(retired) == 1
         assert retired[0].read_bytes() == first_bytes
         assert retired[0].stat().st_size > 0
+
+
+class TestKeptUndoAdvancesTheStack:
+    """A run that must leave files in place does not pin Undo last run."""
+
+    def test_kept_newer_run_then_older_run_can_be_undone(self, tmp_path):
+        src, dst, photo, first = _one_photo_run(tmp_path)
+        photo2 = make_jpeg_with_exif(
+            src / "IMG_2.jpg", datetime(2024, 8, 1, 9, 0, 0))
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        execute_plan(build_plan(options), options)
+        second = dst / "2024" / "08 August" / "IMG_2.jpg"
+        recopy = dst / "2024" / "07 July" / "IMG_1_1.jpg"
+        assert first.exists() and second.exists() and recopy.exists()
+        photo2.unlink()
+
+        latest = load_undoable_log(dst)
+        assert latest is not None
+        result = undo_log(latest, dst)
+        assert result["kept"] >= 1
+        assert result["closed"] is True
+        assert result["remaining"] == 1
+        assert second.exists()
+        assert not recopy.exists()
+        assert first.exists()
+
+        saved_latest = next(
+            log for log in list_run_logs(dst) if log.run_id == latest.run_id)
+        assert saved_latest.undone
+        kept_ops = [op for op in saved_latest.operations if op.status == "kept"]
+        assert [Path(op.destination) for op in kept_ops] == [second]
+
+        earlier = load_undoable_log(dst)
+        assert earlier is not None
+        assert earlier.run_id != latest.run_id
+        assert not earlier.undone
+        again = undo_log(earlier, dst)
+        assert again["undone"] == 1
+        assert again["kept"] == 0
+        assert again["closed"] is True
+        assert again["remaining"] == 0
+        assert not first.exists()
+        assert photo.exists()
+        assert second.exists()
+        assert load_undoable_log(dst) is None
+
+    def test_identical_original_copy_is_removed(self, tmp_path):
+        _src, dst, photo, copied = _one_photo_run(tmp_path)
+        result = undo_log(load_undoable_log(dst), dst)
+        assert result["undone"] == 1
+        assert result["kept"] == 0
+        assert result["failed"] == 0
+        assert result["closed"] is True
+        assert not copied.exists()
+        assert photo.is_file()
+        assert load_undoable_log(dst) is None
+
+    @pytest.mark.parametrize("how", ["missing", "changed_original", "changed_copy"])
+    def test_copy_stays_when_original_is_missing_or_different(self, tmp_path, how):
+        _src, dst, photo, copied = _one_photo_run(tmp_path)
+        original = copied.read_bytes()
+        if how == "missing":
+            photo.unlink()
+        elif how == "changed_original":
+            photo.write_bytes(b"not-the-copy-anymore")
+        else:
+            copied.write_bytes(b"user-edit-of-the-organized-copy")
+        result = undo_log(load_undoable_log(dst), dst)
+        assert result["kept"] == 1
+        assert result["undone"] == 0
+        assert result["closed"] is True
+        assert copied.exists()
+        if how == "changed_copy":
+            assert copied.read_bytes().startswith(b"user-edit")
+        else:
+            assert copied.read_bytes() == original
+        if how != "missing":
+            assert photo.exists()
+        saved = load_log(dst)
+        assert saved is not None and saved.undone
+        assert saved.operations[0].status == "kept"
+        assert load_undoable_log(dst) is None
+
+    @pytest.mark.parametrize("how", ["size", "sha256"])
+    def test_move_undo_refuses_when_size_or_sha256_changes(self, tmp_path, how):
+        _src, dst, photo, moved = _one_photo_run(tmp_path, copy_mode=False)
+        original = moved.read_bytes()
+        assert not photo.exists()
+        if how == "size":
+            moved.write_bytes(original + b"x")
+        else:
+            moved.write_bytes(bytes(b ^ 0xFF for b in original))
+            assert moved.stat().st_size == len(original)
+        result = undo_log(load_undoable_log(dst), dst)
+        assert result["kept"] == 1
+        assert result["undone"] == 0
+        assert result["closed"] is True
+        assert moved.exists()
+        assert moved.read_bytes() != original
+        assert not photo.exists()
+        saved = load_log(dst)
+        assert saved is not None and saved.undone
+        assert saved.operations[0].status == "kept"
+
+    def test_kept_op_is_not_retried_when_a_sibling_fails(self, tmp_path, monkeypatch):
+        import media_organizer.core.plan as plan_mod
+
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        dst.mkdir()
+        original = src / "a.jpg"
+        copy_a = dst / "a.jpg"
+        copy_b = dst / "b.jpg"
+        original.write_bytes(b"same-bytes")
+        copy_a.write_bytes(b"same-bytes")
+        copy_b.write_bytes(b"only-left")
+        log = new_log(dst)
+        log.operations.extend([
+            Operation("copy", str(original), str(copy_a), status="done",
+                      size=len(b"same-bytes")),
+            Operation("copy", str(src / "gone.jpg"), str(copy_b), status="done",
+                      size=len(b"only-left")),
+        ])
+        save_log(log, dst)
+
+        real_discard = plan_mod._discard_copied_file
+        monkeypatch.setattr(plan_mod, "_discard_copied_file", lambda path: False)
+        first = undo_log(load_undoable_log(dst), dst)
+        assert first["kept"] == 1
+        assert first["failed"] == 1
+        assert first["closed"] is False
+        assert copy_a.read_bytes() == b"same-bytes"
+        assert copy_b.read_bytes() == b"only-left"
+        stuck = load_undoable_log(dst)
+        assert stuck is not None and stuck.run_id == log.run_id
+        assert [op.status for op in stuck.operations] == ["done", "kept"]
+
+        monkeypatch.setattr(plan_mod, "_discard_copied_file", real_discard)
+        second = undo_log(load_undoable_log(dst), dst)
+        assert second["kept"] == 0
+        assert second["undone"] == 1
+        assert second["failed"] == 0
+        assert second["closed"] is True
+        assert not copy_a.exists()
+        assert copy_b.read_bytes() == b"only-left"
+        assert load_undoable_log(dst) is None
+
+    def test_kept_legacy_log_is_updated_in_place(self, tmp_path):
+        _src, dst, photo, copied = _one_photo_run(tmp_path)
+        path = log_path_for(dst)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data.pop("run_id", None)
+        path.write_text(json.dumps(data), encoding="utf-8")
+        photo.unlink()
+        log = load_log(dst)
+        assert log is not None and log.run_id == ""
+        result = undo_log(log, dst)
+        assert result["kept"] == 1
+        assert result["closed"] is True
+        assert copied.exists()
+        history = dst / ".media_organizer" / "history"
+        assert not history.exists()
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        assert saved["undone"] is True
+        assert saved["operations"][0]["status"] == "kept"
+        assert load_undoable_log(dst) is None
+
+    def test_messages_say_kept_files_do_not_block_an_older_run(self):
+        lowered = UNDO_LIMITATION.lower()
+        assert "only remaining copy" in lowered
+        assert "older run" in lowered
+        text = undo_result_message({
+            "undone": 1,
+            "skipped": 0,
+            "failed": 0,
+            "kept": 2,
+            "remaining": 1,
+            "closed": True,
+        })
+        assert "2 left in place" in text
+        assert "do not block undoing an older run" in text
+        assert "1 other run can still be undone" in text
+        still_open = undo_result_message({
+            "undone": 0,
+            "skipped": 0,
+            "failed": 1,
+            "kept": 1,
+            "remaining": 1,
+            "closed": False,
+        })
+        assert "left in place" in still_open
+        assert "do not block" not in still_open
+        assert "other run" not in still_open
 
 
 class TestRunWording:
