@@ -443,6 +443,25 @@ def _analyze_one(args):
 _PROCESS_THRESHOLD = 400
 
 
+def _analyze_serial(paths, need_gps: bool = False, progress=None, cancel=None) -> dict:
+    """Inline capture-date (+ optional GPS) extraction.
+
+    Same per-file results as the process-pool worker. Cancel is checked
+    between files; progress is reported every 25 files (index within this
+    list). Never raises per file.
+    """
+    results = {}
+    for i, p in enumerate(paths):
+        if cancel and cancel():
+            break
+        cap = extract_capture_date(p)
+        gps = extract_gps(p) if need_gps else None
+        results[p] = (cap, gps)
+        if progress and i % 25 == 0:
+            progress(i, p.name)
+    return results
+
+
 def analyze_media_batch(paths, need_gps: bool = False, max_workers: Optional[int] = None,
                         progress=None, cancel=None) -> dict:
     """Capture-date (+ optional GPS) extraction for many files.
@@ -450,7 +469,9 @@ def analyze_media_batch(paths, need_gps: bool = False, max_workers: Optional[int
     Profiling showed PIL's EXIF parsing holds the GIL (threads LOSE, ~0.8x)
     while a process pool scales (~2.1x at 2,000 files, better as libraries
     grow). So: small batches run inline-serial; large batches use a
-    ProcessPoolExecutor. Results are identical either way.
+    ProcessPoolExecutor. If the pool cannot be started or used, unfinished
+    files are extracted inline and the pool is not retried. Results are
+    identical either way.
     Returns {Path: (CaptureDate, (lat, lon) | None)}. Never raises per-file.
     """
     paths = list(paths)
@@ -458,16 +479,7 @@ def analyze_media_batch(paths, need_gps: bool = False, max_workers: Optional[int
         return {}
 
     if len(paths) < _PROCESS_THRESHOLD:
-        results = {}
-        for i, p in enumerate(paths):
-            if cancel and cancel():
-                break
-            cap = extract_capture_date(p)
-            gps = extract_gps(p) if need_gps else None
-            results[p] = (cap, gps)
-            if progress and i % 25 == 0:
-                progress(i, p.name)
-        return results
+        return _analyze_serial(paths, need_gps, progress=progress, cancel=cancel)
 
     workers = max_workers or min(8, os.cpu_count() or 4)
     chunk = max(1, len(paths) // (workers * 4))
@@ -487,11 +499,13 @@ def analyze_media_batch(paths, need_gps: bool = False, max_workers: Optional[int
                 if progress and done % 50 == 0:
                     progress(done, Path(path_str).name)
     except Exception:
-        # process pool unavailable (frozen app edge cases, restricted env):
-        # fall back to serial rather than fail the scan
+        # Process pool unavailable (frozen PyInstaller edge cases, restricted
+        # env). Finish inline. Do not call analyze_media_batch again: the
+        # remainder can still be >= _PROCESS_THRESHOLD, which would open
+        # another pool and recurse until RecursionError fails the scan.
         remaining = [p for p in paths if p not in results]
-        results.update(analyze_media_batch(remaining, need_gps, progress=progress,
-                                           cancel=cancel))
+        results.update(_analyze_serial(remaining, need_gps, progress=progress,
+                                        cancel=cancel))
     return results
 
 

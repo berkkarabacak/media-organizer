@@ -14,9 +14,11 @@ from media_organizer.core.journal import (
     completed_sources, discard_journal, find_unfinished_journal,
     journal_path_for,
 )
-from media_organizer.core.metadata import analyze_media_batch
+from media_organizer.core.metadata import (
+    DateSource, analyze_media_batch, extract_capture_date, extract_gps,
+)
 from media_organizer.core.organizer import OrganizeOptions, build_plan
-from tests.helpers import make_jpeg_with_exif
+from tests.helpers import make_jpeg_with_exif, make_jpeg_with_gps
 
 
 def _setup(tmp_path, n=3):
@@ -31,6 +33,36 @@ def _setup(tmp_path, n=3):
 
 def _plan(src, dst, **kw):
     return build_plan(OrganizeOptions(source_dir=src, dest_dir=dst, **kw))
+
+
+def _threshold_batch(tmp_path, n=400):
+    """At least the process-pool threshold, with EXIF, GPS, and filename dates."""
+    from media_organizer.core.metadata import _PROCESS_THRESHOLD
+
+    n = max(n, _PROCESS_THRESHOLD)
+    files = []
+    for i in range(n):
+        path = tmp_path / f"batch_{i:04d}.jpg"
+        path.write_bytes(b"\xff\xd8\xff\xd9")
+        files.append(path)
+    files[0] = make_jpeg_with_exif(
+        tmp_path / "batch_0000.jpg", datetime(2021, 7, 4, 15, 30, 22))
+    files[1] = make_jpeg_with_gps(
+        tmp_path / "batch_0001.jpg", datetime(2019, 1, 2, 3, 4, 5), 41.01, 28.98)
+    named = tmp_path / "IMG_20190615_083045.jpg"
+    named.write_bytes(b"\xff\xd8\xff\xd9")
+    files[2] = named
+    return files
+
+
+def _assert_batch_matches_serial(result, files, need_gps):
+    for path in files:
+        cap, gps = result[path]
+        assert cap == extract_capture_date(path)
+        if need_gps:
+            assert gps == extract_gps(path)
+        else:
+            assert gps is None
 
 
 class TestFreeSpace:
@@ -308,7 +340,94 @@ class TestParallelCorrectness:
         assert r[junk][0].found or r[junk][0].source.value == "mtime"
 
     def test_parallel_gps_prefetch(self, tmp_path):
-        from tests.helpers import make_jpeg_with_gps
         f = make_jpeg_with_gps(tmp_path / "gps.jpg", None, 41.01, 28.98)
         r = analyze_media_batch([f], need_gps=True)
         assert r[f][1] == pytest.approx((41.01, 28.98), abs=0.01)
+
+    def test_process_pool_failure_falls_back_to_serial(self, tmp_path, monkeypatch):
+        """A pool that cannot start must finish >=400 files inline, once."""
+        import concurrent.futures
+
+        files = _threshold_batch(tmp_path)
+        constructions = []
+
+        class BrokenPool:
+            def __init__(self, *args, **kwargs):
+                constructions.append(1)
+                raise RuntimeError("process pool unavailable")
+
+        monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", BrokenPool)
+        ticks = []
+
+        def progress(i, name):
+            ticks.append((i, name))
+
+        result = analyze_media_batch(
+            files, need_gps=True, progress=progress, cancel=lambda: False,
+        )
+
+        assert len(constructions) == 1  # no recursive re-entry into the pool
+        assert len(result) == len(files)
+        _assert_batch_matches_serial(result, files, need_gps=True)
+        assert result[files[0]][0].source == DateSource.EXIF
+        assert result[files[0]][0].date == datetime(2021, 7, 4, 15, 30, 22)
+        assert result[files[1]][1] == pytest.approx((41.01, 28.98), abs=0.01)
+        assert result[files[2]][0].source == DateSource.FILENAME
+        assert result[files[2]][0].date == datetime(2019, 6, 15, 8, 30, 45)
+        assert [i for i, _name in ticks] == list(range(0, len(files), 25))
+        assert ticks[0][1] == files[0].name
+
+    def test_process_pool_map_failure_finishes_remaining_serially(
+            self, tmp_path, monkeypatch):
+        """A pool that dies mid-batch keeps finished paths and serializes the rest."""
+        import concurrent.futures
+
+        files = _threshold_batch(tmp_path)
+        constructions = []
+
+        class BrokenMap:
+            def __init__(self, *args, **kwargs):
+                constructions.append(1)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def map(self, fn, iterable, chunksize=1):
+                for i, item in enumerate(iterable):
+                    if i >= 7:
+                        raise RuntimeError("worker failed")
+                    yield fn(item)
+
+        monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", BrokenMap)
+        result = analyze_media_batch(files, need_gps=True, cancel=lambda: False)
+
+        assert constructions == [1]
+        assert len(result) == len(files)
+        _assert_batch_matches_serial(result, files, need_gps=True)
+
+    def test_serial_fallback_honors_cancel(self, tmp_path, monkeypatch):
+        import concurrent.futures
+
+        files = _threshold_batch(tmp_path)
+
+        class BrokenPool:
+            def __init__(self, *args, **kwargs):
+                raise RuntimeError("process pool unavailable")
+
+        monkeypatch.setattr(concurrent.futures, "ProcessPoolExecutor", BrokenPool)
+        checks = {"n": 0}
+        ticks = []
+
+        def cancel():
+            checks["n"] += 1
+            return checks["n"] > 40
+
+        result = analyze_media_batch(
+            files, cancel=cancel, progress=lambda i, name: ticks.append(i),
+        )
+        assert len(result) == 40
+        assert checks["n"] == 41
+        assert ticks == [0, 25]
