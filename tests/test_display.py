@@ -4,9 +4,10 @@ from datetime import datetime
 from pathlib import Path
 
 from media_organizer.core.display import (
-    elide_middle, format_bytes, plan_sort_key, relative_destination,
-    sorted_plan_items,
+    elide_middle, finished_run_lines, format_bytes, plan_sort_key,
+    relative_destination, sorted_plan_items,
 )
+from media_organizer.core.plan import UNDO_STACK_LIMIT
 from media_organizer.core.metadata import CaptureDate, DateSource
 
 
@@ -140,3 +141,20 @@ class TestElideMiddle:
         out = elide_middle(text, 40)
         assert out != "C:\\..." and out != "C:/..."
         assert "photo.jpg" in out
+
+
+class TestFinishedRunUndoWording:
+    def test_real_run_names_the_undo_stack(self):
+        _status, text = finished_run_lines(
+            {"copied": 2, "moved": 0, "action": "copy", "dry_run": False},
+            folders=1, total_bytes=10)
+        assert f"The last {UNDO_STACK_LIMIT} organize runs" in text
+        assert "newest first" in text
+        assert "replaces" not in text.lower()
+        assert "cannot be undone" not in text.lower()
+
+    def test_dry_run_does_not_mention_undo(self):
+        _status, text = finished_run_lines(
+            {"copied": 2, "moved": 0, "action": "copy", "dry_run": True},
+            folders=1, total_bytes=10)
+        assert "undo" not in text.lower()
