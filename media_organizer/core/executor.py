@@ -4,7 +4,8 @@ Safety features:
 - dry_run: full pipeline simulation, writes nothing
 - crash journal: every completed file is journaled (JSONL) so an interrupted
   run can be resumed. A new organize replaces a finished journal; a resume
-  appends to the unfinished one. Copies go through temp-name + atomic rename
+  appends to the unfinished one. Copies are fsynced to a temp name, then
+  atomically renamed
 - free-space preflight helper
 """
 

@@ -3,8 +3,10 @@
 Each completed file operation is journaled immediately, so a power cut or
 crash mid-run leaves a resumable record. A new organize replaces that file.
 Resuming an interrupted run appends to the same file until it is marked
-complete. Copies are written to a temp name and atomically renamed, so a
-half-written file never appears at its final name. Pure logic, no Qt.
+complete. Copies are flushed and fsynced to a temp name, then atomically
+renamed, so a half-written file never appears at its final name and a
+journal "done" line is not written for bytes still only in the page cache.
+Pure logic, no Qt.
 """
 
 from __future__ import annotations
@@ -163,6 +165,21 @@ def atomic_copy(source: Path, final: Path) -> str:
     A crash mid-copy leaves only a ``.mediaorganizer.part`` file, never a
     truncated file at the final name. A stale part for this same destination
     is replaced; other ``*.part`` files are not touched.
+
+    The part file is flushed and ``os.fsync``'d before ``os.replace``. The
+    journal records the copy only after this returns, so a power cut cannot
+    leave a durable "done" line for bytes that never reached disk. Resume
+    would otherwise skip that source, and a cross-volume move may already
+    have removed it.
+
+    The parent directory is not fsynced after the rename. That call is not
+    portable: on Windows ``os.open`` of a directory raises ``PermissionError``
+    (WinError 5). The C runtime will not open a directory, and ``os.fsync``
+    there is ``_commit`` / ``FlushFileBuffers``, which does not accept a
+    directory handle. A Linux-only directory fsync would not cover the
+    shipped app. Some FUSE and network filesystems also return ``EINVAL``
+    for directory fsync; raising that after ``os.replace`` would report a
+    copy that is already at its final name as a failure.
     """
     part = final.with_name(final.name + PART_SUFFIX)
     try:
@@ -174,6 +191,10 @@ def atomic_copy(source: Path, final: Path) -> str:
         for chunk in iter(lambda: src.read(1024 * 1024), b""):
             digest.update(chunk)
             out.write(chunk)
+        # Flush the Python buffer, then the kernel cache, before the name
+        # is published. close() alone only drops the user-space buffer.
+        out.flush()
+        os.fsync(out.fileno())
     shutil.copystat(source, part)
     os.replace(part, final)
     return digest.hexdigest()
@@ -182,8 +203,10 @@ def atomic_copy(source: Path, final: Path) -> str:
 def atomic_move(source: Path, final: Path) -> str:
     """Move with crash safety. Returns the sha256 of the bytes now at `final`.
 
-    Same-volume renames are atomic. Across volumes the file is copied to a
-    ``.mediaorganizer.part`` name, renamed, then the source is removed.
+    Same-volume renames are atomic: ``os.replace`` of a file that already
+    exists on that volume. Across volumes the file is copied durably
+    (``atomic_copy`` fsyncs the part file before rename), then the source
+    is removed.
     """
     try:
         os.replace(source, final)  # same volume: truly atomic

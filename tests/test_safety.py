@@ -1,6 +1,7 @@
 """Tests for safety features: free space, journal/resume, atomic copy,
 dry run, and parallel correctness (executor.py, journal.py, metadata batch)."""
 
+import hashlib
 import json
 import os
 from datetime import datetime
@@ -126,6 +127,132 @@ class TestAtomicCopy:
         src, _ = _setup(tmp_path)
         f = src / "IMG_1.jpg"
         final = tmp_path / "moved.jpg"
+        atomic_move(f, final)
+        assert final.exists() and not f.exists()
+
+    def test_part_file_is_fsynced_before_replace(self, tmp_path, monkeypatch):
+        """Part-file bytes are fsynced before that name becomes final.
+
+        ``JournalWriter.record`` fsyncs the done line only after
+        ``atomic_copy`` returns. Spying ``open`` / ``os.fsync`` /
+        ``os.replace`` proves the part fd was flushed and synced first,
+        while the temp name still exists. No power cut.
+        """
+        src = _setup(tmp_path)[0] / "IMG_0.jpg"
+        final = tmp_path / "out" / "IMG_0.jpg"
+        final.parent.mkdir()
+        part = final.with_name(final.name + PART_SUFFIX)
+        order = []
+        real_open = open
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        class _Part:
+            """Records flush on the part file. Other methods stay real."""
+
+            def __init__(self, raw):
+                self._raw = raw
+
+            def __getattr__(self, name):
+                return getattr(self._raw, name)
+
+            def __enter__(self):
+                self._raw.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return self._raw.__exit__(exc_type, exc, tb)
+
+            def flush(self):
+                order.append(("flush", self._raw.fileno()))
+                return self._raw.flush()
+
+        def spy_open(file, mode="r", *args, **kwargs):
+            fh = real_open(file, mode, *args, **kwargs)
+            if Path(file) == part:
+                order.append(("open", fh.fileno()))
+                return _Part(fh)
+            return fh
+
+        def spy_fsync(fd):
+            order.append(("fsync", fd))
+            assert part.exists() and not final.exists()
+            return real_fsync(fd)
+
+        def spy_replace(src_path, dst_path):
+            order.append(("replace", Path(src_path), Path(dst_path)))
+            return real_replace(src_path, dst_path)
+
+        monkeypatch.setattr("media_organizer.core.journal.open", spy_open)
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.fsync", spy_fsync)
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.replace", spy_replace)
+
+        atomic_copy(src, final)
+
+        assert final.read_bytes() == src.read_bytes()
+        assert not part.exists()
+        kinds = [kind for kind, *_rest in order]
+        flush_i = kinds.index("flush")
+        fsync_i = kinds.index("fsync")
+        replace_i = kinds.index("replace")
+        assert flush_i < fsync_i < replace_i
+        part_fd = order[kinds.index("open")][1]
+        assert order[flush_i][1] == part_fd
+        assert order[fsync_i][1] == part_fd
+        assert kinds.count("fsync") == 1
+        assert order[replace_i][1:] == (part, final)
+
+    def test_cross_volume_move_fsyncs_part_before_replace(
+            self, tmp_path, monkeypatch):
+        """A failed same-volume rename uses the durable copy path."""
+        src = _setup(tmp_path)[0] / "IMG_1.jpg"
+        payload = src.read_bytes()
+        final = tmp_path / "moved.jpg"
+        part = final.with_name(final.name + PART_SUFFIX)
+        order = []
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        def spy_fsync(fd):
+            order.append(("fsync", fd))
+            assert part.exists() and not final.exists()
+            return real_fsync(fd)
+
+        def spy_replace(src_path, dst_path):
+            order.append(("replace", Path(src_path), Path(dst_path)))
+            if sum(1 for kind, *_r in order if kind == "replace") == 1:
+                raise OSError("simulated cross-volume rename")
+            return real_replace(src_path, dst_path)
+
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.fsync", spy_fsync)
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.replace", spy_replace)
+
+        digest = atomic_move(src, final)
+
+        assert not src.exists()
+        assert final.read_bytes() == payload
+        assert digest == hashlib.sha256(payload).hexdigest()
+        kinds = [kind for kind, *_rest in order]
+        fsync_i = kinds.index("fsync")
+        replace_at = [i for i, kind in enumerate(kinds) if kind == "replace"]
+        assert replace_at == [0, fsync_i + 1]
+        assert order[0][1:] == (src, final)
+        assert order[fsync_i + 1][1:] == (part, final)
+        assert kinds.count("fsync") == 1
+
+    def test_same_volume_move_does_not_fsync(self, tmp_path, monkeypatch):
+        src, _ = _setup(tmp_path)
+        f = src / "IMG_1.jpg"
+        final = tmp_path / "moved.jpg"
+
+        def boom(_fd):
+            raise AssertionError("same-volume rename must not fsync")
+
+        monkeypatch.setattr("media_organizer.core.journal.os.fsync", boom)
         atomic_move(f, final)
         assert final.exists() and not f.exists()
 
