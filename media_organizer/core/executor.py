@@ -124,8 +124,11 @@ def execute_plan(
 
     journal: Optional[JournalWriter] = None
     if not dry_run:
-        # Promote an orphan part onto its final name before a new copy can
-        # land beside it. A part whose final name already exists is removed.
+        # Delete leftover .mediaorganizer.part files. Do not rename an
+        # orphan part onto the final name: a crash before fsync can leave
+        # it truncated, and the source is still present until after the
+        # journal line. Promoting it would publish junk, then resume would
+        # write a collision copy and a move could unlink the source.
         cleanup_stale_parts(options.dest_dir)
         # Replaces a finished journal. Continues one that is still open, which
         # is how resume keeps the files already organized in this run.

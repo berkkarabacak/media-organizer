@@ -320,7 +320,7 @@ class TestDestinationOverlap:
 
 
 class TestPartCleanup:
-    def test_user_part_files_are_kept_orphan_app_parts_are_promoted(self, tmp_path):
+    def test_user_part_files_are_kept_orphan_app_parts_are_deleted(self, tmp_path):
         (tmp_path / "notes.part").write_bytes(b"user notes")
         (tmp_path / "clip.mp4.part").write_bytes(b"user video fragment")
         app_part = tmp_path / "nested" / f"photo.jpg{PART_SUFFIX}"
@@ -333,7 +333,7 @@ class TestPartCleanup:
         assert (tmp_path / "notes.part").read_bytes() == b"user notes"
         assert (tmp_path / "clip.mp4.part").read_bytes() == b"user video fragment"
         assert (tmp_path / "keep.jpg").read_bytes() == b"photo"
-        assert (app_part.parent / "photo.jpg").read_bytes() == b"incomplete copy"
+        assert not (app_part.parent / "photo.jpg").exists()
         assert not app_part.exists()
         assert resolved == 1
 

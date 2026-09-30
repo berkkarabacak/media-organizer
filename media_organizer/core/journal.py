@@ -6,6 +6,9 @@ Resuming an interrupted run appends to the same file until it is marked
 complete. Copies are flushed and fsynced to a temp name, then atomically
 renamed, so a half-written file never appears at its final name and a
 journal "done" line is not written for bytes still only in the page cache.
+A leftover ``.mediaorganizer.part`` is deleted on the next run. It is
+not renamed onto the final name: the part may be truncated, and the
+source is still present until after the journal line.
 Pure logic, no Qt.
 """
 
@@ -23,9 +26,11 @@ from typing import Iterable, Iterator, Optional
 JOURNAL_DIRNAME = ".mediaorganizer-journal"
 JOURNAL_FILENAME = "operations.jsonl"
 # Distinct from a user file that merely ends in ".part". Incomplete copies
-# are named "<final name>.mediaorganizer.part". Cleanup promotes that file
-# when the final name is missing, and deletes it only when the final name
-# is already there.
+# are named "<final name>.mediaorganizer.part". Cleanup deletes that file
+# whether or not the final name is already there. Promoting it would
+# publish a possibly truncated copy under the real filename. The source
+# is still on disk until the journal line, which is written only after
+# the final name exists.
 PART_SUFFIX = ".mediaorganizer.part"
 
 
@@ -236,8 +241,12 @@ def atomic_copy(source: Path, final: Path) -> str:
     """Copy via temp name + atomic rename. Returns the sha256 of the bytes.
 
     A crash mid-copy leaves only a ``.mediaorganizer.part`` file, never a
-    truncated file at the final name. A stale part for this same destination
-    is replaced; other ``*.part`` files are not touched.
+    truncated file at the final name. That part is not promoted later.
+    The source is still present (a move unlinks it only after the journal
+    line, which is written after this rename), and a crash before fsync
+    can leave the part short. ``cleanup_stale_parts`` deletes it.
+    A stale part for this same destination is replaced by this copy;
+    other ``*.part`` files are not touched.
 
     The part file is flushed and ``os.fsync``'d before ``os.replace``. The
     journal records the copy only after this returns, so a power cut cannot
@@ -291,8 +300,9 @@ def atomic_move(source: Path, final: Path) -> tuple[str, bool]:
     If the process dies after that rename and before the journal line, the
     bytes are already at ``final`` and the source is still there. Resume
     keeps that path when the bytes still match, instead of copying to a
-    collision name. A crash before the rename still leaves only the part
-    file.
+    collision name. A crash before the rename leaves the part file and
+    the source. Cleanup deletes that part; it does not rename it onto
+    ``final``.
     """
     try:
         os.replace(source, final)  # same volume: truly atomic
@@ -302,21 +312,31 @@ def atomic_move(source: Path, final: Path) -> tuple[str, bool]:
 
 
 def cleanup_stale_parts(dest_dir: Path | str) -> int:
-    """Resolve this app's ``.mediaorganizer.part`` files left by a crash.
+    """Delete this app's ``.mediaorganizer.part`` files left by a crash.
 
     Only names ending in ``.mediaorganizer.part`` are touched. A file the
     user named ``notes.part`` or ``clip.mp4.part`` is left alone.
 
-    When the final name (the part name with that suffix removed) is
-    missing, the part is renamed onto it. Those bytes may be the only
-    surviving copy: the part file was fsynced, then a crash lost the
-    rename's directory entry. Deleting the part in that case would
-    destroy them.
+    The part is removed whether or not the final name (the part name with
+    that suffix removed) already exists. It is never renamed onto that
+    name.
 
-    When the final name already exists, the part is a leftover from a
-    copy that finished the rename, and it is removed.
+    Promoting an orphan part is unsafe with the current copy and move
+    order. ``atomic_copy`` writes the part, flushes and fsyncs it, then
+    ``os.replace``s it to the final name. Only after that does
+    ``execute_plan`` journal the file. A cross-volume move unlinks the
+    source only after that journal line. A same-volume move uses
+    ``os.replace`` on the source and never creates a part file. So when a
+    part exists and the final name is missing, the source is still
+    present. A crash before fsync can leave the part truncated. Publishing
+    those bytes under the real filename makes resume fail the byte check,
+    write the good file to a collision name, and on a move unlink the
+    source.
 
-    Returns how many part files were promoted or removed.
+    The part is not the only surviving copy after fsync plus a lost
+    rename. That window is not how this app orders the writes.
+
+    Returns how many part files were removed.
     """
     root = Path(dest_dir)
     n = 0
@@ -328,12 +348,8 @@ def cleanup_stale_parts(dest_dir: Path | str) -> int:
         final_name = p.name[:-len(PART_SUFFIX)]
         if not final_name or final_name in (".", ".."):
             continue
-        final = p.with_name(final_name)
         try:
-            if final.exists():
-                p.unlink()
-            else:
-                os.replace(p, final)
+            p.unlink()
             n += 1
         except OSError:
             pass

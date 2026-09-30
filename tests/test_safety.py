@@ -376,17 +376,17 @@ class TestAtomicCopy:
         (tmp_path / "keep.jpg").write_bytes(b"")
         (tmp_path / "notes.part").write_bytes(b"user")
         assert cleanup_stale_parts(tmp_path) == 2
-        assert (tmp_path / "a" / "x.jpg").read_bytes() == b"x-bytes"
+        assert not (tmp_path / "a" / "x.jpg").exists()
         assert not (tmp_path / "a" / f"x.jpg{PART_SUFFIX}").exists()
-        assert (tmp_path / "y.jpg").read_bytes() == b"y-bytes"
+        assert not (tmp_path / "y.jpg").exists()
         assert not (tmp_path / f"y.jpg{PART_SUFFIX}").exists()
         assert (tmp_path / "keep.jpg").read_bytes() == b""
         assert (tmp_path / "notes.part").read_bytes() == b"user"
 
-    def test_cleanup_promotes_orphan_part_and_drops_stale_part(self, tmp_path):
-        """An orphan part becomes the final file; a finished final drops the part."""
+    def test_cleanup_deletes_orphan_part_and_drops_stale_part(self, tmp_path):
+        """An orphan part is deleted; a finished final drops its leftover part."""
         orphan = tmp_path / f"photo.jpg{PART_SUFFIX}"
-        orphan.write_bytes(b"only copy")
+        orphan.write_bytes(b"truncated junk")
         final = tmp_path / "photo.jpg"
         kept = tmp_path / "keep.jpg"
         kept.write_bytes(b"already final")
@@ -397,7 +397,7 @@ class TestAtomicCopy:
 
         assert cleanup_stale_parts(tmp_path) == 2
 
-        assert final.read_bytes() == b"only copy"
+        assert not final.exists()
         assert not orphan.exists()
         assert kept.read_bytes() == b"already final"
         assert not stale.exists()
@@ -720,6 +720,130 @@ def _unfinished_without(dest: Path, source: Path) -> None:
         fh.write(line + "\n")
     assert find_unfinished_journal(dest) == jp
     assert str(source) not in completed_sources(jp)
+
+
+def _truncated_orphan_resume(tmp_path, *, copy_mode):
+    """Part is short, final name is missing, journal is unfinished, source remains."""
+    src, dst = _setup(tmp_path, n=1)
+    source = src / "IMG_0.jpg"
+    payload = source.read_bytes()
+    assert len(payload) > 32
+    options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=copy_mode)
+    planned = _plan(src, dst, copy_mode=copy_mode)[0].destination
+    assert planned.name == "IMG_0.jpg"
+    planned.parent.mkdir(parents=True)
+    part = planned.with_name(planned.name + PART_SUFFIX)
+    part.write_bytes(payload[:8])
+    assert not planned.exists()
+    _unfinished_without(dst, source)
+    user_part = planned.parent / "notes.part"
+    user_part.write_bytes(b"keep-me")
+    plan = _plan(src, dst, copy_mode=copy_mode)
+    assert [item.destination for item in plan] == [planned]
+    remaining = exclude_completed_sources(
+        plan, completed_sources(journal_path_for(dst)))
+    assert [item.source for item in remaining] == [source]
+    return (options, dst, source, payload, planned, part, user_part, remaining)
+
+
+def _assert_full_file_at_natural_name(
+        dst, source, payload, planned, part, user_part, log, summary, *,
+        copy_mode):
+    key = "copied" if copy_mode else "moved"
+    assert summary[key] == 1
+    assert summary["errors"] == 0
+    assert planned.is_file()
+    assert planned.read_bytes() == payload
+    assert not part.exists()
+    assert not list(dst.rglob("*_1*"))
+    assert [p.name for p in dst.rglob("*.jpg")] == ["IMG_0.jpg"]
+    assert user_part.read_bytes() == b"keep-me"
+    action = "copy" if copy_mode else "move"
+    assert [(op.action, op.source, op.destination, op.status)
+            for op in log.operations] == [
+        (action, str(source), str(planned), "done")]
+    if copy_mode:
+        assert source.is_file()
+        assert source.read_bytes() == payload
+    else:
+        assert not source.exists()
+
+
+class TestTruncatedOrphanPartResume:
+    """Crash mid-write: truncated part, missing final name, source still there.
+
+    ``cleanup_stale_parts`` must delete the part. Promoting it would leave
+    junk at the natural name. Resume would then fail ``files_identical``,
+    write the good bytes to ``name_1``, and a move could unlink the source.
+    """
+
+    def test_copy_resume_replaces_truncated_part_with_source(
+            self, tmp_path):
+        (options, dst, source, payload, planned, part, user_part,
+         remaining) = _truncated_orphan_resume(tmp_path, copy_mode=True)
+        assert part.is_file()
+        assert part.read_bytes() == payload[:8]
+
+        log, summary = execute_plan(remaining, options)
+
+        _assert_full_file_at_natural_name(
+            dst, source, payload, planned, part, user_part, log, summary,
+            copy_mode=True)
+        assert find_unfinished_journal(dst) is None
+
+    def test_cross_volume_move_resume_journals_natural_name_before_unlink(
+            self, tmp_path, monkeypatch):
+        (options, dst, source, payload, planned, part, user_part,
+         remaining) = _truncated_orphan_resume(tmp_path, copy_mode=False)
+        order = []
+        real_replace = os.replace
+        real_record = JournalWriter.record
+        real_unlink = Path.unlink
+
+        def spy_replace(src_path, dst_path):
+            # Fail only the same-volume rename of the source. A promotion
+            # of the truncated part would still go through, and resume
+            # would then land the good bytes on ``IMG_0_1.jpg``.
+            if Path(src_path) == source:
+                order.append("replace-cross")
+                raise OSError("simulated cross-volume rename")
+            order.append(("replace", Path(src_path), Path(dst_path)))
+            return real_replace(src_path, dst_path)
+
+        def spy_record(self, action, source_s, destination):
+            order.append("journal")
+            assert Path(source_s) == source
+            assert source.is_file()
+            assert source.read_bytes() == payload
+            assert Path(destination) == planned
+            assert planned.read_bytes() == payload
+            assert not part.exists()
+            return real_record(self, action, source_s, destination)
+
+        def spy_unlink(self, *args, **kwargs):
+            if self == source:
+                order.append("unlink")
+                text = journal_path_for(dst).read_text(encoding="utf-8")
+                assert str(source) in text
+                assert str(planned) in text
+                assert "IMG_0_1" not in text
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.replace", spy_replace)
+        monkeypatch.setattr(JournalWriter, "record", spy_record)
+        monkeypatch.setattr(Path, "unlink", spy_unlink)
+
+        log, summary = execute_plan(remaining, options)
+
+        _assert_full_file_at_natural_name(
+            dst, source, payload, planned, part, user_part, log, summary,
+            copy_mode=False)
+        assert order[0] == "replace-cross"
+        assert ("replace", part, planned) in order
+        assert order.index("journal") < order.index("unlink")
+        assert order.count("unlink") == 1
+        assert find_unfinished_journal(dst) is None
 
 
 class TestResumePublishedDestination:
