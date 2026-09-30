@@ -5,20 +5,21 @@ import hashlib
 import json
 import os
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 import pytest
 
 from media_organizer.core.executor import execute_plan, free_space_status
 from media_organizer.core.journal import (
     PART_SUFFIX, JournalWriter, atomic_copy, atomic_move, cleanup_stale_parts,
-    completed_sources, discard_journal, find_unfinished_journal,
-    journal_path_for,
+    completed_sources, discard_journal, exclude_completed_sources,
+    find_unfinished_journal, journal_path_for, path_identity,
 )
 from media_organizer.core.metadata import (
-    DateSource, analyze_media_batch, extract_capture_date, extract_gps,
+    CaptureDate, Confidence, DateSource, analyze_media_batch,
+    extract_capture_date, extract_gps,
 )
-from media_organizer.core.organizer import OrganizeOptions, build_plan
+from media_organizer.core.organizer import OrganizeOptions, PlannedFile, build_plan
 from tests.helpers import make_jpeg_with_exif, make_jpeg_with_gps
 
 
@@ -435,7 +436,7 @@ class TestJournal:
         assert 0 < len(done) < 4
 
         # resume: remaining files complete the set
-        remaining = [p for p in plan if str(p.source) not in done]
+        remaining = exclude_completed_sources(plan, done)
         execute_plan(remaining, options)
         assert find_unfinished_journal(dst) is None
         copied = sorted(p.name for p in dst.rglob("*.jpg"))
@@ -503,7 +504,7 @@ class TestJournal:
         assert sorted(p.relative_to(dst) for p in dst.rglob("*.jpg")
                       if "B_" not in p.name) == kept
 
-        remaining = [p for p in plan_b if str(p.source) not in done]
+        remaining = exclude_completed_sources(plan_b, done)
         assert len(remaining) == 2
         execute_plan(remaining, options_b)
         assert find_unfinished_journal(dst) is None
@@ -636,6 +637,73 @@ class TestJournal:
         assert jp is not None
         assert completed_sources(jp)
         assert '"run": "complete"' not in jp.read_text(encoding="utf-8")
+
+    @pytest.mark.parametrize("journalled,same", [
+        # Slash style only. PureWindowsPath stringifies with backslashes,
+        # which is what Path does on Windows for a forward-slash input.
+        ("C:/Photos/Vacation/IMG_0001.JPG",
+         PureWindowsPath("C:/Photos/Vacation/IMG_0001.JPG")),
+        # Case and slashes, the mismatch a typed path vs a folder dialog makes.
+        ("C:/Photos/Vacation/IMG_0001.JPG",
+         PureWindowsPath(r"c:\photos\vacation\img_0001.jpg")),
+        # Journal stored the backslash form; the rescan kept forward slashes
+        # and a different case.
+        (r"C:\Photos\Vacation\IMG_0001.JPG",
+         PureWindowsPath("C:/photos/vacation/img_0001.jpg")),
+    ])
+    def test_resume_skip_matches_windows_case_and_slashes(
+            self, tmp_path, journalled, same):
+        """Completed sources skip even when only case or slashes differ.
+
+        ``windows=True`` applies the helper's Windows key on Linux CI.
+        Exact string membership is the bug: it would organize the file
+        again and land a ``name_1.ext`` collision copy.
+        """
+        # A real Path, so str() is the spelling a rescan would hand the GUI.
+        # On Windows that is backslashes; PureWindowsPath reproduces that here.
+        same_path = Path(os.fspath(same))
+        other_path = Path(os.fspath(
+            PureWindowsPath(r"C:\Photos\Vacation\IMG_0099.JPG")))
+        assert str(same_path) != journalled
+        assert str(other_path) != journalled
+
+        with JournalWriter(tmp_path) as writer:
+            writer.record("copy", journalled, "D:/Organized/2024/IMG_0001.jpg")
+        jp = journal_path_for(tmp_path)
+        stored = json.loads(jp.read_text(encoding="utf-8").splitlines()[0])
+        assert stored["source"] == journalled  # original spelling, not the key
+
+        done = completed_sources(jp)
+        assert journalled in done
+        assert str(same_path) not in done
+
+        capture = CaptureDate(datetime(2024, 7, 15, 10, 0, 0),
+                              DateSource.EXIF, Confidence.HIGH, "EXIF")
+        plan = [
+            PlannedFile(same_path, Path(os.fspath(
+                PureWindowsPath(r"D:\Organized\2024\a.jpg"))),
+                        10, capture, "image"),
+            PlannedFile(other_path, Path(os.fspath(
+                PureWindowsPath(r"D:\Organized\2024\b.jpg"))),
+                        10, capture, "image"),
+        ]
+        remaining = exclude_completed_sources(plan, done, windows=True)
+        assert [p.source for p in remaining] == [other_path]
+        assert path_identity(journalled, windows=True) == path_identity(
+            same_path, windows=True)
+        assert path_identity(other_path, windows=True) != path_identity(
+            same_path, windows=True)
+
+    def test_path_identity_follows_host_normcase(self, tmp_path):
+        path = tmp_path / "Photos" / "A.JPG"
+        text = os.fspath(path)
+        assert path_identity(path) == os.path.normcase(
+            os.path.normpath(os.path.abspath(text)))
+        assert path_identity(text) == path_identity(path)
+        messy = str(path.parent) + os.sep + os.sep + path.name
+        assert path_identity(messy) == path_identity(path)
+        other = path.parent / "B.JPG"
+        assert path_identity(other) != path_identity(path)
 
 
 class TestDryRun:

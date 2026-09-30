@@ -13,10 +13,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import ntpath
 import os
 import shutil
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Iterable, Iterator, Optional
 
 JOURNAL_DIRNAME = ".mediaorganizer-journal"
 JOURNAL_FILENAME = "operations.jsonl"
@@ -123,11 +124,37 @@ def find_unfinished_journal(dest_dir: Path | str) -> Optional[Path]:
     return None if finished else path
 
 
+def path_identity(path: str | os.PathLike, *, windows: bool | None = None) -> str:
+    """Stable key for one file across resume scans.
+
+    The journal keeps the original path text. Resume compares keys so an
+    older ``str(Path)`` entry still matches a later scan.
+
+    On Windows, and when ``windows=True``, the key is
+    ``normcase(normpath(abspath(...)))`` via ``ntpath``: drive and folder
+    case do not matter, and ``/`` and ``\\`` are the same separator. That
+    is what ``os.path`` does on Windows. ``windows=True`` forces the same
+    key on Linux so the resume regression does not need a Windows runner.
+
+    On POSIX the key is ``normpath(abspath(...))`` and case is preserved.
+    """
+    text = os.fspath(path)
+    if windows is None:
+        windows = os.name == "nt"
+    if windows:
+        return ntpath.normcase(ntpath.normpath(ntpath.abspath(text)))
+    return os.path.normpath(os.path.abspath(text))
+
+
 def completed_sources(journal_path: Path | str) -> set[str]:
     """Sources fully written in the interrupted run (safe to skip on resume).
 
-    Sources from a run that already wrote ``{"run": "complete"}`` are not
-    included. Those files belong to a finished organize, not this resume.
+    Values are the path strings stored in the journal, not identity keys.
+    Compare them with :func:`path_identity` (or
+    :func:`exclude_completed_sources`) so slash style and, on Windows,
+    case still match. Sources from a run that already wrote
+    ``{"run": "complete"}`` are not included. Those files belong to a
+    finished organize, not this resume.
     """
     entries, _finished = _open_run(Path(journal_path))
     return {e["source"] for e in entries
@@ -135,9 +162,28 @@ def completed_sources(journal_path: Path | str) -> set[str]:
 
 
 def completed_destinations(journal_path: Path | str) -> set[str]:
+    """Destinations fully written in the interrupted run.
+
+    Values are the original journal strings. Compare with
+    :func:`path_identity`, the same way resume matches sources.
+    """
     entries, _finished = _open_run(Path(journal_path))
     return {e["destination"] for e in entries
             if e.get("status") == "done" and e.get("destination")}
+
+
+def exclude_completed_sources(plan, completed: Iterable[str | os.PathLike], *,
+                              windows: bool | None = None) -> list:
+    """Plan rows whose source is not already in ``completed``.
+
+    Both the journal strings and each plan source go through
+    :func:`path_identity`. ``C:/Photos/A.jpg`` and ``c:\\photos\\a.jpg``
+    are the same file on Windows, including for a journal written before
+    this helper existed. A different file is kept.
+    """
+    done = {path_identity(source, windows=windows) for source in completed}
+    return [item for item in plan
+            if path_identity(item.source, windows=windows) not in done]
 
 
 def discard_journal(dest_dir: Path | str) -> None:

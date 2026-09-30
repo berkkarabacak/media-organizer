@@ -29,6 +29,7 @@ from ..core.display import (elide_middle, finished_run_lines, format_bytes,
 from ..core.eta import ThroughputEstimator, format_eta, format_rate
 from ..core.executor import free_space_status
 from ..core.journal import (completed_sources, discard_journal,
+                            exclude_completed_sources,
                             find_unfinished_journal)
 from ..core.metadata import Confidence, DateSource
 from ..core.organizer import STRATEGIES, OrganizeOptions, destination_blocks_scan
@@ -1294,8 +1295,7 @@ class MainWindow(QMainWindow):
                     f"Yes = Resume (skip them) · No = Discard and start over",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
                 if answer == QMessageBox.Yes:
-                    active = [p for p in active
-                              if str(p.source) not in done_before]
+                    active = exclude_completed_sources(active, done_before)
                     if not active:
                         QMessageBox.information(
                             self, APP_NAME,
