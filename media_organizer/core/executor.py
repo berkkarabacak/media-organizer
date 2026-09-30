@@ -116,6 +116,14 @@ def execute_plan(
         # is how resume keeps the files already organized in this run.
         journal = JournalWriter(options.dest_dir)
 
+    # complete() only after the plan loop finishes with no break and no
+    # unexpected exception. Cancel breaks out and must stay resumable.
+    # Per-file OSError is caught inside the loop and is not this case.
+    # Anything else (a bug, MemoryError, a runtime failure) used to reach
+    # finally with cancelled still false and write {"run": "complete"}, so
+    # the next launch treated the crash as finished and could replace the
+    # journal. close() always runs, including when complete() is skipped.
+    finished_normally = False
     try:
         for i, item in enumerate(plan):
             if cancel and cancel():
@@ -169,11 +177,16 @@ def execute_plan(
                 op.error = str(exc)
                 summary["errors"] += 1
             log.operations.append(op)
+        else:
+            # No break (cancel) and no exception escaped the loop.
+            finished_normally = True
     finally:
         if journal is not None:
-            if not summary["cancelled"]:
-                journal.complete()
-            journal.close()
+            try:
+                if finished_normally and not summary["cancelled"]:
+                    journal.complete()
+            finally:
+                journal.close()
 
     if not dry_run:
         save_log(log, options.dest_dir)

@@ -148,6 +148,7 @@ class TestJournal:
         jp = journal_path_for(dst)
         assert jp.exists()
         assert find_unfinished_journal(dst) is None  # run completed
+        assert '{"run": "complete"}' in jp.read_text(encoding="utf-8")
 
     def test_interrupted_run_is_detected_and_resumable(self, tmp_path):
         src, dst = _setup(tmp_path, n=4)
@@ -165,6 +166,7 @@ class TestJournal:
         assert summary["cancelled"]
         jp = find_unfinished_journal(dst)
         assert jp is not None, "interrupted run must leave an unfinished journal"
+        assert '"run": "complete"' not in jp.read_text(encoding="utf-8")
         done = completed_sources(jp)
         assert 0 < len(done) < 4
 
@@ -304,6 +306,72 @@ class TestJournal:
             writer.complete()
         assert find_unfinished_journal(tmp_path) is None
         assert completed_sources(jp) == set()
+
+    def test_unexpected_exception_leaves_unfinished_journal(
+            self, tmp_path, monkeypatch):
+        """A non-OSError mid-run must stay resumable.
+
+        Per-file OSError is recorded and the loop continues. Anything else
+        used to hit finally while cancelled was still false and write
+        {"run": "complete"}. The next launch then skipped resume and a new
+        JournalWriter could replace the open run.
+        """
+        src, dst = _setup(tmp_path, n=3)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        plan = _plan(src, dst)
+        real_copy = atomic_copy
+        calls = {"n": 0}
+
+        def fail_after_one(source, final):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("injected mid-organize failure")
+            return real_copy(source, final)
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor.atomic_copy", fail_after_one)
+
+        with pytest.raises(RuntimeError, match="injected mid-organize failure"):
+            execute_plan(plan, options)
+
+        jp = find_unfinished_journal(dst)
+        assert jp is not None
+        done = completed_sources(jp)
+        assert len(done) == 1
+        assert done <= {str(item.source) for item in plan}
+        assert '"run": "complete"' not in jp.read_text(encoding="utf-8")
+        # The open run is continued, not replaced by the next writer.
+        with JournalWriter(dst) as writer:
+            writer.record("copy", "still-open", str(dst / "still-open.jpg"))
+        assert done <= completed_sources(jp)
+        assert "still-open" in completed_sources(jp)
+
+    def test_successful_run_writes_complete_and_is_not_unfinished(self, tmp_path):
+        src, dst = _setup(tmp_path, n=2)
+        execute_plan(_plan(src, dst),
+                     OrganizeOptions(source_dir=src, dest_dir=dst))
+        jp = journal_path_for(dst)
+        assert find_unfinished_journal(dst) is None
+        text = jp.read_text(encoding="utf-8")
+        assert text.strip().splitlines()[-1] == '{"run": "complete"}'
+        assert completed_sources(jp) == set()
+
+    def test_cancelled_run_does_not_write_complete(self, tmp_path):
+        src, dst = _setup(tmp_path, n=3)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        calls = {"n": 0}
+
+        def cancel_after_one():
+            calls["n"] += 1
+            return calls["n"] > 1
+
+        _log, summary = execute_plan(_plan(src, dst), options,
+                                     cancel=cancel_after_one)
+        assert summary["cancelled"]
+        jp = find_unfinished_journal(dst)
+        assert jp is not None
+        assert completed_sources(jp)
+        assert '"run": "complete"' not in jp.read_text(encoding="utf-8")
 
 
 class TestDryRun:
