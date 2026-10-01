@@ -1,7 +1,10 @@
 # Google Drive incremental upload
 
 Design for [issue 2](https://github.com/berkkarabacak/media-organizer/issues/2).
-Later slices should follow this document.
+Slices 1–6 are in the app. This document is what they do.
+
+The short version for someone using the app is the README section
+"Upload to Google Drive (optional)".
 
 Slice 1 is `media_organizer.core.drive_sync`. It loads and saves a local
 sync record and decides whether a file is `skip` or `upload`. It does not
@@ -37,6 +40,25 @@ show an HTTP status, a response body, or a stack trace. A hard failure
 stops the pass. Files already saved with a Drive file id stay skippable.
 A resumable session that was already opened stays, so that file can
 continue on the next run. Later files in the same pass are not started.
+
+Slice 6 is these docs. The README tells someone using the app how to sign
+in, pick one folder, upload, skip unchanged files, cancel and resume, and
+read a failure. It does not say the app is unconditionally offline.
+
+## What you do in the app
+
+1. Organize the library on this computer first. Drive does not replace that
+   step.
+2. Open **Drive → Google Drive…**.
+3. Press **Sign in**.
+4. Choose the organized library and one Drive folder.
+5. Press **Upload**. The first run sends the organized tree. A later run
+   skips unchanged files, adds a new path, and updates a changed file that
+   already has a Drive file id.
+6. **Cancel** stops before the next file. **Upload** again continues. Files
+   already saved are skipped.
+7. A failure shows one short sentence (Drive full, sign-in expired, or this
+   computer cannot reach Google).
 
 ## Where Drive sits
 
@@ -250,11 +272,12 @@ kept. `mark_uploaded` runs only after Drive returns a file id, then
 `save_sync_record` runs, then the session URI for that path is removed.
 `DriveUploadError` stops the pass. See "Errors the upload shows".
 
-## Later slices
+## Slices
 
 1. Local sync record (`skip` / `upload`, no network). Done: `drive_sync`.
-2. Sign in, and let the user pick one Drive folder. Still no upload.
-   Done: `google_auth`, `drive_folders`, and `gui/drive_dialog`.
+2. Sign in, and let the user pick one Drive folder. Done: `google_auth`,
+   `drive_folders`, and `gui/drive_dialog`. Signing in does not upload
+   file bytes.
 3. First upload of an organized library, with progress, cancel, and resume.
    Done: `drive_upload` and the Upload button in `gui/drive_dialog`.
    The session URI is `upload_sessions.json` next to the OAuth token.
@@ -268,9 +291,9 @@ kept. `mark_uploaded` runs only after Drive returns a file id, then
 5. Errors a non-technical user can read (quota, expired sign-in, offline).
    Done: `drive_upload` and the status line in `gui/drive_dialog`. The
    sentences are in "Errors the upload shows".
-6. Docs. The README currently says the app is offline and has no network
-   features. Update that sentence in the same release that ships upload.
-   Not started.
+6. Docs. Done: the README describes optional Drive upload. Organize and
+   GPS stay on this computer. The README does not say the app is
+   unconditionally offline. This document matches slices 1–5.
 
 ## Errors the upload shows
 
@@ -298,7 +321,9 @@ was opened.
 ## Out of scope for this version
 
 - Two-way sync.
+- Deleting a remote file, including after a local rename or a local delete.
 - Deleting local files after a successful upload.
 - Replacing the local organize step.
-- The README offline sentence (slice 6), in the release that ships upload.
 - A client secret, token, or credential file in the repository.
+- Replacing the placeholder Desktop client id. That stays
+  `REPLACE_WITH_YOUR_DESKTOP_CLIENT_ID` until Berk sets his own.

@@ -1233,3 +1233,42 @@ class TestUploadErrors:
         assert (library / "2024/a.jpg").read_bytes() == b"aaaa"
         assert (library / "2024/b.jpg").read_bytes() == b"bbbb"
         assert not any(_is_remote_delete(call) for call in fake.calls)
+
+
+class TestDocumentedHappyPath:
+    def test_first_upload_then_skips_unchanged_without_a_real_library(self, tmp_path):
+        """README path: upload a tiny tree, then skip it when nothing changed.
+
+        Fake Drive HTTP and a temporary directory. No photo library and no
+        connection to Google.
+        """
+        library = tmp_path / "organized"
+        _bind(library)
+        relative = "2024/07 July/note.jpg"
+        payload = b"not-a-photo"
+        _write(library, relative, payload)
+        local = library.joinpath(*relative.split("/"))
+        fake = FakeDrive()
+        sessions = tmp_path / "upload_sessions.json"
+
+        first, _progress = _run(library, fake, sessions)
+        assert first.cancelled is False
+        assert first.uploaded == 1
+        assert first.skipped == 0
+        assert local.read_bytes() == payload
+        assert not any(_is_remote_delete(call) for call in fake.calls)
+        digest = full_hash(local)
+        assert load_sync_record(library).decide(relative, len(payload), digest) == DECISION_SKIP
+
+        sent = len(fake.calls)
+        second, _again = _run(library, fake, sessions)
+        assert second.cancelled is False
+        assert second.uploaded == 0
+        assert second.skipped == 1
+        assert fake.calls[sent:] == []
+        assert local.read_bytes() == payload
+        assert list(fake.files.values())[0]["data"] == payload
+
+        readme = Path(__file__).resolve().parents[1].joinpath("README.md").read_text(encoding="utf-8")
+        assert "100% offline" not in readme
+        assert "docs/drive-incremental-upload.md" in readme
