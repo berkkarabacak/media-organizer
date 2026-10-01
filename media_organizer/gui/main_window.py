@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
 )
 
 from .. import APP_NAME, __version__
-from ..core.display import (elide_middle, finished_run_lines, format_bytes,
+from ..core.display import (elide_middle, finished_run_keeps_plan,
+                            finished_run_lines, format_bytes,
                             relative_destination, relative_destination_fast,
                             sorted_plan_items)
 from ..core.eta import ThroughputEstimator, format_eta, format_rate
@@ -1380,38 +1381,66 @@ class MainWindow(QMainWindow):
     def _disarm_finished_plan(self) -> None:
         """Drop the plan after a run that must not be started again.
 
-        A normal finish and an empty Resume both end here. Organize stays
+        A clean finish and an empty Resume both end here. Organize stays
         off until the next scan builds a new plan. The preview table is
         left as it was: a finished run does not rebuild it either.
+
+        Do not call this when the crash journal is still open. Resume
+        uses the plan already on screen and skips sources that succeeded.
         """
         self.plan = []
         self.organize_btn.setEnabled(False)
 
     def _on_run_finished(self, log, summary: dict):
         # finished_run is emitted from run() before the thread leaves
-        # isRunning(). Join first so Done-dialog Undo is not treated as
-        # an in-flight organize.
+        # isRunning(). Join first so dialog Undo is not treated as an
+        # in-flight organize.
         self._join_organize_worker()
         QApplication.restoreOverrideCursor()
         self._set_busy(False)
         self._hide_progress_panel()
-        self._disarm_finished_plan()
         dest_dir = self.dest_card.edit.text().strip()
         self._last_run = (log, dest_dir, summary)
+        # Cancel and a per-file OSError return here with the journal still
+        # open. _set_busy turns Organize back on when the plan is loaded;
+        # disarming afterwards forced a full Scan before Resume could run.
+        journal_open = bool(
+            dest_dir and find_unfinished_journal(dest_dir) is not None)
+        keep_plan = finished_run_keeps_plan(
+            summary, journal_open=journal_open)
+        if keep_plan:
+            self.organize_btn.setEnabled(bool(self._active_plan()))
+        else:
+            self._disarm_finished_plan()
 
         folders = len({str(Path(op.destination).parent) for op in log.operations
                        if op.status == "done"})
         status, text = finished_run_lines(
-            summary, folders=folders, total_bytes=self._last_active_bytes)
+            summary, folders=folders, total_bytes=self._last_active_bytes,
+            journal_open=journal_open)
         self.status_label.setText(status)
 
         box = QMessageBox(self)
         dry = summary.get("dry_run", False)
-        box.setWindowTitle(f"{APP_NAME} — {'Dry run complete' if dry else 'Done'}")
-        box.setIconPixmap(icons.pixmap(
-            "scan" if dry else "check-circle",
-            theme.AMBER if dry else theme.GREEN, 44))
+        if dry:
+            title = "Dry run complete"
+            icon_name, icon_color = "scan", theme.AMBER
+        elif keep_plan:
+            title = "Organize stopped"
+            icon_name, icon_color = "alert-triangle", theme.AMBER
+        else:
+            title = "Done"
+            icon_name, icon_color = "check-circle", theme.GREEN
+        box.setWindowTitle(f"{APP_NAME} — {title}")
+        box.setIconPixmap(icons.pixmap(icon_name, icon_color, 44))
         box.setText(text)
+        # Resume stays on this dialog so a cancel or a per-file error does
+        # not look like a finished run whose only repair is Undo.
+        resume_btn = None
+        if keep_plan and self._active_plan():
+            resume_btn = box.addButton("Resume", QMessageBox.AcceptRole)
+            resume_btn.setIcon(icons.icon("play", theme.TEXT, 14))
+            box.setDefaultButton(resume_btn)
         open_btn = box.addButton("Open folder", QMessageBox.AcceptRole)
         open_btn.setIcon(icons.icon("external-link", theme.TEXT, 14))
         # A dry run writes nothing and does not save a log. Undo of that
@@ -1424,7 +1453,9 @@ class MainWindow(QMainWindow):
         box.addButton(QMessageBox.Close)
         box.exec()
         clicked = box.clickedButton()
-        if clicked is open_btn:
+        if resume_btn is not None and clicked is resume_btn:
+            self.start_organize()
+        elif clicked is open_btn:
             QDesktopServices.openUrl(QUrl.fromLocalFile(dest_dir))
         elif undo_btn is not None and clicked is undo_btn:
             self._undo_log(log, dest_dir)

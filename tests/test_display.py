@@ -4,8 +4,8 @@ from datetime import datetime
 from pathlib import Path
 
 from media_organizer.core.display import (
-    elide_middle, finished_run_lines, format_bytes, plan_sort_key,
-    relative_destination, sorted_plan_items,
+    elide_middle, finished_run_keeps_plan, finished_run_lines, format_bytes,
+    plan_sort_key, relative_destination, sorted_plan_items,
 )
 from media_organizer.core.plan import UNDO_STACK_LIMIT
 from media_organizer.core.metadata import CaptureDate, DateSource
@@ -158,3 +158,113 @@ class TestFinishedRunUndoWording:
             {"copied": 2, "moved": 0, "action": "copy", "dry_run": True},
             folders=1, total_bytes=10)
         assert "undo" not in text.lower()
+
+
+def _run_summary(**overrides):
+    summary = {
+        "copied": 1,
+        "moved": 0,
+        "skipped_duplicates": 0,
+        "undated": 0,
+        "uncertain": 0,
+        "errors": 0,
+        "cancelled": False,
+        "dry_run": False,
+        "action": "copy",
+    }
+    summary.update(overrides)
+    return summary
+
+
+class TestPartialFinishKeepsResume:
+    """Cancel and per-file errors stay resumable. A clean finish does not."""
+
+    def test_open_journal_keeps_the_plan_for_cancel_and_errors(self):
+        assert finished_run_keeps_plan(
+            _run_summary(cancelled=True), journal_open=True)
+        assert finished_run_keeps_plan(
+            _run_summary(errors=1, copied=1), journal_open=True)
+        # The journal is the signal. A summary that looks clean still
+        # stays armed when complete() never landed.
+        assert finished_run_keeps_plan(
+            _run_summary(copied=2), journal_open=True)
+
+    def test_clean_finish_and_dry_run_drop_the_plan(self):
+        assert not finished_run_keeps_plan(
+            _run_summary(copied=2), journal_open=False)
+        assert not finished_run_keeps_plan(
+            _run_summary(dry_run=True, copied=2), journal_open=True)
+        assert not finished_run_keeps_plan(
+            _run_summary(dry_run=True, cancelled=True, errors=1),
+            journal_open=True)
+
+    def test_errors_are_not_called_permanently_skipped(self):
+        status, text = finished_run_lines(
+            _run_summary(errors=1, copied=1),
+            folders=1, total_bytes=10, journal_open=True)
+        assert "couldn't be read" not in text
+        assert "skipped" not in text.lower()
+        assert "1 file could not be organized" in text
+        assert "Organize again to Resume" in text
+        assert "Organize again to Resume" in status
+        assert "Done!" not in text
+        assert not status.startswith("Finished")
+        assert "Undo reverses" in text
+        assert f"The last {UNDO_STACK_LIMIT} organize runs" in text
+
+    def test_several_errors_use_the_plural(self):
+        _status, text = finished_run_lines(
+            _run_summary(errors=2, copied=1),
+            folders=1, total_bytes=10, journal_open=True)
+        assert "2 files could not be organized" in text
+        assert "couldn't be read" not in text
+
+    def test_cancel_points_at_resume(self):
+        status, text = finished_run_lines(
+            _run_summary(cancelled=True, copied=1),
+            folders=1, total_bytes=10, journal_open=True)
+        assert "skipped" not in text.lower()
+        assert "couldn't be read" not in text
+        assert "cancelled part-way" in text
+        assert "Organize again to Resume" in text
+        assert "Organize again to Resume" in status
+        assert "Done!" not in text
+        assert not status.startswith("Finished")
+
+    def test_stopped_move_says_moved(self):
+        status, text = finished_run_lines(
+            _run_summary(action="move", moved=1, copied=0, cancelled=True),
+            folders=1, total_bytes=10, journal_open=True)
+        assert "1 moved" in status
+        assert "moved" in text
+        assert "copied" not in status
+        assert "copied" not in text
+
+    def test_closed_journal_still_says_done(self):
+        status, text = finished_run_lines(
+            _run_summary(copied=2, errors=0),
+            folders=1, total_bytes=10, journal_open=False)
+        assert status == "Finished: 2 copied."
+        assert text.startswith("Done!")
+        assert "Resume" not in text
+        assert "could not be organized" not in text
+
+    def test_errors_without_a_journal_are_not_called_skipped(self):
+        _status, text = finished_run_lines(
+            _run_summary(errors=1, dry_run=False),
+            folders=1, total_bytes=10, journal_open=False)
+        assert "couldn't be read" not in text
+        assert "skipped" not in text.lower()
+        assert "1 file could not be organized" in text
+        assert "Resume" not in text
+
+    def test_dry_run_with_an_open_journal_does_not_say_resume(self):
+        status, text = finished_run_lines(
+            _run_summary(dry_run=True, errors=1, cancelled=True),
+            folders=1, total_bytes=10, journal_open=True)
+        assert "Resume" not in text
+        assert "Resume" not in status
+        assert "undo" not in text.lower()
+        assert "couldn't be read" not in text
+        assert "skipped" not in text.lower()
+        assert "Dry run" in text
