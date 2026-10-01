@@ -6,9 +6,11 @@ Safety features:
   run can be resumed. A new organize replaces a finished journal; a resume
   appends to the unfinished one. Copies are fsynced to a temp name, then
   atomically renamed. A cross-volume move journals that copy before the
-  source is removed. A destination that already holds this source's bytes
-  is journaled and not copied again. A different file at that path still
-  gets a collision suffix.
+  source is removed. Resume still removes that source when the done line
+  is already there and the destination bytes still match; a missing or
+  different destination is left alone. A destination that already holds
+  this source's bytes is journaled and not copied again. A different file
+  at that path still gets a collision suffix.
 - free-space preflight helper. The byte total is what this run will
   still write, not rows Resume will skip and not a destination that
   already holds the source. A same-volume move is a rename and is not
@@ -32,7 +34,7 @@ from typing import Callable, Optional
 from .journal import (JournalWriter, atomic_copy, atomic_move,
                        cleanup_stale_parts, completed_operations,
                        file_sha256, files_identical,
-                       find_unfinished_journal)
+                       find_unfinished_journal, path_identity)
 from .metadata import DateSource
 from .organizer import OrganizeOptions, PlannedFile
 from .plan import Operation, RunLog, new_log, save_log
@@ -181,6 +183,61 @@ def free_space_status(dest_dir: Path | str, needed_bytes: int) -> dict:
     }
 
 
+def finish_pending_move_unlinks(dest_dir: Path | str, plan=(), *,
+                                copy_mode: bool = False) -> int:
+    """Remove sources a cross-volume move journaled but did not unlink.
+
+    Returns how many sources were removed.
+
+    The done line is written before ``source.unlink()`` so a crash cannot
+    drop the only copy. Resume then drops that source from the plan, and
+    the original file would stay in the library forever. On a Move resume,
+    unlink it when the journal action is move, this ``plan`` will not move
+    it itself, and the destination is still a byte-for-byte match of a
+    different file.
+
+    Leave the source alone when the destination is missing, the bytes
+    differ, or the two paths are the same file. That source may be the
+    only copy. Copy mode removes nothing. A journaled copy removes
+    nothing even when this run is a move. Same-volume moves already
+    dropped the source name inside ``os.replace`` before the done line,
+    so there is nothing left to unlink.
+    """
+    if copy_mode:
+        return 0
+    journal = find_unfinished_journal(dest_dir)
+    if journal is None:
+        return 0
+    # Rows still in the plan take the reused-destination path: journal,
+    # then unlink. Removing the source first would make that path miss
+    # the byte check and publish a collision copy.
+    deferred: set[str] = set()
+    for item in plan:
+        if item.is_duplicate or not item.destination or item.error:
+            continue
+        deferred.add(path_identity(item.source))
+    removed = 0
+    for entry in completed_operations(journal):
+        if entry["action"] != "move" or not entry["destination"]:
+            continue
+        source = Path(entry["source"])
+        destination = Path(entry["destination"])
+        if path_identity(source) in deferred:
+            continue
+        if path_identity(source) == path_identity(destination):
+            continue
+        if not files_identical(source, destination):
+            continue
+        if _same_file(source, destination):
+            continue
+        try:
+            source.unlink()
+        except FileNotFoundError:
+            continue
+        removed += 1
+    return removed
+
+
 def _seed_log_from_journal(log: RunLog, dest_dir: Path | str) -> None:
     """Append the open journal's done files to ``log`` before the plan runs.
 
@@ -271,6 +328,13 @@ def execute_plan(
     finished_normally = False
     aborted: Optional[Exception] = None
     try:
+        # Journaled cross-volume moves are not in ``plan`` (Resume excludes
+        # done sources). Finish the unlink now, before those rows are
+        # treated as fully settled. Copy mode and a destination that no
+        # longer matches leave the source in place.
+        if journal is not None and not options.copy_mode:
+            finish_pending_move_unlinks(
+                options.dest_dir, plan, copy_mode=False)
         for i, item in enumerate(plan):
             if cancel and cancel():
                 summary["cancelled"] = True

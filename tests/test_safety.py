@@ -1861,6 +1861,241 @@ class TestResumePublishedDestination:
         assert log.operations[0].destination == str(plan[0].destination)
 
 
+def _journaled_move_still_on_disk(tmp_path, *, n=2, dest="match", action="move"):
+    """Done line for the first file, source still present, dest as ``dest``.
+
+    ``dest`` is ``match`` (same bytes), ``missing``, or ``differ`` (same
+    size, different bytes). Later files are not journaled.
+    """
+    src, dst = _setup(tmp_path, n=n)
+    options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+    plan = _plan(src, dst, copy_mode=False)
+    source = plan[0].source
+    payload = source.read_bytes()
+    final = plan[0].destination
+    if dest == "match":
+        final.parent.mkdir(parents=True, exist_ok=True)
+        atomic_copy(source, final)
+    elif dest == "differ":
+        final.parent.mkdir(parents=True, exist_ok=True)
+        mutated = bytearray(payload)
+        mutated[-1] ^= 0xFF
+        assert bytes(mutated) != payload
+        assert len(mutated) == len(payload)
+        final.write_bytes(bytes(mutated))
+    elif dest != "missing":
+        raise ValueError(dest)
+    with JournalWriter(dst) as writer:
+        writer.record(action, str(source), str(final))
+    assert find_unfinished_journal(dst) is not None
+    assert source.is_file()
+    assert source.read_bytes() == payload
+    remaining = exclude_completed_sources(
+        plan, completed_sources(journal_path_for(dst)))
+    assert source not in [item.source for item in remaining]
+    return (options, src, dst, plan, source, payload, final, remaining)
+
+
+class TestJournaledCrossVolumeMoveResume:
+    """Crash after the move done line and before ``source.unlink()``.
+
+    Resume excludes that source. The destination copy is already there.
+    The source must still be removed when those bytes match, and must be
+    kept when they do not.
+    """
+
+    def test_cross_volume_resume_unlinks_journaled_source_still_present(
+            self, tmp_path, monkeypatch):
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        source = plan[0].source
+        other = plan[1].source
+        payload = source.read_bytes()
+        other_payload = other.read_bytes()
+        final = plan[0].destination
+        other_final = plan[1].destination
+        state = {"abort": True}
+        real_replace = os.replace
+        real_unlink = Path.unlink
+
+        def spy_replace(src_path, dst_path):
+            if Path(src_path) == source:
+                raise OSError("simulated cross-volume rename")
+            return real_replace(src_path, dst_path)
+
+        def spy_unlink(self, *args, **kwargs):
+            if state["abort"] and self == source:
+                text = journal_path_for(dst).read_text(encoding="utf-8")
+                assert str(source) in text
+                assert '"status": "done"' in text
+                assert '"run": "complete"' not in text
+                assert self.is_file()
+                raise RuntimeError("abort before unlink")
+            return real_unlink(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.replace", spy_replace)
+        monkeypatch.setattr(Path, "unlink", spy_unlink)
+
+        with pytest.raises(RuntimeError, match="abort before unlink"):
+            execute_plan(plan, options)
+
+        assert source.is_file()
+        assert source.read_bytes() == payload
+        assert final.is_file()
+        assert final.read_bytes() == payload
+        assert other.is_file()
+        assert not other_final.exists()
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        assert str(source) in completed_sources(journal)
+        assert '"run": "complete"' not in journal.read_text(encoding="utf-8")
+
+        state["abort"] = False
+        remaining = exclude_completed_sources(plan, completed_sources(journal))
+        assert [item.source for item in remaining] == [other]
+
+        log, summary = execute_plan(remaining, options)
+
+        assert summary["moved"] == 1
+        assert summary["errors"] == 0
+        assert summary["cancelled"] is False
+        assert not source.exists()
+        assert final.read_bytes() == payload
+        assert not other.exists()
+        assert other_final.read_bytes() == other_payload
+        names = sorted(p.name for p in dst.rglob("*.jpg"))
+        assert names == ["IMG_0.jpg", "IMG_1.jpg"]
+        text = journal_path_for(dst).read_text(encoding="utf-8")
+        assert text.count(str(source)) == 1
+        assert text.strip().splitlines()[-1] == '{"run": "complete"}'
+        assert find_unfinished_journal(dst) is None
+        done = [op for op in log.operations if op.status == "done"]
+        assert {path_identity(op.source) for op in done} == {
+            path_identity(source), path_identity(other)}
+        assert all(op.action == "move" for op in done)
+
+        result = undo_log(log, dst)
+        assert result["undone"] == 2
+        assert result["failed"] == 0
+        assert source.read_bytes() == payload
+        assert other.read_bytes() == other_payload
+        assert not final.exists()
+        assert not other_final.exists()
+
+    def test_empty_resume_unlinks_journaled_cross_volume_source(self, tmp_path):
+        (options, _src, dst, _plan_rows, source, payload, final,
+         remaining) = _journaled_move_still_on_disk(tmp_path, n=1)
+        assert remaining == []
+
+        log, summary = execute_plan(remaining, options)
+
+        assert summary["moved"] == 0
+        assert summary["errors"] == 0
+        assert summary["cancelled"] is False
+        assert not source.exists()
+        assert final.read_bytes() == payload
+        assert not list(dst.rglob("IMG_0_1.jpg"))
+        text = journal_path_for(dst).read_text(encoding="utf-8")
+        assert text.count(str(source)) == 1
+        assert text.strip().splitlines()[-1] == '{"run": "complete"}'
+        assert find_unfinished_journal(dst) is None
+        assert [path_identity(op.source) for op in log.operations
+                if op.status == "done"] == [path_identity(source)]
+
+    def test_resume_keeps_source_when_journaled_destination_missing(
+            self, tmp_path):
+        (options, _src, dst, plan, source, payload, final,
+         remaining) = _journaled_move_still_on_disk(tmp_path, dest="missing")
+        assert remaining
+        assert not final.exists()
+
+        _log, summary = execute_plan(remaining, options)
+
+        assert summary["errors"] == 0
+        assert summary["moved"] == 1
+        assert source.is_file()
+        assert source.read_bytes() == payload
+        assert not final.exists()
+        names = sorted(p.name for p in dst.rglob("*.jpg"))
+        assert names == ["IMG_1.jpg"]
+        assert find_unfinished_journal(dst) is None
+
+    def test_resume_keeps_source_when_journaled_destination_bytes_differ(
+            self, tmp_path):
+        (options, _src, dst, _plan_rows, source, payload, final,
+         remaining) = _journaled_move_still_on_disk(tmp_path, dest="differ")
+        mutated = final.read_bytes()
+        assert mutated != payload
+        assert len(mutated) == len(payload)
+
+        _log, summary = execute_plan(remaining, options)
+
+        assert summary["errors"] == 0
+        assert summary["moved"] == 1
+        assert source.is_file()
+        assert source.read_bytes() == payload
+        assert final.read_bytes() == mutated
+        names = sorted(p.name for p in dst.rglob("*.jpg"))
+        assert names == ["IMG_0.jpg", "IMG_1.jpg"]
+        assert find_unfinished_journal(dst) is None
+
+    def test_copy_resume_does_not_unlink_journaled_move_source(self, tmp_path):
+        (options, _src, dst, plan, source, payload, final,
+         remaining) = _journaled_move_still_on_disk(tmp_path)
+        options = OrganizeOptions(
+            source_dir=options.source_dir, dest_dir=dst, copy_mode=True)
+
+        _log, summary = execute_plan(remaining, options)
+
+        assert summary["copied"] == 1
+        assert summary["errors"] == 0
+        assert source.is_file()
+        assert source.read_bytes() == payload
+        assert final.read_bytes() == payload
+        assert plan[1].source.is_file()
+        names = sorted(p.name for p in dst.rglob("*.jpg"))
+        assert names == ["IMG_0.jpg", "IMG_1.jpg"]
+        assert find_unfinished_journal(dst) is None
+
+    def test_move_resume_does_not_unlink_journaled_copy_source(self, tmp_path):
+        (options, _src, dst, plan, source, payload, final,
+         remaining) = _journaled_move_still_on_disk(tmp_path, action="copy")
+
+        _log, summary = execute_plan(remaining, options)
+
+        assert summary["moved"] == 1
+        assert summary["errors"] == 0
+        assert source.is_file()
+        assert source.read_bytes() == payload
+        assert final.read_bytes() == payload
+        assert not plan[1].source.exists()
+        names = sorted(p.name for p in dst.rglob("*.jpg"))
+        assert names == ["IMG_0.jpg", "IMG_1.jpg"]
+        assert find_unfinished_journal(dst) is None
+
+    def test_dry_run_does_not_unlink_journaled_move_source(self, tmp_path):
+        (options, _src, dst, plan, source, payload, final,
+         remaining) = _journaled_move_still_on_disk(tmp_path)
+        options = OrganizeOptions(
+            source_dir=options.source_dir, dest_dir=dst, copy_mode=False,
+            dry_run=True)
+
+        _log, summary = execute_plan(remaining, options)
+
+        assert summary["dry_run"] is True
+        assert summary["moved"] == 1
+        assert source.is_file()
+        assert source.read_bytes() == payload
+        assert final.read_bytes() == payload
+        assert plan[1].source.is_file()
+        assert not plan[1].destination.exists()
+        text = journal_path_for(dst).read_text(encoding="utf-8")
+        assert '"run": "complete"' not in text
+        assert find_unfinished_journal(dst) is not None
+
+
 class TestDryRun:
     def test_dry_run_writes_nothing(self, tmp_path):
         src, dst = _setup(tmp_path)

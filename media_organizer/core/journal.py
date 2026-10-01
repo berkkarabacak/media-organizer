@@ -207,6 +207,11 @@ def exclude_completed_sources(plan, completed: Iterable[str | os.PathLike], *,
     :func:`path_identity`. ``C:/Photos/A.jpg`` and ``c:\\photos\\a.jpg``
     are the same file on Windows, including for a journal written before
     this helper existed. A different file is kept.
+
+    A journaled cross-volume move can still have its source on disk: the
+    done line is written before the unlink. This helper still drops that
+    row so the bytes are not copied again. ``execute_plan`` removes the
+    source when the destination is still a match.
     """
     done = {path_identity(source, windows=windows) for source in completed}
     return [item for item in plan
@@ -321,8 +326,12 @@ def atomic_move(source: Path, final: Path) -> tuple[str, bool]:
     If the process dies after that rename and before the journal line, the
     bytes are already at ``final`` and the source is still there. Resume
     keeps that path when the bytes still match, instead of copying to a
-    collision name. A crash before the rename leaves the part file and
-    the source. Cleanup deletes that part; it does not rename it onto
+    collision name. A crash after the journal line and before the source
+    unlink is the other window: the done line is already there, so Resume
+    would otherwise skip the row and leave the source in place.
+    ``execute_plan`` removes that source when the destination still
+    matches. A crash before the rename leaves the part file and the
+    source. Cleanup deletes that part; it does not rename it onto
     ``final``.
     """
     try:

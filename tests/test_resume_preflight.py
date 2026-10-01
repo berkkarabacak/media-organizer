@@ -548,6 +548,41 @@ class TestResumePreflight:
         assert not photo.exists()
         assert find_unfinished_journal(dst) is None
 
+    def test_resume_move_unlinks_journaled_source_when_nothing_else_remains(
+            self, qapp, window, tmp_path, monkeypatch):
+        """Last-file crash: Resume's plan is empty, but the source is still there."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        when = datetime(2024, 7, 15, 10, 0, 0)
+        photo = make_jpeg_with_exif(src / "done.jpg", when)
+        payload = photo.read_bytes()
+        plan = build_plan(OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=False))
+        assert len(plan) == 1
+        final = plan[0].destination
+        final.parent.mkdir(parents=True)
+        atomic_copy(photo, final)
+        with JournalWriter(dst) as writer:
+            writer.record("move", str(photo), str(final))
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
+        seen = _install_space(monkeypatch, free=1000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.start_organize()
+
+        assert seen == []
+        assert events[0][1].startswith("Move mode removes")
+        assert "Resume" in events[1][1]
+        assert "already organized" in _texts(events, "information")[0]
+        assert not photo.exists()
+        assert final.read_bytes() == payload
+        assert not list(dst.rglob("*_1*"))
+        assert find_unfinished_journal(dst) is None
+        assert window.org_worker is None
+
     def test_dry_run_move_skips_free_space_and_the_move_question(
             self, qapp, window, tmp_path, monkeypatch):
         src = tmp_path / "src"
