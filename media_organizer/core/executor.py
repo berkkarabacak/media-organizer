@@ -240,6 +240,29 @@ def finish_pending_move_unlinks(dest_dir: Path | str, plan=(), *,
     return removed
 
 
+def saved_run_owns_plan_row(item, owned: set[str]) -> bool:
+    """True when running ``item`` would re-journal a saved run's file.
+
+    ``execute_plan`` journals a destination that already matches and does
+    not copy it again. That done row is undoable, so Undo deletes the
+    file. A saved run already recorded this path: the file belongs to
+    that log. A missing source with the file still there is the same
+    case after a move. A missing destination, or different bytes while
+    the source is still on disk, is not owned for this check. Discard
+    still has to write that file.
+    """
+    dest = getattr(item, "destination", None)
+    if not dest or not owned:
+        return False
+    dest = Path(dest)
+    if path_identity(dest) not in owned or not dest.is_file():
+        return False
+    source = Path(item.source)
+    if files_identical(source, dest):
+        return True
+    return not source.exists()
+
+
 def _seed_log_from_journal(log: RunLog, dest_dir: Path | str) -> None:
     """Append the open journal's done files to ``log`` before the plan runs.
 
@@ -372,7 +395,10 @@ def execute_plan(
             try:
                 # Published already, and still this source: do not copy a
                 # second file to name_1. A different occupant falls through
-                # to the collision suffix.
+                # to the collision suffix. The match is journaled below so
+                # Undo can remove it. Discard must not pass a row a saved
+                # run already owns: this branch would put that file in the
+                # new log, and Undo would delete it.
                 reused = files_identical(item.source, item.destination)
                 if reused:
                     final = item.destination

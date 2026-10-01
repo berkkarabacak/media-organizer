@@ -29,13 +29,14 @@ from ..core.display import (elide_middle, finished_run_keeps_plan,
                             sorted_plan_items)
 from ..core.eta import ThroughputEstimator, format_eta, format_rate
 from ..core.executor import (bytes_still_needed, execute_plan,
-                            free_space_status)
+                            free_space_status, saved_run_owns_plan_row)
 from ..core.journal import (completed_sources, discard_journal,
                             exclude_completed_sources,
                             find_unfinished_journal)
 from ..core.metadata import Confidence, DateSource
 from ..core.organizer import STRATEGIES, OrganizeOptions, destination_blocks_scan
-from ..core.plan import (UNDO_LIMITATION, list_run_logs, undo_log,
+from ..core.plan import (UNDO_LIMITATION, list_run_logs,
+                         saved_run_destinations, undo_log,
                          undo_result_message)
 from ..core.strategies import DEFAULT_STRATEGY_KEY
 from . import icons, theme
@@ -1272,6 +1273,7 @@ class MainWindow(QMainWindow):
         # A blocked check leaves the journal in place so the same choice
         # can be made again.
         discard_after_preflight = False
+        done_before: set[str] = set()
         if not options.dry_run:
             journal = find_unfinished_journal(options.dest_dir)
             if journal is not None:
@@ -1333,7 +1335,37 @@ class MainWindow(QMainWindow):
                 if answer != QMessageBox.Yes:
                     return
             if discard_after_preflight:
+                # Seed and save before the journal is dropped. execute_plan([])
+                # reads the open journal, writes the operation log, completes
+                # that journal, and for a move unlinks a source whose
+                # destination still matches. An empty journal has nothing to
+                # seed; calling it would publish an empty undo log. Discard
+                # then deletes the journal so the restart is a new run.
+                # Rows a saved log already owns are left out of that run.
+                # A match is journaled as done without a new copy, so Undo
+                # of the new log would delete a file the seeded log still
+                # owns. A source that is already gone is the same case after
+                # a move. A missing destination stays in the plan so Discard
+                # can write it.
+                if done_before:
+                    execute_plan([], options)
                 discard_journal(options.dest_dir)
+                owned = saved_run_destinations(options.dest_dir)
+                if owned:
+                    active = [item for item in active
+                              if not saved_run_owns_plan_row(item, owned)]
+                    self.plan = [item for item in self.plan
+                                 if not saved_run_owns_plan_row(item, owned)]
+                if not active:
+                    self._disarm_finished_plan()
+                    self.status_label.setText(
+                        "Everything was already organized — nothing new "
+                        "to write.")
+                    QMessageBox.information(
+                        self, APP_NAME,
+                        "Those files are already in the destination.\n\n"
+                        "File → Undo can still undo the interrupted run.")
+                    return
 
         self._set_busy(True, "Organizing…")
         # File → Undo stays available during a scan (that worker does not

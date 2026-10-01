@@ -28,7 +28,9 @@ from media_organizer.core.journal import (
 )
 from media_organizer.core.metadata import CaptureDate, Confidence, DateSource
 from media_organizer.core.organizer import OrganizeOptions, PlannedFile, build_plan
-from media_organizer.core.plan import list_run_logs, load_log, undo_log
+from media_organizer.core.plan import (
+    list_run_logs, load_log, load_undoable_log, undo_log,
+)
 from tests.helpers import make_jpeg_with_exif
 
 
@@ -118,6 +120,11 @@ def _install_space(monkeypatch, free):
 
 def _texts(events, kind):
     return [text for name, text in events if name == kind]
+
+
+def _done_ids(log):
+    return {path_identity(op.source)
+            for op in log.operations if op.status == "done"}
 
 
 def _wait(window, qapp):
@@ -712,3 +719,236 @@ class TestResumePreflight:
         assert [item.run_id for item in logs] == [seeded_id]
         assert all(not item.undone for item in logs)
         assert not list(dst.rglob("*_1*"))
+
+    def test_discard_keeps_undo_of_matching_copies_out_of_the_new_log(
+            self, qapp, window, tmp_path, monkeypatch):
+        """Discard must not make Undo delete copies the interrupted run finished.
+
+        A matching destination used to be journaled again as a done op in
+        the restart's log. Undo of that log deleted it. A journaled file
+        whose destination is missing is still written, and Undo of the
+        restart removes that new copy only. The seeded log from the open
+        journal still reverses the copy that was already there.
+        """
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        kept = make_jpeg_with_exif(
+            src / "kept.jpg", datetime(2024, 7, 15, 10, 0, 0))
+        gone = make_jpeg_with_exif(
+            src / "gone.jpg", datetime(2024, 7, 15, 10, 1, 0))
+        fresh = make_jpeg_with_exif(
+            src / "new.jpg", datetime(2024, 7, 15, 10, 2, 0))
+        kept_payload = kept.read_bytes()
+        gone_payload = gone.read_bytes()
+        fresh_payload = fresh.read_bytes()
+        plan = build_plan(OrganizeOptions(source_dir=src, dest_dir=dst))
+        by_source = {item.source: item for item in plan}
+        kept_final = by_source[kept].destination
+        gone_final = by_source[gone].destination
+        fresh_final = by_source[fresh].destination
+        kept_final.parent.mkdir(parents=True, exist_ok=True)
+        atomic_copy(kept, kept_final)
+        with JournalWriter(dst) as writer:
+            writer.record("copy", str(kept), str(kept_final))
+            writer.record("copy", str(gone), str(gone_final))
+        assert not gone_final.exists()
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
+        _install_space(monkeypatch, free=1_000_000)
+        _arm(window, src, dst, plan)
+        window.organize_btn.setEnabled(True)
+        window.start_organize()
+        _wait(window, qapp)
+
+        assert _texts(events, "critical") == []
+        assert _texts(events, "information") == []
+        assert "Resume" in _texts(events, "question")[0]
+        assert kept_final.read_bytes() == kept_payload
+        assert kept.read_bytes() == kept_payload
+        assert gone_final.read_bytes() == gone_payload
+        assert fresh_final.read_bytes() == fresh_payload
+        assert not list(dst.rglob("*_1*"))
+        assert find_unfinished_journal(dst) is None
+        logs = list_run_logs(dst)
+        assert len(logs) == 2
+        newest, seeded = logs
+        assert _done_ids(newest) == {
+            path_identity(gone), path_identity(fresh)}
+        assert _done_ids(seeded) == {
+            path_identity(kept), path_identity(gone)}
+        assert {op.action for op in newest.operations} == {"copy"}
+        assert {op.action for op in seeded.operations} == {"copy"}
+        assert all(op.size >= 0 and op.sha256
+                   for op in seeded.operations
+                   if path_identity(op.source) == path_identity(kept))
+
+        result = undo_log(newest, dst)
+        assert result["undone"] == 2
+        assert result["failed"] == 0
+        assert kept_final.read_bytes() == kept_payload
+        assert kept.read_bytes() == kept_payload
+        assert not gone_final.exists()
+        assert not fresh_final.exists()
+        assert gone.read_bytes() == gone_payload
+        assert fresh.read_bytes() == fresh_payload
+
+        older = load_undoable_log(dst)
+        assert older is not None and older.run_id == seeded.run_id
+        result = undo_log(older, dst)
+        assert result["undone"] == 1
+        assert result["failed"] == 0
+        assert not kept_final.exists()
+        assert kept.read_bytes() == kept_payload
+        assert gone.is_file() and fresh.is_file()
+
+    def test_discard_move_keeps_undo_of_matching_destination(
+            self, qapp, window, tmp_path, monkeypatch):
+        """A matching Move stays in the seeded log, not the restart's log.
+
+        The source is still on disk, as in a cross-volume move journaled
+        before the unlink. Discard finishes that unlink while saving Undo,
+        then moves only the file the journal had not finished.
+        """
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        kept = make_jpeg_with_exif(
+            src / "kept.jpg", datetime(2024, 7, 15, 10, 0, 0))
+        fresh = make_jpeg_with_exif(
+            src / "new.jpg", datetime(2024, 7, 15, 10, 2, 0))
+        kept_payload = kept.read_bytes()
+        fresh_payload = fresh.read_bytes()
+        plan = build_plan(OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=False))
+        by_source = {item.source: item for item in plan}
+        kept_final = by_source[kept].destination
+        fresh_final = by_source[fresh].destination
+        kept_final.parent.mkdir(parents=True, exist_ok=True)
+        atomic_copy(kept, kept_final)
+        with JournalWriter(dst) as writer:
+            writer.record("move", str(kept), str(kept_final))
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
+        _install_space(monkeypatch, free=1_000_000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.organize_btn.setEnabled(True)
+        window.start_organize()
+        _wait(window, qapp)
+
+        assert events[0][1].startswith("Move mode removes")
+        assert "Resume" in events[1][1]
+        assert _texts(events, "critical") == []
+        assert _texts(events, "information") == []
+        assert not kept.exists()
+        assert kept_final.read_bytes() == kept_payload
+        assert not fresh.exists()
+        assert fresh_final.read_bytes() == fresh_payload
+        assert not list(dst.rglob("*_1*"))
+        assert find_unfinished_journal(dst) is None
+        logs = list_run_logs(dst)
+        assert len(logs) == 2
+        newest, seeded = logs
+        assert _done_ids(newest) == {path_identity(fresh)}
+        assert _done_ids(seeded) == {path_identity(kept)}
+        assert newest.operations[0].action == "move"
+        assert seeded.operations[0].action == "move"
+        assert seeded.operations[0].size >= 0
+        assert seeded.operations[0].sha256
+
+        result = undo_log(newest, dst)
+        assert result["undone"] == 1
+        assert result["failed"] == 0
+        assert fresh.read_bytes() == fresh_payload
+        assert not fresh_final.exists()
+        assert not kept.exists()
+        assert kept_final.read_bytes() == kept_payload
+
+        older = load_undoable_log(dst)
+        assert older is not None and older.run_id == seeded.run_id
+        result = undo_log(older, dst)
+        assert result["undone"] == 1
+        assert result["failed"] == 0
+        assert kept.read_bytes() == kept_payload
+        assert not kept_final.exists()
+
+    @pytest.mark.parametrize("copy_mode", [True, False])
+    def test_discard_of_settled_files_disarms_and_undo_restores(
+            self, qapp, window, tmp_path, monkeypatch, copy_mode):
+        """Every journaled file already matches. Discard must not re-log it.
+
+        Organize is turned off, the same way an empty Resume disarms.
+        A second Organize must not start a worker or write another log.
+        File → Undo still reverses the interrupted run.
+        """
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        photo = make_jpeg_with_exif(
+            src / "kept.jpg", datetime(2024, 7, 15, 10, 0, 0))
+        payload = photo.read_bytes()
+        plan = build_plan(OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=copy_mode))
+        assert len(plan) == 1
+        final = plan[0].destination
+        final.parent.mkdir(parents=True, exist_ok=True)
+        atomic_copy(photo, final)
+        action = "copy" if copy_mode else "move"
+        with JournalWriter(dst) as writer:
+            writer.record(action, str(photo), str(final))
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
+        _install_space(monkeypatch, free=1_000_000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(copy_mode)
+        window.move_radio.setChecked(not copy_mode)
+        window._refresh_table()
+        window.organize_btn.setEnabled(True)
+        window.start_organize()
+
+        assert window.org_worker is None
+        assert window.plan == []
+        assert window._active_plan() == []
+        assert window.organize_btn.isEnabled() is False
+        assert "already organized" in window.status_label.text()
+        assert "nothing new" in window.status_label.text()
+        note = _texts(events, "information")[0]
+        assert "already in the destination" in note
+        assert "Undo" in note
+        assert "interrupted run" in note
+        assert find_unfinished_journal(dst) is None
+        assert final.read_bytes() == payload
+        if copy_mode:
+            assert photo.read_bytes() == payload
+        else:
+            assert not photo.exists()
+        seeded = load_log(dst)
+        assert seeded is not None and seeded.undone is False
+        done_ops = [op for op in seeded.operations if op.status == "done"]
+        assert [path_identity(op.source) for op in done_ops] == [
+            path_identity(photo)]
+        assert done_ops[0].action == action
+        assert done_ops[0].size >= 0 and done_ops[0].sha256
+        seeded_id = seeded.run_id
+
+        events.clear()
+        window.start_organize()
+
+        assert window.org_worker is None
+        assert window.plan == []
+        assert window.organize_btn.isEnabled() is False
+        assert _texts(events, "information") == []
+        assert _texts(events, "question") == []
+        assert final.read_bytes() == payload
+        logs = list_run_logs(dst)
+        assert [item.run_id for item in logs] == [seeded_id]
+        assert not list(dst.rglob("*_1*"))
+
+        result = undo_log(seeded, dst)
+        assert result["undone"] == 1
+        assert result["failed"] == 0
+        assert photo.read_bytes() == payload
+        assert not final.exists()
+        assert find_unfinished_journal(dst) is None
