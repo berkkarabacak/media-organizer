@@ -152,6 +152,29 @@ def path_identity(path: str | os.PathLike, *, windows: bool | None = None) -> st
     return os.path.normpath(os.path.abspath(text))
 
 
+def completed_operations(journal_path: Path | str) -> list[dict]:
+    """Done operations of the open run, in journal order.
+
+    Each item has the ``action``, ``source``, and ``destination`` stored
+    in the journal. A run that already wrote ``{"run": "complete"}``
+    contributes nothing: those files belong to a finished organize.
+    Resume seeds the operation log from this list so undo still covers
+    files that were journaled before ``save_log`` ran.
+    """
+    entries, _finished = _open_run(Path(journal_path))
+    ops: list[dict] = []
+    for entry in entries:
+        source = entry.get("source")
+        if entry.get("status") != "done" or not source:
+            continue
+        ops.append({
+            "action": entry.get("action") or "",
+            "source": source,
+            "destination": entry.get("destination") or "",
+        })
+    return ops
+
+
 def completed_sources(journal_path: Path | str) -> set[str]:
     """Sources fully written in the interrupted run (safe to skip on resume).
 
@@ -162,9 +185,7 @@ def completed_sources(journal_path: Path | str) -> set[str]:
     ``{"run": "complete"}`` are not included. Those files belong to a
     finished organize, not this resume.
     """
-    entries, _finished = _open_run(Path(journal_path))
-    return {e["source"] for e in entries
-            if e.get("status") == "done" and e.get("source")}
+    return {op["source"] for op in completed_operations(journal_path)}
 
 
 def completed_destinations(journal_path: Path | str) -> set[str]:

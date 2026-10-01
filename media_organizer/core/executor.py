@@ -14,6 +14,11 @@ Safety features:
   already holds the source. A same-volume move is a rename and is not
   counted. A copy, a cross-volume move, and a move whose device cannot
   be read still count in full.
+- operation log: saved on success, on cancel, and when an unexpected
+  exception aborts the loop after at least one operation was recorded.
+  Resume seeds that log from the unfinished journal first, so undo
+  covers files journaled before a crash that never reached save_log.
+  The log is fsynced before its name is published.
 """
 
 from __future__ import annotations
@@ -25,7 +30,9 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .journal import (JournalWriter, atomic_copy, atomic_move,
-                       cleanup_stale_parts, file_sha256, files_identical)
+                       cleanup_stale_parts, completed_operations,
+                       file_sha256, files_identical,
+                       find_unfinished_journal)
 from .metadata import DateSource
 from .organizer import OrganizeOptions, PlannedFile
 from .plan import Operation, RunLog, new_log, save_log
@@ -174,6 +181,42 @@ def free_space_status(dest_dir: Path | str, needed_bytes: int) -> dict:
     }
 
 
+def _seed_log_from_journal(log: RunLog, dest_dir: Path | str) -> None:
+    """Append the open journal's done files to ``log`` before the plan runs.
+
+    A crash journals each finished file and can die before ``save_log``.
+    Resume skips those sources, so a new empty log would omit them and
+    undo would leave them where the crashed run put them. Size and sha256
+    are filled when the destination is still a readable file, which is
+    what move-undo checks. A missing or unreadable file is still recorded
+    (``size=-1``, empty sha256) so copy and move undo can try to restore it.
+    """
+    journal = find_unfinished_journal(dest_dir)
+    if journal is None:
+        return
+    for entry in completed_operations(journal):
+        destination = entry["destination"]
+        size = -1
+        digest = ""
+        if destination:
+            path = Path(destination)
+            try:
+                if path.is_file():
+                    size = path.stat().st_size
+                    digest = file_sha256(path)
+            except OSError:
+                size = -1
+                digest = ""
+        log.operations.append(Operation(
+            action=entry["action"],
+            source=entry["source"],
+            destination=destination,
+            status="done",
+            size=size,
+            sha256=digest,
+        ))
+
+
 def execute_plan(
     plan: list[PlannedFile],
     options: OrganizeOptions,
@@ -205,6 +248,11 @@ def execute_plan(
         # journal line. Promoting it would publish junk, then resume would
         # write a collision copy and a move could unlink the source.
         cleanup_stale_parts(options.dest_dir)
+        # Read the open run before JournalWriter opens it. A finished
+        # journal is truncated on open; an unfinished one is appended to.
+        # Seeding first is how undo covers files journaled before a crash
+        # that never reached save_log. Dry runs write no log and skip this.
+        _seed_log_from_journal(log, options.dest_dir)
         # Replaces a finished journal. Continues one that is still open, which
         # is how resume keeps the files already organized in this run.
         journal = JournalWriter(options.dest_dir)
@@ -216,7 +264,12 @@ def execute_plan(
     # finally with cancelled still false and write {"run": "complete"}, so
     # the next launch treated the crash as finished and could replace the
     # journal. close() always runs, including when complete() is skipped.
+    # That failure also used to skip save_log. The journal could resume,
+    # but undo had no record of the files already written. save_log runs
+    # for it when the log has any operation (including ones seeded from
+    # the open journal). The journal stays unfinished.
     finished_normally = False
+    aborted: Optional[Exception] = None
     try:
         for i, item in enumerate(plan):
             if cancel and cancel():
@@ -299,16 +352,24 @@ def execute_plan(
         else:
             # No break (cancel) and no exception escaped the loop.
             finished_normally = True
+    except Exception as exc:
+        aborted = exc
     finally:
         if journal is not None:
             try:
-                if finished_normally and not summary["cancelled"]:
+                if (finished_normally and aborted is None
+                        and not summary["cancelled"]):
                     journal.complete()
             finally:
                 journal.close()
 
-    if not dry_run:
+    # Cancel and a normal finish always persist the log. An unexpected
+    # exception persists it only once something was recorded, then the
+    # original error propagates. A dry run never writes a log.
+    if not dry_run and (aborted is None or log.operations):
         save_log(log, options.dest_dir)
+    if aborted is not None:
+        raise aborted
     if progress:
         progress(total, total, "", total_bytes, total_bytes)
     return log, summary

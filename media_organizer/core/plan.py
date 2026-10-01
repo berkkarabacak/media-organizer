@@ -107,10 +107,19 @@ def _read_log(path: Path) -> Optional[RunLog]:
 
 
 def _write_log(log: RunLog, path: Path) -> None:
-    """Write `log` by replacing `path`. A failed write leaves the old file."""
+    """Write `log` by replacing `path`. A failed write leaves the old file.
+
+    The temp file is flushed and fsynced before ``os.replace``, same as a
+    journal line. A power cut then cannot publish a torn undo log. The
+    parent directory is not fsynced: opening a directory raises
+    ``PermissionError`` on Windows.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(log.to_dict(), indent=2), encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(log.to_dict(), indent=2))
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
 
 

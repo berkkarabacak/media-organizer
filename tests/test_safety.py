@@ -24,7 +24,10 @@ from media_organizer.core.metadata import (
     extract_capture_date, extract_gps,
 )
 from media_organizer.core.organizer import OrganizeOptions, PlannedFile, build_plan
-from media_organizer.core.plan import Operation, list_run_logs, new_log, undo_log
+from media_organizer.core.plan import (
+    Operation, list_run_logs, load_undoable_log, log_path_for, new_log,
+    save_log, undo_log,
+)
 from tests.helpers import make_jpeg_with_exif, make_jpeg_with_gps
 
 
@@ -1030,6 +1033,203 @@ class TestJournal:
         assert done <= completed_sources(jp)
         assert "still-open" in completed_sources(jp)
 
+    def test_exception_then_resume_undo_covers_precrash_files(
+            self, tmp_path, monkeypatch):
+        """Crash, resume the rest, then undo removes both sets of copies.
+
+        The journal line is durable, but a non-cancel failure used to skip
+        ``save_log``. Resume started an empty log, and undo of that run left
+        the pre-crash copies in the destination.
+        """
+        src, dst = _setup(tmp_path, n=3)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        plan = _plan(src, dst)
+        real_copy = atomic_copy
+        calls = {"n": 0}
+
+        def fail_after_one(source, final):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise RuntimeError("injected mid-organize failure")
+            return real_copy(source, final)
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor.atomic_copy", fail_after_one)
+
+        with pytest.raises(RuntimeError, match="injected mid-organize failure"):
+            execute_plan(plan, options)
+
+        jp = find_unfinished_journal(dst)
+        assert jp is not None
+        assert '"run": "complete"' not in jp.read_text(encoding="utf-8")
+        crashed = completed_sources(jp)
+        assert len(crashed) == 1
+        crashed_id = path_identity(next(iter(crashed)))
+
+        partial = load_undoable_log(dst)
+        assert partial is not None
+        assert {path_identity(op.source) for op in partial.operations
+                if op.status == "done"} == {crashed_id}
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor.atomic_copy", real_copy)
+        remaining = exclude_completed_sources(plan, crashed)
+        assert len(remaining) == 2
+        assert crashed_id not in {
+            path_identity(item.source) for item in remaining}
+
+        log, summary = execute_plan(remaining, options)
+        assert summary["copied"] == 2
+        assert summary["errors"] == 0
+        assert summary["cancelled"] is False
+        assert find_unfinished_journal(dst) is None
+
+        newest = load_undoable_log(dst)
+        assert newest is not None
+        assert newest.run_id == log.run_id
+        done_ids = {path_identity(op.source) for op in newest.operations
+                    if op.status == "done"}
+        assert done_ids == {path_identity(item.source) for item in plan}
+        pre = next(op for op in newest.operations
+                   if path_identity(op.source) == crashed_id)
+        pre_dest = Path(pre.destination)
+        assert pre_dest.is_file()
+        assert pre.size == pre_dest.stat().st_size
+        assert pre.sha256 == hashlib.sha256(pre_dest.read_bytes()).hexdigest()
+        assert len(list(dst.rglob("*.jpg"))) == 3
+
+        result = undo_log(newest, dst)
+        assert result["undone"] == 3
+        assert result["failed"] == 0
+        assert result["kept"] == 0
+        assert not list(dst.rglob("*.jpg"))
+        for item in plan:
+            assert item.source.is_file()
+            assert item.source.read_bytes()
+
+    def test_exception_before_any_file_writes_no_log(
+            self, tmp_path, monkeypatch):
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+
+        def fail_immediately(source, final):
+            raise RuntimeError("injected before any file")
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor.atomic_copy", fail_immediately)
+        with pytest.raises(RuntimeError, match="injected before any file"):
+            execute_plan(_plan(src, dst), options)
+
+        assert load_undoable_log(dst) is None
+        assert not log_path_for(dst).exists()
+        jp = find_unfinished_journal(dst)
+        assert jp is not None
+        assert completed_sources(jp) == set()
+        assert '"run": "complete"' not in jp.read_text(encoding="utf-8")
+
+    def test_resume_seeds_missing_destination_with_defaults(self, tmp_path):
+        """A journaled file that is gone is still an undo row."""
+        src, dst = _setup(tmp_path, n=1)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        plan = _plan(src, dst)
+        missing_source = str(tmp_path / "never-copied.jpg")
+        missing_dest = str(dst / "missing.jpg")
+        with JournalWriter(dst) as writer:
+            writer.record("move", missing_source, missing_dest)
+
+        log, summary = execute_plan(plan, options)
+
+        assert summary["copied"] == 1
+        assert find_unfinished_journal(dst) is None
+        seeded, copied = log.operations
+        assert seeded.action == "move"
+        assert seeded.source == missing_source
+        assert seeded.destination == missing_dest
+        assert seeded.status == "done"
+        assert seeded.size == -1
+        assert seeded.sha256 == ""
+        assert copied.status == "done"
+        assert path_identity(copied.source) == path_identity(plan[0].source)
+        assert copied.size == plan[0].destination.stat().st_size
+        assert copied.sha256 == hashlib.sha256(
+            plan[0].destination.read_bytes()).hexdigest()
+
+    def test_write_log_fsyncs_temp_before_replace(self, tmp_path, monkeypatch):
+        """The undo log is fsynced while it is still a temp name.
+
+        Mirrors the part-file check: flush, then fsync of that fd, then
+        ``os.replace``. No directory fsync.
+        """
+        log = new_log(tmp_path)
+        log.operations.append(Operation(
+            action="copy", source=str(tmp_path / "a.jpg"),
+            destination=str(tmp_path / "b.jpg"), status="done",
+            size=4, sha256="abc"))
+        path = log_path_for(tmp_path)
+        tmp = path.with_name(path.name + ".tmp")
+        order = []
+        real_open = open
+        real_fsync = os.fsync
+        real_replace = os.replace
+
+        class _Tmp:
+            def __init__(self, raw):
+                self._raw = raw
+
+            def __getattr__(self, name):
+                return getattr(self._raw, name)
+
+            def __enter__(self):
+                self._raw.__enter__()
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return self._raw.__exit__(exc_type, exc, tb)
+
+            def flush(self):
+                order.append(("flush", self._raw.fileno()))
+                return self._raw.flush()
+
+        def spy_open(file, mode="r", *args, **kwargs):
+            fh = real_open(file, mode, *args, **kwargs)
+            if Path(file) == tmp:
+                order.append(("open", fh.fileno()))
+                return _Tmp(fh)
+            return fh
+
+        def spy_fsync(fd):
+            order.append(("fsync", fd))
+            assert tmp.exists() and not path.exists()
+            return real_fsync(fd)
+
+        def spy_replace(src_path, dst_path):
+            order.append(("replace", Path(src_path), Path(dst_path)))
+            return real_replace(src_path, dst_path)
+
+        monkeypatch.setattr(
+            "media_organizer.core.plan.open", spy_open, raising=False)
+        monkeypatch.setattr(
+            "media_organizer.core.plan.os.fsync", spy_fsync)
+        monkeypatch.setattr(
+            "media_organizer.core.plan.os.replace", spy_replace)
+
+        saved = save_log(log, tmp_path)
+
+        assert saved == path
+        assert path.is_file()
+        assert not tmp.exists()
+        assert json.loads(path.read_text(encoding="utf-8"))["run_id"] == log.run_id
+        kinds = [kind for kind, *_rest in order]
+        flush_i = kinds.index("flush")
+        fsync_i = kinds.index("fsync")
+        replace_i = kinds.index("replace")
+        assert flush_i < fsync_i < replace_i
+        tmp_fd = order[kinds.index("open")][1]
+        assert order[flush_i][1] == tmp_fd
+        assert order[fsync_i][1] == tmp_fd
+        assert kinds.count("fsync") == 1
+        assert order[replace_i][1:] == (tmp, path)
+
     def test_successful_run_writes_complete_and_is_not_unfinished(self, tmp_path):
         src, dst = _setup(tmp_path, n=2)
         execute_plan(_plan(src, dst),
@@ -1362,8 +1562,11 @@ def _assert_full_file_at_natural_name(
     assert [p.name for p in dst.rglob("*.jpg")] == ["IMG_0.jpg"]
     assert user_part.read_bytes() == b"keep-me"
     action = "copy" if copy_mode else "move"
+    # An open journal may also seed earlier done rows. This file is logged once.
+    real = [op for op in log.operations
+            if path_identity(op.source) == path_identity(source)]
     assert [(op.action, op.source, op.destination, op.status)
-            for op in log.operations] == [
+            for op in real] == [
         (action, str(source), str(planned), "done")]
     if copy_mode:
         assert source.is_file()
@@ -1492,7 +1695,9 @@ class TestResumePublishedDestination:
         assert planned.read_bytes() == source.read_bytes()
         assert planned.stat().st_mtime == published
         assert source.exists()
-        done = [op for op in log.operations if op.status == "done"]
+        done = [op for op in log.operations
+                if op.status == "done"
+                and path_identity(op.source) == path_identity(source)]
         assert [(op.action, op.source, op.destination) for op in done] == [
             ("copy", str(source), str(planned))]
         text = journal_path_for(dst).read_text(encoding="utf-8")
@@ -1553,8 +1758,10 @@ class TestResumePublishedDestination:
         assert planned.read_bytes() == payload
         assert planned.stat().st_mtime == published
         assert not list(dst.rglob("IMG_0_1.jpg"))
+        real = [op for op in log.operations
+                if path_identity(op.source) == path_identity(source)]
         assert [(op.action, op.source, op.destination, op.status)
-                for op in log.operations] == [
+                for op in real] == [
             ("move", str(source), str(planned), "done")]
 
     def test_reused_destination_is_taken_for_a_later_row(self, tmp_path):
@@ -1599,8 +1806,11 @@ class TestResumePublishedDestination:
         assert summary["errors"] == 0
         assert natural.read_bytes() == bytes(mutated)
         assert plan[0].destination.read_bytes() == source.read_bytes()
-        assert log.operations[0].destination == str(plan[0].destination)
-        assert log.operations[0].status == "done"
+        logged = [op for op in log.operations
+                  if path_identity(op.source) == path_identity(source)]
+        assert len(logged) == 1
+        assert logged[0].destination == str(plan[0].destination)
+        assert logged[0].status == "done"
         assert source.exists()
 
     def test_saved_run_is_not_adopted_during_a_later_interrupt(self, tmp_path):
@@ -1626,7 +1836,10 @@ class TestResumePublishedDestination:
         assert summary["errors"] == 0
         assert natural.read_bytes() == original
         assert plan[0].destination.read_bytes() == source.read_bytes()
-        assert log.operations[0].destination == str(plan[0].destination)
+        logged = [op for op in log.operations
+                  if path_identity(op.source) == path_identity(source)]
+        assert len(logged) == 1
+        assert logged[0].destination == str(plan[0].destination)
 
     def test_happy_path_uses_natural_name_once(self, tmp_path):
         src, dst = _setup(tmp_path, n=1)
