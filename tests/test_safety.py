@@ -4,13 +4,15 @@ dry run, and parallel correctness (executor.py, journal.py, metadata batch)."""
 import hashlib
 import json
 import os
+import shutil
+import tempfile
 from datetime import datetime
 from pathlib import Path, PureWindowsPath
 
 import pytest
 
 from media_organizer.core.executor import (
-    bytes_still_needed, execute_plan, free_space_status,
+    _volume_id, bytes_still_needed, execute_plan, free_space_status,
 )
 from media_organizer.core.journal import (
     PART_SUFFIX, JournalWriter, atomic_copy, atomic_move, cleanup_stale_parts,
@@ -120,6 +122,10 @@ class TestBytesStillNeeded:
     Resume drops journaled sources before this sum. A row whose destination
     already matches the source is journaled only, so its size is not needed
     either. A different occupant still needs a full new copy.
+
+    Copy mode counts every remaining row. Move mode omits a row on the
+    same device as the destination: that transfer is a rename. A different
+    device, or a device that cannot be read, still counts.
     """
 
     def test_sums_rows_that_will_be_written(self, tmp_path):
@@ -256,6 +262,267 @@ class TestBytesStillNeeded:
             writer.record("copy", str(done.source), str(done.destination))
         assert bytes_still_needed(plan) == 128
         assert free_space_status(dst, bytes_still_needed(plan))["ok"]
+
+    def test_move_same_volume_does_not_need_the_rename_bytes(self, tmp_path):
+        """A nearly-full drive can still rename. Copy mode still counts."""
+        src = tmp_path / "src"
+        src.mkdir()
+        photo = src / "a.jpg"
+        photo.write_bytes(b"jpeg")
+        capture = _capture_date()
+        # Destination folder is not created yet. Its existing ancestor is
+        # the same device, which is where the move will mkdir.
+        dst = tmp_path / "missing" / "organized"
+        plan = [
+            PlannedFile(photo, dst / "2024" / "a.jpg", 10**15, capture, "image"),
+        ]
+        needed = bytes_still_needed(plan, copy_mode=False, dest_dir=dst)
+        assert needed == 0
+        assert free_space_status(dst, needed)["ok"]
+        assert not free_space_status(dst, needed)["tight"]
+        assert bytes_still_needed(plan) == 10**15
+        assert bytes_still_needed(plan, copy_mode=True, dest_dir=dst) == 10**15
+        assert not free_space_status(dst, bytes_still_needed(plan))["ok"]
+
+    def test_move_without_a_destination_root_still_counts(self, tmp_path):
+        """No dest device to compare against: overcount, do not undercount."""
+        src = tmp_path / "src"
+        src.mkdir()
+        photo = src / "a.jpg"
+        photo.write_bytes(b"jpeg")
+        plan = [
+            PlannedFile(photo, tmp_path / "out" / "a.jpg", 10**15,
+                        _capture_date(), "image"),
+        ]
+        assert bytes_still_needed(plan, copy_mode=False) == 10**15
+
+    def test_move_other_device_still_counts(self, tmp_path, monkeypatch):
+        """Cross-volume move copies before it unlinks, so the size counts."""
+        src = tmp_path / "src"
+        src.mkdir()
+        photo = src / "a.jpg"
+        photo.write_bytes(b"jpeg")
+        dst = tmp_path / "dst"
+        plan = [
+            PlannedFile(photo, dst / "a.jpg", 10**15, _capture_date(), "image"),
+        ]
+
+        def volume(path):
+            if Path(path) == photo:
+                return 11
+            return 22
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", volume)
+        needed = bytes_still_needed(plan, copy_mode=False, dest_dir=dst)
+        assert needed == 10**15
+        assert not free_space_status(dst, needed)["ok"]
+        # Copy mode is unchanged by the device split.
+        assert bytes_still_needed(plan, copy_mode=True, dest_dir=dst) == 10**15
+
+    def test_move_unknown_device_still_counts(self, tmp_path, monkeypatch):
+        """OSError or an unreadable anchor counts the size."""
+        src = tmp_path / "src"
+        src.mkdir()
+        photo = src / "a.jpg"
+        photo.write_bytes(b"jpeg")
+        dst = tmp_path / "dst"
+        plan = [
+            PlannedFile(photo, dst / "a.jpg", 8192, _capture_date(), "image"),
+        ]
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", lambda _path: None)
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 8192
+
+        def source_unknown(path):
+            if Path(path) == photo:
+                return None
+            return 5
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", source_unknown)
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 8192
+
+        def dest_unknown(path):
+            if Path(path) == dst:
+                return None
+            return 5
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", dest_unknown)
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 8192
+
+    def test_move_stat_failure_counts_instead_of_raising(self, tmp_path, monkeypatch):
+        """A real stat error is an unknown device, not a preflight crash."""
+        src = tmp_path / "src"
+        src.mkdir()
+        photo = src / "a.jpg"
+        photo.write_bytes(b"jpeg")
+        dst = tmp_path / "dst"
+        plan = [
+            PlannedFile(photo, dst / "a.jpg", 8192, _capture_date(), "image"),
+        ]
+
+        def boom(self, *args, **kwargs):
+            raise PermissionError("unreadable")
+
+        monkeypatch.setattr(Path, "stat", boom)
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 8192
+
+    def test_move_identical_destination_is_zero_on_another_device(
+            self, tmp_path, monkeypatch):
+        """Journal-only rows stay at 0 even when the devices differ."""
+        src = tmp_path / "src"
+        src.mkdir()
+        photo = src / "a.jpg"
+        photo.write_bytes(b"same-bytes")
+        dst = tmp_path / "dst"
+        dest = dst / "a.jpg"
+        dest.parent.mkdir()
+        dest.write_bytes(b"same-bytes")
+        assert files_identical(photo, dest)
+        plan = [
+            PlannedFile(photo, dest, 10**15, _capture_date(), "image"),
+        ]
+
+        def volume(path):
+            if Path(path) == photo:
+                return 11
+            return 22
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", volume)
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 0
+        assert bytes_still_needed(plan, copy_mode=True, dest_dir=dst) == 0
+
+    def test_move_mixes_rename_copy_and_journal_only(
+            self, tmp_path, monkeypatch):
+        """Only the cross-volume row that is not already identical counts."""
+        src = tmp_path / "src"
+        src.mkdir()
+        capture = _capture_date()
+        same = src / "same.jpg"
+        other = src / "other.jpg"
+        published = src / "published.jpg"
+        same.write_bytes(b"same")
+        other.write_bytes(b"other")
+        published.write_bytes(b"published")
+        dst = tmp_path / "dst"
+        published_dest = dst / "published.jpg"
+        published_dest.parent.mkdir()
+        published_dest.write_bytes(b"published")
+        plan = [
+            PlannedFile(same, dst / "same.jpg", 10**15, capture, "image"),
+            PlannedFile(other, dst / "other.jpg", 4096, capture, "image"),
+            PlannedFile(published, published_dest, 10**15, capture, "image"),
+            PlannedFile(src / "dup.jpg", None, 10**15, capture, "image",
+                        is_duplicate=True),
+        ]
+
+        def volume(path):
+            if Path(path) == other:
+                return 11
+            return 3
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", volume)
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 4096
+        assert bytes_still_needed(plan, copy_mode=True, dest_dir=dst) == (
+            10**15 + 4096)
+
+    def test_resume_move_drops_other_volume_and_keeps_rename_at_zero(
+            self, tmp_path, monkeypatch):
+        """Resume measures the post-exclude plan. Discard measures all of it."""
+        src = tmp_path / "src"
+        src.mkdir()
+        capture = _capture_date()
+        done = src / "done.jpg"
+        fresh = src / "fresh.jpg"
+        done.write_bytes(b"done")
+        fresh.write_bytes(b"fresh")
+        dst = tmp_path / "dst"
+        dst.mkdir()
+        plan = [
+            PlannedFile(done, dst / "done.jpg", 10**15, capture, "image"),
+            PlannedFile(fresh, dst / "fresh.jpg", 10**15, capture, "image"),
+        ]
+        with JournalWriter(dst) as writer:
+            writer.record("move", str(done), str(dst / "done.jpg"))
+        remaining = exclude_completed_sources(
+            plan, completed_sources(journal_path_for(dst)))
+
+        def volume(path):
+            if Path(path) == done:
+                return 11
+            return 3
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", volume)
+        assert bytes_still_needed(
+            remaining, copy_mode=False, dest_dir=dst) == 0
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 10**15
+        assert free_space_status(dst, 0)["ok"]
+        assert not free_space_status(dst, 10**15)["ok"]
+
+
+class TestVolumeId:
+    """Device identity for move preflight. Unknown counts as not-the-same."""
+
+    def test_existing_file_and_missing_parent(self, tmp_path):
+        photo = tmp_path / "a.jpg"
+        photo.write_bytes(b"x")
+        assert _volume_id(photo) == photo.stat().st_dev
+        missing = tmp_path / "no" / "such" / "dir"
+        assert _volume_id(missing) == tmp_path.stat().st_dev
+
+    def test_oserror_is_unknown(self, tmp_path, monkeypatch):
+        """Permission errors are not "missing". They must not escape."""
+        def boom(self, *args, **kwargs):
+            raise PermissionError("unreadable")
+
+        monkeypatch.setattr(Path, "stat", boom)
+        assert _volume_id(tmp_path / "a" / "b.jpg") is None
+
+    def test_windows_drive_letter_is_unknown_off_windows(self):
+        if os.name == "nt":
+            pytest.skip("drive-letter guard is for non-Windows")
+        assert _volume_id("Q:/photos/out") is None
+        assert _volume_id("Q:\\photos\\out") is None
+
+    def test_real_other_volume_counts_and_same_volume_does_not(self, tmp_path):
+        """``/dev/shm`` is a different device from the pytest temp dir on Linux."""
+        shm = Path("/dev/shm")
+        if not shm.is_dir() or shm.stat().st_dev == tmp_path.stat().st_dev:
+            pytest.skip("need a second local volume such as /dev/shm")
+        other = Path(tempfile.mkdtemp(prefix="mo-vol-", dir=shm))
+        try:
+            assert other.stat().st_dev != tmp_path.stat().st_dev
+            capture = _capture_date()
+            there = other / "clip.jpg"
+            there.write_bytes(b"clip")
+            here = tmp_path / "here.jpg"
+            here.write_bytes(b"here")
+            dst = tmp_path / "dst"
+            plan_there = [
+                PlannedFile(there, dst / "clip.jpg", 10**15, capture, "image"),
+            ]
+            plan_here = [
+                PlannedFile(here, other / "nested" / "here.jpg", 10**15,
+                            capture, "image"),
+            ]
+            assert bytes_still_needed(
+                plan_there, copy_mode=False, dest_dir=dst) == 10**15
+            assert bytes_still_needed(
+                plan_here, copy_mode=False, dest_dir=other / "nested") == 10**15
+            assert bytes_still_needed(
+                plan_here, copy_mode=False, dest_dir=tmp_path / "out") == 0
+            both_there = [
+                PlannedFile(there, other / "moved.jpg", 10**15, capture, "image"),
+            ]
+            assert bytes_still_needed(
+                both_there, copy_mode=False, dest_dir=other) == 0
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
 
 
 class TestAtomicCopy:

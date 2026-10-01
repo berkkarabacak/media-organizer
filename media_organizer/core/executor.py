@@ -11,7 +11,9 @@ Safety features:
   gets a collision suffix.
 - free-space preflight helper. The byte total is what this run will
   still write, not rows Resume will skip and not a destination that
-  already holds the source.
+  already holds the source. A same-volume move is a rename and is not
+  counted. A copy, a cross-volume move, and a move whose device cannot
+  be read still count in full.
 """
 
 from __future__ import annotations
@@ -69,21 +71,74 @@ def _same_file(src: Path, dest: Path) -> bool:
         return False
 
 
-def bytes_still_needed(plan) -> int:
+def _existing_ancestor(path: Path | str) -> Path | None:
+    """Closest existing path, climbing parents that are not created yet.
+
+    ``None`` when ``path`` is a Windows drive letter seen on another
+    system. That string is relative there, and climbing it would use the
+    current directory.
+    """
+    raw = os.fspath(path)
+    if os.name != "nt" and _WINDOWS_DRIVE.match(raw.replace("\\", "/")):
+        return None
+    p = Path(path)
+    while not p.exists() and p != p.parent:
+        p = p.parent
+    return p
+
+
+def _volume_id(path: Path | str) -> int | None:
+    """``st_dev`` of ``path``, or of the closest existing parent.
+
+    ``None`` when the device cannot be read. Move preflight then counts
+    the file: undercounting can start Organize and run out of space.
+    ``Path.exists`` re-raises errors other than "not found", so the climb
+    is inside the same guard.
+    """
+    try:
+        anchor = _existing_ancestor(path)
+        if anchor is None:
+            return None
+        return anchor.stat().st_dev
+    except OSError:
+        return None
+
+
+def bytes_still_needed(
+    plan,
+    *,
+    copy_mode: bool = True,
+    dest_dir: Path | str | None = None,
+) -> int:
     """Bytes ``execute_plan`` will still write for ``plan``.
 
     Duplicates and rows with no destination are omitted, same as the
     organize dialog's previous sum. A destination that already holds this
     source's bytes is omitted too: the executor journals that row and does
-    not copy or move new bytes onto the drive. Every other row counts in
-    full, including one whose final name is already a different file and
-    will be written beside it under a collision suffix.
+    not copy or move new bytes onto the drive.
+
+    Copy mode counts every other row in full, including one whose final
+    name is already a different file and will be written beside it under a
+    collision suffix.
+
+    Move mode (``copy_mode=False``) omits a row whose source is on the
+    same device as ``dest_dir``. ``atomic_move`` renames that file with
+    ``os.replace`` and does not need a second copy of those bytes. A
+    different device still needs the durable copy before the source is
+    unlinked, so that size counts. If either device cannot be read, or
+    ``dest_dir`` was not passed, the size counts too.
     """
     total = 0
+    dest_dev = None
+    if not copy_mode and dest_dir is not None:
+        dest_dev = _volume_id(dest_dir)
     for item in plan:
         if item.is_duplicate or not item.destination:
             continue
         if files_identical(item.source, item.destination):
+            continue
+        if (not copy_mode and dest_dev is not None
+                and _volume_id(item.source) == dest_dev):
             continue
         total += item.size
     return total
@@ -97,26 +152,24 @@ def free_space_status(dest_dir: Path | str, needed_bytes: int) -> dict:
     `unknown` means the disk could not be read. `ok` is then true so this
     check does not block the run, and `free` is -1.
     """
-    raw = os.fspath(dest_dir)
-    if os.name != "nt" and _WINDOWS_DRIVE.match(raw.replace("\\", "/")):
+    anchor = _existing_ancestor(dest_dir)
+    if anchor is None:
         # Do not climb into the current directory and report its free space.
+        raw = os.fspath(dest_dir)
         return _unknown_free_space(needed_bytes, raw[:2] + "\\")
-    p = Path(dest_dir)
-    while not p.exists() and p != p.parent:
-        p = p.parent
     try:
-        usage = shutil.disk_usage(p)
+        usage = shutil.disk_usage(anchor)
     except OSError:
         # drive missing/unreadable (e.g. unplugged): can't preflight — let the
         # executor's per-file error handling report it instead of crashing
-        return _unknown_free_space(needed_bytes, p.anchor or str(p))
+        return _unknown_free_space(needed_bytes, anchor.anchor or str(anchor))
     free = usage.free
     return {
         "free": free,
         "needed": needed_bytes,
         "ok": needed_bytes <= free,
         "tight": needed_bytes > free * (1 - TIGHT_MARGIN),
-        "drive": p.anchor or str(p),
+        "drive": anchor.anchor or str(anchor),
         "unknown": False,
     }
 

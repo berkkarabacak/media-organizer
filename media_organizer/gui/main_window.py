@@ -1263,8 +1263,11 @@ class MainWindow(QMainWindow):
 
         # Resume or Discard is chosen before free-space preflight, and dry
         # runs skip both: they write nothing. `needed` is the bytes the plan
-        # that will actually run still has to copy or move. A blocked check
-        # leaves the journal in place so the same choice can be made again.
+        # that will actually run still has to write. Copy mode counts each
+        # remaining file. Move mode omits a same-volume rename and still
+        # counts a cross-volume copy, or a row whose device cannot be read.
+        # A blocked check leaves the journal in place so the same choice
+        # can be made again.
         discard_after_preflight = False
         if not options.dry_run:
             journal = find_unfinished_journal(options.dest_dir)
@@ -1288,7 +1291,11 @@ class MainWindow(QMainWindow):
                 else:
                     discard_after_preflight = True
 
-            needed = bytes_still_needed(active)
+            needed = bytes_still_needed(
+                active,
+                copy_mode=options.copy_mode,
+                dest_dir=options.dest_dir,
+            )
             space = free_space_status(options.dest_dir, needed)
             if not space["ok"]:
                 QMessageBox.critical(

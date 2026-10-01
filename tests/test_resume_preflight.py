@@ -3,6 +3,8 @@
 Free space used to be summed before the crash-journal question, so files
 Resume will skip could block the run. A destination that already holds
 the source is journaled only and must not inflate ``needed`` either.
+Move mode omits a same-volume rename. Copy mode, and a move onto another
+device, still count those bytes.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from PySide6.QtCore import QSettings
@@ -65,7 +68,8 @@ def _arm(window, src, dst, plan):
     window.move_radio.setChecked(False)
 
 
-def _install_dialogs(monkeypatch, *, resume, tight=QMessageBox.No):
+def _install_dialogs(monkeypatch, *, resume, tight=QMessageBox.No,
+                     move=QMessageBox.Yes):
     events = []
 
     def question(*args, **kwargs):
@@ -73,6 +77,8 @@ def _install_dialogs(monkeypatch, *, resume, tight=QMessageBox.No):
         events.append(("question", text))
         if "Resume" in text:
             return resume
+        if "Move mode removes" in text:
+            return move
         return tight
 
     def critical(*args, **kwargs):
@@ -375,3 +381,195 @@ class TestResumePreflight:
         assert window.org_worker is not None
         assert not window.org_worker.isRunning()
         assert not (dst / "out.jpg").exists()
+
+    def test_move_same_volume_does_not_block_on_rename_bytes(
+            self, qapp, window, tmp_path, monkeypatch):
+        """Huge same-volume Move rows must not fail preflight."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        photo = src / "a.jpg"
+        photo.write_bytes(b"jpeg-bytes")
+        capture = _capture()
+        plan = [
+            PlannedFile(photo, dst / "2024" / "a.jpg", 10**15, capture, "image"),
+        ]
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
+        seen = _install_space(monkeypatch, free=1000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.start_organize()
+
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 0
+        assert seen == [0]
+        assert _texts(events, "critical") == []
+        blob = " ".join(text for _name, text in events)
+        assert "Move mode removes" in blob
+        assert "Not enough free space" not in blob
+        assert "nearly fill" not in blob
+        _wait(window, qapp)
+        moved = dst / "2024" / "a.jpg"
+        assert moved.is_file()
+        assert moved.read_bytes() == b"jpeg-bytes"
+        assert not photo.exists()
+
+    def test_move_other_volume_still_blocks_and_keeps_the_journal(
+            self, qapp, window, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        dst.mkdir()
+        capture = _capture()
+        done = src / "done.jpg"
+        fresh = src / "fresh.jpg"
+        done.write_bytes(b"done")
+        fresh.write_bytes(b"fresh")
+        plan = [
+            PlannedFile(done, dst / "done.jpg", 111, capture, "image"),
+            PlannedFile(fresh, dst / "fresh.jpg", 10**15, capture, "image"),
+        ]
+        with JournalWriter(dst) as writer:
+            writer.record("move", str(done), str(dst / "done.jpg"))
+
+        def volume(path):
+            if Path(path) == fresh:
+                return 11
+            return 3
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", volume)
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
+        seen = _install_space(monkeypatch, free=1_000_000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.start_organize()
+
+        assert events[0][1].startswith("Move mode removes")
+        assert events[1][0] == "question"
+        assert "Resume" in events[1][1]
+        assert seen == [10**15]
+        critical = _texts(events, "critical")
+        assert len(critical) == 1
+        assert "Not enough free space" in critical[0]
+        assert format_bytes(10**15) in critical[0]
+        assert window.org_worker is None
+        assert find_unfinished_journal(dst) is not None
+        assert done.is_file() and fresh.is_file()
+
+    def test_resume_move_same_volume_measures_only_the_remainder(
+            self, qapp, window, tmp_path, monkeypatch):
+        """A cross-volume completed row must not block a same-volume Resume."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        dst.mkdir()
+        capture = _capture()
+        done = src / "done.jpg"
+        fresh = src / "fresh.jpg"
+        done.write_bytes(b"done")
+        fresh.write_bytes(b"fresh")
+        plan = [
+            PlannedFile(done, dst / "done.jpg", 10**15, capture, "image"),
+            PlannedFile(fresh, dst / "2024" / "fresh.jpg", 10**15,
+                        capture, "image"),
+        ]
+        with JournalWriter(dst) as writer:
+            writer.record("move", str(done), str(dst / "done.jpg"))
+
+        def volume(path):
+            if Path(path) == done:
+                return 11
+            return 3
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", volume)
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
+        seen = _install_space(monkeypatch, free=1000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.start_organize()
+
+        assert events[0][1].startswith("Move mode removes")
+        assert "Resume" in events[1][1]
+        assert seen == [0]
+        assert _texts(events, "critical") == []
+        assert "nearly fill" not in " ".join(text for _name, text in events)
+        _wait(window, qapp)
+        moved = dst / "2024" / "fresh.jpg"
+        assert moved.is_file()
+        assert moved.read_bytes() == b"fresh"
+        assert not fresh.exists()
+        # The journaled source was not part of this resume.
+        assert done.is_file()
+
+    def test_discard_move_same_volume_drops_the_journal(
+            self, qapp, window, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        photo = src / "a.jpg"
+        photo.write_bytes(b"jpeg-bytes")
+        capture = _capture()
+        plan = [
+            PlannedFile(photo, dst / "a.jpg", 10**15, capture, "image"),
+        ]
+        with JournalWriter(dst) as writer:
+            writer.record("move", str(photo), str(dst / "a.jpg"))
+        assert not (dst / "a.jpg").exists()
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
+        seen = _install_space(monkeypatch, free=1000)
+        from media_organizer.gui import main_window as mw
+        discarded = []
+        real_discard = mw.discard_journal
+
+        def spy(dest):
+            discarded.append(dest)
+            assert seen == [0]
+            return real_discard(dest)
+
+        monkeypatch.setattr(mw, "discard_journal", spy)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.start_organize()
+
+        assert events[0][1].startswith("Move mode removes")
+        assert "Resume" in events[1][1]
+        assert seen == [0]
+        assert _texts(events, "critical") == []
+        assert discarded
+        _wait(window, qapp)
+        assert (dst / "a.jpg").is_file()
+        assert (dst / "a.jpg").read_bytes() == b"jpeg-bytes"
+        assert not photo.exists()
+        assert find_unfinished_journal(dst) is None
+
+    def test_dry_run_move_skips_free_space_and_the_move_question(
+            self, qapp, window, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        dst.mkdir()
+        capture = _capture()
+        photo = src / "a.jpg"
+        photo.write_bytes(b"jpeg-bytes")
+        plan = [
+            PlannedFile(photo, dst / "a.jpg", 10**15, capture, "image"),
+        ]
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
+        seen = _install_space(monkeypatch, free=1000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.dry_run_cb.setChecked(True)
+        window.start_organize()
+
+        assert seen == []
+        assert events == []
+        _wait(window, qapp)
+        assert photo.is_file()
+        assert not (dst / "a.jpg").exists()
