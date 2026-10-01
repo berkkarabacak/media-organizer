@@ -1,11 +1,17 @@
 # Google Drive incremental upload
 
-Slice 1 of [issue 2](https://github.com/berkkarabacak/media-organizer/issues/2).
+Design for [issue 2](https://github.com/berkkarabacak/media-organizer/issues/2).
 Later slices should follow this document.
 
-The code in this slice is `media_organizer.core.drive_sync`. It loads and
-saves a local sync record and decides whether a file is `skip` or `upload`.
-It does not sign in, call the Drive API, show a folder picker, or upload.
+Slice 1 is `media_organizer.core.drive_sync`. It loads and saves a local
+sync record and decides whether a file is `skip` or `upload`. It does not
+sign in, call the Drive API, or upload.
+
+Slice 2 is sign-in and the folder picker:
+`media_organizer.core.google_auth` (OAuth and the token file),
+`media_organizer.core.drive_folders` (folder list and binding), and
+`media_organizer.gui.drive_dialog` (Sign in, Sign out, Choose Drive folder).
+Slice 2 does not upload file bytes and does not create Drive files.
 
 ## Where Drive sits
 
@@ -39,8 +45,24 @@ Tokens stay on the machine.
 
 Use a Desktop OAuth client with PKCE, so the app does not need a client
 secret. Do not commit a client secret, a `client_secret.json`, a user token,
-or a credential file. Those filenames are listed in `.gitignore`. This slice
-does not add a client id. The sign-in slice adds one without adding a secret.
+or a credential file. Those filenames stay in `.gitignore`.
+
+The client id is public. `resolve_client_id` reads
+`MEDIA_ORGANIZER_GOOGLE_CLIENT_ID` first. If that is unset, it uses
+`BUNDLED_CLIENT_ID` in `google_auth.py`. The value shipped in the repository
+is the placeholder `REPLACE_WITH_YOUR_DESKTOP_CLIENT_ID`, which the app
+treats as not configured. Berk replaces that placeholder, or sets the
+environment variable, with the Desktop client id from his Google Cloud
+project (APIs & Services → Credentials → OAuth client ID → Desktop). Enable
+the Google Picker API on that project so Choose Drive folder can open
+Google's folder picker. There is no client secret to paste.
+
+Sign-in is implemented by `GoogleSession.sign_in`. The redirect is
+`http://127.0.0.1:<port>/`. Choosing a folder can open Google's desktop
+Picker on that same redirect (`trigger_onepick`, `allow_folder_selection`,
+folder mime type) via `GoogleSession.pick_drive_folder`. The in-app list is
+`list_drive_folders` (`files.list` for folders only). With `drive.file`,
+that list is only folders the app can already access. Neither call uploads.
 
 ## One Drive folder
 
@@ -52,8 +74,9 @@ library-relative path (`2024/Q3/07 July/IMG_1234.jpg`).
 stored file ids so the next pass uploads into the new folder. The files
 already in the previous folder stay there. Switching back has no memory of
 the old ids, so those files would upload again, still without deleting
-anything. The folder-picker slice should ask before replacing a folder that
-already has a record.
+anything. The folder picker asks before replacing a folder that already has
+a record. `commit_folder_choice` returns `declined` and leaves the record
+alone when the answer is no. `replaced` is `bind_folder` on a different id.
 
 ## Sync record
 
@@ -174,11 +197,22 @@ record.entry_for(local_path) -> SyncEntry | None
 record.mark_uploaded(local_path, size, content_hash, drive_file_id)
 ```
 
-Nothing in this module opens a socket.
+Nothing in `drive_sync` opens a socket. Sign-in and folder listing live in
+the slice 2 modules named above.
+
+```text
+resolve_client_id() -> str
+GoogleSession.sign_in() / sign_out() / signed_in_account()
+GoogleSession.list_folders() / pick_drive_folder()
+commit_folder_choice(record, folder_id, replace_confirmed=...)
+commit_listed_folder(record, folders, folder_id, replace_confirmed=...)
+```
 
 ## Later slices
 
+1. Local sync record (`skip` / `upload`, no network). Done: `drive_sync`.
 2. Sign in, and let the user pick one Drive folder. Still no upload.
+   Done: `google_auth`, `drive_folders`, and `gui/drive_dialog`.
 3. First upload of an organized library, with progress, cancel, and resume.
 4. Incremental pass: skip unchanged files, upload new and changed ones.
 5. Errors a non-technical user can read (quota, expired sign-in, offline).
@@ -190,5 +224,5 @@ Nothing in this module opens a socket.
 - Two-way sync.
 - Deleting local files after a successful upload.
 - Replacing the local organize step.
-- OAuth, the Drive API, a folder picker, and the upload itself (later slices).
+- The upload itself (later slices). Sign-in and the folder picker are slice 2.
 - A client secret, token, or credential file in the repository.
