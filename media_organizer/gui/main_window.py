@@ -474,6 +474,7 @@ class MainWindow(QMainWindow):
                               "Undo last run…", self)
         undo_action.triggered.connect(self.undo_last_run)
         file_menu.addAction(undo_action)
+        self.undo_action = undo_action
         file_menu.addSeparator()
         quit_action = QAction(icons.icon("x", theme.TEXT_DIM, 14), "E&xit", self)
         quit_action.triggered.connect(self.close)
@@ -1325,6 +1326,11 @@ class MainWindow(QMainWindow):
                 discard_journal(options.dest_dir)
 
         self._set_busy(True, "Organizing…")
+        # File → Undo stays available during a scan (that worker does not
+        # write). It must not run while this worker is copying, moving, or
+        # journaling the same destination. A queued click is also refused
+        # in undo_last_run / _undo_log.
+        self.undo_action.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self._throughput.reset()
         self._last_active_bytes = sum(p.size for p in active
@@ -1363,6 +1369,10 @@ class MainWindow(QMainWindow):
             f"Organizing {min(i + 1, total):,} of {total:,}{current}")
 
     def _on_run_finished(self, log, summary: dict):
+        # finished_run is emitted from run() before the thread leaves
+        # isRunning(). Join first so Done-dialog Undo is not treated as
+        # an in-flight organize.
+        self._join_organize_worker()
         QApplication.restoreOverrideCursor()
         self._set_busy(False)
         self._hide_progress_panel()
@@ -1408,6 +1418,8 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Cancelling…")
 
     def undo_last_run(self):
+        if self._refuse_undo_while_organizing():
+            return
         dst = Path(self.dest_card.edit.text().strip())
         if not dst.is_dir():
             QMessageBox.warning(
@@ -1428,6 +1440,8 @@ class MainWindow(QMainWindow):
         self._undo_log(log, dst)
 
     def _undo_log(self, log, dst):
+        if self._refuse_undo_while_organizing():
+            return
         if log.undone:
             QMessageBox.information(self, APP_NAME,
                                     "That run has already been undone.")
@@ -1446,15 +1460,51 @@ class MainWindow(QMainWindow):
 
     # -------------------------------------------------------------- helpers
 
+    def _organize_running(self) -> bool:
+        worker = self.org_worker
+        return worker is not None and bool(worker.isRunning())
+
+    def _refuse_undo_while_organizing(self) -> bool:
+        """True when Undo must leave files, the log, and the journal alone.
+
+        A running OrganizeWorker may still be writing a destination that
+        undo would delete or move back, and undo_log drops an unfinished
+        journal that lists a restored source. Returning here writes nothing.
+        """
+        if not self._organize_running():
+            return False
+        QMessageBox.information(
+            self, APP_NAME,
+            "Organize is still running. Cancel it or wait for it to finish, "
+            "then undo.")
+        return True
+
+    def _join_organize_worker(self) -> None:
+        """Wait out a worker that has already reported completion or failure.
+
+        The slot runs on the GUI thread. The worker only has to leave
+        run(), so this returns as soon as isRunning() flips. Undo is then
+        allowed again.
+        """
+        worker = self.org_worker
+        if worker is not None and worker.isRunning():
+            worker.wait(5000)
+
     def _set_busy(self, busy: bool, message: str = ""):
         self.organize_btn.setEnabled(not busy and bool(self._active_plan()))
         self.cancel_btn.setEnabled(busy)
         self.next_btn.setEnabled(not busy)
         self.back_btn.setEnabled(not busy)
+        # Organize disables Undo itself, before the worker is running.
+        # Clearing busy turns it back on once that worker has stopped.
+        # A scan never disables it.
+        if not busy:
+            self.undo_action.setEnabled(not self._organize_running())
         if message:
             self.status_label.setText(message)
 
     def _on_worker_failed(self, message: str):
+        self._join_organize_worker()
         QApplication.restoreOverrideCursor()
         self._set_busy(False)
         self._hide_progress_panel()
