@@ -9,11 +9,13 @@ from pathlib import Path, PureWindowsPath
 
 import pytest
 
-from media_organizer.core.executor import execute_plan, free_space_status
+from media_organizer.core.executor import (
+    bytes_still_needed, execute_plan, free_space_status,
+)
 from media_organizer.core.journal import (
     PART_SUFFIX, JournalWriter, atomic_copy, atomic_move, cleanup_stale_parts,
     completed_sources, discard_journal, exclude_completed_sources,
-    find_unfinished_journal, journal_path_for, path_identity,
+    files_identical, find_unfinished_journal, journal_path_for, path_identity,
 )
 from media_organizer.core.metadata import (
     CaptureDate, Confidence, DateSource, analyze_media_batch,
@@ -105,6 +107,155 @@ class TestFreeSpace:
             assert s["unknown"] is True
             assert s["free"] == -1
             assert s["tight"] is False
+
+
+def _capture_date():
+    return CaptureDate(datetime(2024, 7, 15, 10, 0, 0),
+                       DateSource.EXIF, Confidence.HIGH, "EXIF")
+
+
+class TestBytesStillNeeded:
+    """Free-space `needed` is the bytes execute_plan will still write.
+
+    Resume drops journaled sources before this sum. A row whose destination
+    already matches the source is journaled only, so its size is not needed
+    either. A different occupant still needs a full new copy.
+    """
+
+    def test_sums_rows_that_will_be_written(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        first = src / "a.jpg"
+        second = src / "b.jpg"
+        first.write_bytes(b"aaa")
+        second.write_bytes(b"bbbb")
+        capture = _capture_date()
+        plan = [
+            PlannedFile(first, tmp_path / "out" / "a.jpg", 30, capture, "image"),
+            PlannedFile(second, tmp_path / "out" / "b.jpg", 70, capture, "image"),
+            PlannedFile(src / "dup.jpg", None, 10**15, capture, "image",
+                        is_duplicate=True),
+            PlannedFile(src / "skip.jpg", None, 10**15, capture, "image"),
+        ]
+        assert bytes_still_needed(plan) == 100
+
+    def test_resume_drops_completed_bytes_that_would_not_fit(self, tmp_path):
+        src, dst = _setup(tmp_path, n=2)
+        plan = _plan(src, dst)
+        done, fresh = plan
+        done.size = 10**15
+        fresh.size = 4096
+        with JournalWriter(dst) as writer:
+            writer.record("copy", str(done.source), str(done.destination))
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        remaining = exclude_completed_sources(plan, completed_sources(journal))
+
+        full = bytes_still_needed(plan)
+        needed = bytes_still_needed(remaining)
+        assert full == 10**15 + 4096
+        assert needed == 4096
+        assert [item.source for item in remaining] == [fresh.source]
+        assert not free_space_status(dst, full)["ok"]
+        remaining_space = free_space_status(dst, needed)
+        assert remaining_space["ok"]
+        assert remaining_space["needed"] == 4096
+        assert not remaining_space["tight"]
+
+    def test_remaining_work_that_still_does_not_fit_is_the_real_total(
+            self, tmp_path):
+        src, dst = _setup(tmp_path, n=2)
+        plan = _plan(src, dst)
+        done, fresh = plan
+        done.size = 111
+        fresh.size = 10**14
+        with JournalWriter(dst) as writer:
+            writer.record("copy", str(done.source), str(done.destination))
+        remaining = exclude_completed_sources(
+            plan, completed_sources(journal_path_for(dst)))
+
+        needed = bytes_still_needed(remaining)
+        assert needed == 10**14
+        assert needed != bytes_still_needed(plan)
+        space = free_space_status(dst, needed)
+        assert space["ok"] is False
+        assert space["needed"] == 10**14
+        assert space["free"] >= 0
+
+    def test_published_identical_destination_does_not_inflate_needed(
+            self, tmp_path):
+        """Crash after publish, before the journal line: no new bytes."""
+        src, dst = _setup(tmp_path, n=2)
+        published, fresh = _plan(src, dst)
+        published.destination.parent.mkdir(parents=True)
+        atomic_copy(published.source, published.destination)
+        published.size = 10**15
+        fresh.size = 2048
+        _unfinished_without(dst, published.source)
+        # The published source is not a completed journal line, so Resume
+        # keeps the row. execute_plan journals it and does not copy it.
+        remaining = exclude_completed_sources(
+            [published, fresh], completed_sources(journal_path_for(dst)))
+        assert published.source in {item.source for item in remaining}
+        assert fresh.source in {item.source for item in remaining}
+
+        needed = bytes_still_needed(remaining)
+        assert needed == 2048
+        assert free_space_status(dst, needed)["ok"]
+        assert not free_space_status(dst, 10**15 + 2048)["ok"]
+
+    def test_different_bytes_at_destination_still_count(self, tmp_path):
+        """A same-size occupant is a collision copy, not a free resume."""
+        src, dst = _setup(tmp_path, n=1)
+        item = _plan(src, dst)[0]
+        item.destination.parent.mkdir(parents=True)
+        mutated = bytearray(item.source.read_bytes())
+        mutated[-1] ^= 0xFF
+        item.destination.write_bytes(bytes(mutated))
+        assert not files_identical(item.source, item.destination)
+        item.size = 10**15
+        _unfinished_without(dst, item.source)
+        remaining = exclude_completed_sources(
+            [item], completed_sources(journal_path_for(dst)))
+        assert remaining == [item]
+
+        needed = bytes_still_needed(remaining)
+        assert needed == 10**15
+        space = free_space_status(dst, needed)
+        assert space["ok"] is False
+        assert space["needed"] == 10**15
+
+    def test_discard_counts_sources_whose_bytes_are_not_on_disk(self, tmp_path):
+        """Discard runs the full plan. A missing copy must be counted again."""
+        src, dst = _setup(tmp_path, n=2)
+        plan = _plan(src, dst)
+        done, fresh = plan
+        done.size = 10**15
+        fresh.size = 512
+        with JournalWriter(dst) as writer:
+            writer.record("copy", str(done.source), str(done.destination))
+        assert not done.destination.exists()
+        # Resume would skip `done`. Discard copies it, because nothing is
+        # at the destination yet.
+        assert bytes_still_needed(
+            exclude_completed_sources(
+                plan, completed_sources(journal_path_for(dst)))) == 512
+        assert bytes_still_needed(plan) == 10**15 + 512
+        assert not free_space_status(dst, bytes_still_needed(plan))["ok"]
+
+    def test_discard_does_not_count_identical_bytes_already_at_dest(
+            self, tmp_path):
+        src, dst = _setup(tmp_path, n=2)
+        plan = _plan(src, dst)
+        done, fresh = plan
+        done.destination.parent.mkdir(parents=True)
+        atomic_copy(done.source, done.destination)
+        done.size = 10**15
+        fresh.size = 128
+        with JournalWriter(dst) as writer:
+            writer.record("copy", str(done.source), str(done.destination))
+        assert bytes_still_needed(plan) == 128
+        assert free_space_status(dst, bytes_still_needed(plan))["ok"]
 
 
 class TestAtomicCopy:

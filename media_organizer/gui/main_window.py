@@ -27,7 +27,7 @@ from ..core.display import (elide_middle, finished_run_lines, format_bytes,
                             relative_destination, relative_destination_fast,
                             sorted_plan_items)
 from ..core.eta import ThroughputEstimator, format_eta, format_rate
-from ..core.executor import free_space_status
+from ..core.executor import bytes_still_needed, free_space_status
 from ..core.journal import (completed_sources, discard_journal,
                             exclude_completed_sources,
                             find_unfinished_journal)
@@ -1261,30 +1261,12 @@ class MainWindow(QMainWindow):
         if options is None:
             return
 
-        # --- free-space preflight (skipped for dry runs) ---
+        # Resume or Discard is chosen before free-space preflight, and dry
+        # runs skip both: they write nothing. `needed` is the bytes the plan
+        # that will actually run still has to copy or move. A blocked check
+        # leaves the journal in place so the same choice can be made again.
+        discard_after_preflight = False
         if not options.dry_run:
-            needed = sum(p.size for p in active
-                         if not p.is_duplicate and p.destination)
-            space = free_space_status(options.dest_dir, needed)
-            if not space["ok"]:
-                QMessageBox.critical(
-                    self, APP_NAME,
-                    f"Not enough free space.\n\n"
-                    f"Need {format_bytes(space['needed'])}, but only "
-                    f"{format_bytes(space['free'])} free on {space['drive']}\n\n"
-                    f"Free up space or choose another destination.")
-                return
-            if space["tight"]:
-                answer = QMessageBox.question(
-                    self, APP_NAME,
-                    f"This will nearly fill {space['drive']} "
-                    f"({format_bytes(space['needed'])} needed, "
-                    f"{format_bytes(space['free'])} free).\nContinue anyway?",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-                if answer != QMessageBox.Yes:
-                    return
-
-        # --- crash-journal resume ---
             journal = find_unfinished_journal(options.dest_dir)
             if journal is not None:
                 done_before = completed_sources(journal)
@@ -1304,7 +1286,29 @@ class MainWindow(QMainWindow):
                         discard_journal(options.dest_dir)
                         return
                 else:
-                    discard_journal(options.dest_dir)
+                    discard_after_preflight = True
+
+            needed = bytes_still_needed(active)
+            space = free_space_status(options.dest_dir, needed)
+            if not space["ok"]:
+                QMessageBox.critical(
+                    self, APP_NAME,
+                    f"Not enough free space.\n\n"
+                    f"Need {format_bytes(space['needed'])}, but only "
+                    f"{format_bytes(space['free'])} free on {space['drive']}\n\n"
+                    f"Free up space or choose another destination.")
+                return
+            if space["tight"]:
+                answer = QMessageBox.question(
+                    self, APP_NAME,
+                    f"This will nearly fill {space['drive']} "
+                    f"({format_bytes(space['needed'])} needed, "
+                    f"{format_bytes(space['free'])} free).\nContinue anyway?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if answer != QMessageBox.Yes:
+                    return
+            if discard_after_preflight:
+                discard_journal(options.dest_dir)
 
         self._set_busy(True, "Organizing…")
         QApplication.setOverrideCursor(Qt.WaitCursor)

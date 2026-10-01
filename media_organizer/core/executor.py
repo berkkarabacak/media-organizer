@@ -9,7 +9,9 @@ Safety features:
   source is removed. A destination that already holds this source's bytes
   is journaled and not copied again. A different file at that path still
   gets a collision suffix.
-- free-space preflight helper
+- free-space preflight helper. The byte total is what this run will
+  still write, not rows Resume will skip and not a destination that
+  already holds the source.
 """
 
 from __future__ import annotations
@@ -65,6 +67,26 @@ def _same_file(src: Path, dest: Path) -> bool:
         return src.samefile(dest)
     except OSError:
         return False
+
+
+def bytes_still_needed(plan) -> int:
+    """Bytes ``execute_plan`` will still write for ``plan``.
+
+    Duplicates and rows with no destination are omitted, same as the
+    organize dialog's previous sum. A destination that already holds this
+    source's bytes is omitted too: the executor journals that row and does
+    not copy or move new bytes onto the drive. Every other row counts in
+    full, including one whose final name is already a different file and
+    will be written beside it under a collision suffix.
+    """
+    total = 0
+    for item in plan:
+        if item.is_duplicate or not item.destination:
+            continue
+        if files_identical(item.source, item.destination):
+            continue
+        total += item.size
+    return total
 
 
 def free_space_status(dest_dir: Path | str, needed_bytes: int) -> dict:
