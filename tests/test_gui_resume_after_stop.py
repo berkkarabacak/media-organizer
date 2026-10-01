@@ -187,7 +187,7 @@ class TestPartialFinishLeavesResume:
         assert "Organize again to Resume" in dialog["text"]
         assert "Undo reverses" in dialog["text"]
         assert "Resume" in dialog["buttons"]
-        assert "Undo" in dialog["buttons"]
+        assert "Undo" not in dialog["buttons"]
         assert "Open folder" in dialog["buttons"]
 
         _forbid_rescan(monkeypatch)
@@ -275,6 +275,7 @@ class TestPartialFinishLeavesResume:
         assert "Organize again to Resume" in dialog["text"]
         assert "permanently" not in dialog["text"].lower()
         assert "Resume" in dialog["buttons"]
+        assert "Undo" not in dialog["buttons"]
         assert "Finished:" not in window.status_label.text()
 
         _forbid_rescan(monkeypatch)

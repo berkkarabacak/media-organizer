@@ -24,9 +24,9 @@ from PySide6.QtWidgets import (
 
 from .. import APP_NAME, __version__
 from ..core.display import (elide_middle, finished_run_keeps_plan,
-                            finished_run_lines, format_bytes,
-                            relative_destination, relative_destination_fast,
-                            sorted_plan_items)
+                            finished_run_lines, finished_run_offers_undo,
+                            format_bytes, relative_destination,
+                            relative_destination_fast, sorted_plan_items)
 from ..core.eta import ThroughputEstimator, format_eta, format_rate
 from ..core.executor import (bytes_still_needed, execute_plan,
                             free_space_status, saved_run_owns_plan_row)
@@ -1477,9 +1477,11 @@ class MainWindow(QMainWindow):
         open_btn.setIcon(icons.icon("external-link", theme.TEXT, 14))
         # A dry run writes nothing and does not save a log. Undo of that
         # in-memory log can delete or relocate a file that was already in
-        # the destination, then persist a fake operation log.
+        # the destination, then persist a fake operation log. An unfinished
+        # journal still has Resume as the next step. Undo there reverses
+        # files this run already finished. File → Undo last run is separate.
         undo_btn = None
-        if not dry:
+        if finished_run_offers_undo(summary, keep_plan=keep_plan):
             undo_btn = box.addButton("Undo", QMessageBox.DestructiveRole)
             undo_btn.setIcon(icons.icon("undo", theme.TEXT, 14))
         box.addButton(QMessageBox.Close)

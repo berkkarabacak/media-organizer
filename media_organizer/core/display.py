@@ -24,6 +24,22 @@ def finished_run_keeps_plan(summary: dict, *, journal_open: bool) -> bool:
     return bool(journal_open)
 
 
+def finished_run_offers_undo(summary: dict, *, keep_plan: bool) -> bool:
+    """True when the finish dialog may add an Undo button.
+
+    A dry run writes nothing. Undo of that in-memory log can delete or
+    relocate a file that was already in the destination, then persist a
+    fake operation log. An unfinished run keeps the plan so Resume is
+    the next step. Undo on that dialog reverses files the interrupted
+    run already finished while the crash journal is still open. A
+    successful real run still offers Undo. File → Undo last run is a
+    separate path and is not this flag.
+    """
+    if summary.get("dry_run"):
+        return False
+    return not keep_plan
+
+
 def finished_run_lines(summary: dict, *, folders: int, total_bytes: int,
                        journal_open: bool = False) -> tuple[str, str]:
     """Status-bar line and dialog body for a finished organize run.

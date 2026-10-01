@@ -255,7 +255,20 @@ class TestUndoWhileOrganizeRuns:
 
     def test_done_dialog_undo_works_after_the_worker_finishes(
             self, qapp, window, tmp_path, monkeypatch):
-        src, dst, plan, log, op = _partial_run(tmp_path, copy_mode=True)
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        make_jpeg_with_exif(
+            src / "IMG_0.jpg", datetime(2024, 7, 15, 10, 0, 0))
+        options = OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=True)
+        plan = build_plan(options)
+        log, summary = execute_plan(plan, options)
+        assert summary["cancelled"] is False
+        assert summary["dry_run"] is False
+        assert find_unfinished_journal(dst) is None
+        op = next(item for item in log.operations if item.status == "done")
+        assert Path(op.destination).is_file()
         events = _dialogs(monkeypatch)
         _hold_organize(monkeypatch, window, src, dst, plan, copy_mode=True)
         assert window.undo_action.isEnabled() is False
@@ -274,13 +287,10 @@ class TestUndoWhileOrganizeRuns:
         monkeypatch.setattr(
             QMessageBox, "clickedButton", lambda self: clicked.get("button"))
 
-        window._on_run_finished(log, {
-            "copied": 1, "moved": 0, "skipped_duplicates": 0,
-            "undated": 0, "uncertain": 0, "errors": 0,
-            "cancelled": True, "dry_run": False, "action": "copy",
-        })
+        window._on_run_finished(log, summary)
 
         assert "Undo" in clicked["buttons"]
+        assert "Resume" not in clicked["buttons"]
         assert "Open folder" in clicked["buttons"]
         assert window.undo_action.isEnabled()
         assert window.org_worker.isRunning() is False
@@ -289,6 +299,51 @@ class TestUndoWhileOrganizeRuns:
         assert find_unfinished_journal(dst) is None
         assert any("Undo the newest" in text
                    for kind, text in events if kind == "question")
+
+    def test_stopped_dialog_does_not_undo_finished_copies(
+            self, qapp, window, tmp_path, monkeypatch):
+        src, dst, plan, log, op = _partial_run(tmp_path, copy_mode=True)
+        payload = Path(op.destination).read_bytes()
+        events = _dialogs(monkeypatch)
+        _hold_organize(monkeypatch, window, src, dst, plan, copy_mode=True)
+        assert window.undo_action.isEnabled() is False
+        before = _snapshot(src, dst)
+        clicked = {}
+
+        def fake_exec(self):
+            clicked["title"] = self.windowTitle()
+            clicked["buttons"] = [
+                button.text().replace("&", "") for button in self.buttons()]
+            # A regression that puts Undo back would press it.
+            clicked["button"] = next(
+                (button for button in self.buttons()
+                 if button.text().replace("&", "") == "Undo"),
+                None)
+            return 0
+
+        monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+        monkeypatch.setattr(
+            QMessageBox, "clickedButton", lambda self: clicked.get("button"))
+
+        window._on_run_finished(log, {
+            "copied": 1, "moved": 0, "skipped_duplicates": 0,
+            "undated": 0, "uncertain": 0, "errors": 0,
+            "cancelled": True, "dry_run": False, "action": "copy",
+        })
+
+        assert clicked["title"].endswith("Organize stopped")
+        assert "Resume" in clicked["buttons"]
+        assert "Undo" not in clicked["buttons"]
+        assert "Open folder" in clicked["buttons"]
+        assert window.undo_action.isEnabled()
+        assert window.org_worker.isRunning() is False
+        assert _snapshot(src, dst) == before
+        assert Path(op.destination).is_file()
+        assert Path(op.destination).read_bytes() == payload
+        assert Path(op.source).is_file()
+        assert find_unfinished_journal(dst) is not None
+        assert not any("Undo the newest" in text
+                       for kind, text in events if kind == "question")
 
     def test_a_running_scan_does_not_block_undo(
             self, qapp, window, tmp_path, monkeypatch):

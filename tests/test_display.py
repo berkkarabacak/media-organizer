@@ -4,8 +4,9 @@ from datetime import datetime
 from pathlib import Path
 
 from media_organizer.core.display import (
-    elide_middle, finished_run_keeps_plan, finished_run_lines, format_bytes,
-    plan_sort_key, relative_destination, sorted_plan_items,
+    elide_middle, finished_run_keeps_plan, finished_run_lines,
+    finished_run_offers_undo, format_bytes, plan_sort_key,
+    relative_destination, sorted_plan_items,
 )
 from media_organizer.core.plan import UNDO_STACK_LIMIT
 from media_organizer.core.metadata import CaptureDate, DateSource
@@ -268,3 +269,26 @@ class TestPartialFinishKeepsResume:
         assert "couldn't be read" not in text
         assert "skipped" not in text.lower()
         assert "Dry run" in text
+
+
+class TestFinishDialogOffersUndo:
+    """Undo on Organize stopped reverses work Resume is meant to keep."""
+
+    def test_stopped_run_does_not_offer_undo(self):
+        for summary in (
+            _run_summary(cancelled=True),
+            _run_summary(errors=1, copied=1),
+            _run_summary(copied=2),
+        ):
+            assert finished_run_keeps_plan(summary, journal_open=True)
+            assert not finished_run_offers_undo(summary, keep_plan=True)
+
+    def test_successful_real_run_offers_undo(self):
+        summary = _run_summary(copied=2)
+        assert not finished_run_keeps_plan(summary, journal_open=False)
+        assert finished_run_offers_undo(summary, keep_plan=False)
+
+    def test_dry_run_does_not_offer_undo(self):
+        summary = _run_summary(dry_run=True, copied=2, cancelled=True)
+        assert not finished_run_offers_undo(summary, keep_plan=False)
+        assert not finished_run_offers_undo(summary, keep_plan=True)
