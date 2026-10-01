@@ -16,8 +16,9 @@ from media_organizer.core.executor import (
 )
 from media_organizer.core.journal import (
     PART_SUFFIX, JournalWriter, atomic_copy, atomic_move, cleanup_stale_parts,
-    completed_sources, discard_journal, exclude_completed_sources,
-    files_identical, find_unfinished_journal, journal_path_for, path_identity,
+    completed_operations, completed_sources, discard_journal,
+    exclude_completed_sources, files_identical, find_unfinished_journal,
+    journal_path_for, path_identity,
 )
 from media_organizer.core.metadata import (
     CaptureDate, Confidence, DateSource, analyze_media_batch,
@@ -1335,6 +1336,232 @@ def _resume_plan(plan, dest):
     if journal is None:
         return list(plan)
     return exclude_completed_sources(plan, completed_sources(journal))
+
+
+class TestPartialFileErrorsLeaveJournalUnfinished:
+    """A per-file failure must not close the crash journal.
+
+    The plan loop used to finish without ``break`` and call ``complete()``
+    even when ``summary["errors"]`` was non-zero. Resume then saw no
+    unfinished journal. The next Copy planned files that had already
+    landed onto ``name_1``, and a destination published before a failed
+    ``JournalWriter.record`` could not be adopted.
+    """
+
+    def test_copy_oserror_after_first_file_stays_resumable(
+            self, tmp_path, monkeypatch):
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=True)
+        plan = _plan(src, dst, copy_mode=True)
+        assert len(plan) >= 2
+        first, second = plan[0], plan[1]
+        assert first.destination is not None and second.destination is not None
+        assert first.destination.name == first.source.name
+        assert second.destination.name == second.source.name
+        real_copy = atomic_copy
+        calls = {"n": 0}
+
+        def fail_second(source, final):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise OSError("injected copy failure")
+            return real_copy(source, final)
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor.atomic_copy", fail_second)
+
+        _log, summary = execute_plan(plan, options)
+
+        assert summary["errors"] >= 1
+        assert summary["cancelled"] is False
+        assert summary["copied"] == 1
+        assert first.destination.is_file()
+        assert first.destination.read_bytes() == first.source.read_bytes()
+        assert first.source.is_file()
+        assert not second.destination.exists()
+        assert not (first.destination.parent / "IMG_0_1.jpg").exists()
+
+        jp = find_unfinished_journal(dst)
+        assert jp is not None
+        text = jp.read_text(encoding="utf-8")
+        assert '"run": "complete"' not in text
+        done = completed_sources(jp)
+        done_ids = {path_identity(source) for source in done}
+        assert path_identity(first.source) in done_ids
+        assert path_identity(second.source) not in done_ids
+        assert any(
+            path_identity(op["source"]) == path_identity(first.source)
+            and path_identity(op["destination"]) == path_identity(first.destination)
+            for op in completed_operations(jp))
+
+        rescanned = _plan(src, dst, copy_mode=True)
+        by_id = {path_identity(item.source): item for item in rescanned}
+        again_first = by_id[path_identity(first.source)]
+        again_second = by_id[path_identity(second.source)]
+        assert again_first.destination == first.destination
+        assert again_second.destination == second.destination
+
+        remaining = _resume_plan(rescanned, dst)
+        assert [path_identity(item.source) for item in remaining] == [
+            path_identity(second.source)]
+        assert remaining[0].destination == second.destination
+
+    def test_record_failure_after_publish_can_be_adopted(
+            self, tmp_path, monkeypatch):
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=True)
+        plan = _plan(src, dst, copy_mode=True)
+        first, second = plan[0], plan[1]
+        assert first.destination.name == first.source.name
+        assert second.destination.name == second.source.name
+        payload = second.source.read_bytes()
+        real_record = JournalWriter.record
+        calls = {"n": 0}
+
+        def fail_second_record(self, action, source, destination):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                published = Path(destination)
+                assert published.is_file()
+                assert published.read_bytes() == payload
+                assert published == second.destination
+                raise OSError("journal write failed")
+            return real_record(self, action, source, destination)
+
+        monkeypatch.setattr(JournalWriter, "record", fail_second_record)
+
+        _log, summary = execute_plan(plan, options)
+
+        assert summary["errors"] >= 1
+        assert summary["copied"] == 2
+        assert first.destination.is_file()
+        assert second.destination.is_file()
+        assert second.destination.read_bytes() == payload
+        assert not (first.destination.parent / "IMG_0_1.jpg").exists()
+        assert not (second.destination.parent / "IMG_1_1.jpg").exists()
+
+        jp = find_unfinished_journal(dst)
+        assert jp is not None
+        assert '"run": "complete"' not in jp.read_text(encoding="utf-8")
+        done_ids = {path_identity(source) for source in completed_sources(jp)}
+        assert path_identity(first.source) in done_ids
+        assert path_identity(second.source) not in done_ids
+        assert any(
+            path_identity(op["source"]) == path_identity(first.source)
+            for op in completed_operations(jp))
+
+        rescanned = _plan(src, dst, copy_mode=True)
+        by_id = {path_identity(item.source): item for item in rescanned}
+        assert by_id[path_identity(second.source)].destination == second.destination
+        assert by_id[path_identity(first.source)].destination == first.destination
+
+        remaining = _resume_plan(rescanned, dst)
+        assert [path_identity(item.source) for item in remaining] == [
+            path_identity(second.source)]
+        assert remaining[0].destination == second.destination
+
+        def fail_copy(*_args, **_kwargs):
+            raise AssertionError(
+                "resume copied a file that was already published")
+
+        monkeypatch.setattr(JournalWriter, "record", real_record)
+        monkeypatch.setattr(
+            "media_organizer.core.executor.atomic_copy", fail_copy)
+
+        retry_log, retry = execute_plan(remaining, options)
+
+        assert retry["errors"] == 0
+        assert retry["copied"] == 1
+        assert retry["cancelled"] is False
+        assert second.destination.read_bytes() == payload
+        assert not (second.destination.parent / "IMG_1_1.jpg").exists()
+        assert sorted(p.name for p in dst.rglob("*.jpg")) == [
+            "IMG_0.jpg", "IMG_1.jpg"]
+        text = journal_path_for(dst).read_text(encoding="utf-8")
+        assert str(first.source) in text
+        assert str(second.source) in text
+        assert text.strip().splitlines()[-1] == '{"run": "complete"}'
+        assert find_unfinished_journal(dst) is None
+        adopted = [op for op in retry_log.operations
+                   if path_identity(op.source) == path_identity(second.source)
+                   and op.status == "done"]
+        assert [(op.action, op.destination) for op in adopted] == [
+            ("copy", str(second.destination))]
+
+    def test_missing_destination_row_leaves_successes_resumable(self, tmp_path):
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=True)
+        plan = _plan(src, dst, copy_mode=True)
+        first, broken = plan[0], plan[1]
+        natural = broken.destination
+        broken.destination = None
+        broken.error = "unreadable during scan"
+
+        _log, summary = execute_plan(plan, options)
+
+        assert summary["errors"] >= 1
+        assert summary["copied"] == 1
+        assert summary["cancelled"] is False
+        assert first.destination.is_file()
+        jp = find_unfinished_journal(dst)
+        assert jp is not None
+        assert '"run": "complete"' not in jp.read_text(encoding="utf-8")
+        done_ids = {path_identity(source) for source in completed_sources(jp)}
+        assert done_ids == {path_identity(first.source)}
+        assert any(
+            path_identity(op["source"]) == path_identity(first.source)
+            for op in completed_operations(jp))
+
+        rescanned = _plan(src, dst, copy_mode=True)
+        by_id = {path_identity(item.source): item for item in rescanned}
+        assert by_id[path_identity(first.source)].destination == first.destination
+        assert by_id[path_identity(broken.source)].destination == natural
+        remaining = _resume_plan(rescanned, dst)
+        assert [path_identity(item.source) for item in remaining] == [
+            path_identity(broken.source)]
+
+    def test_finished_prior_run_still_gets_a_collision_suffix(
+            self, tmp_path, monkeypatch):
+        """A completed earlier organize is not adopted after a later error.
+
+        Leaving the failed run unfinished must not reuse a destination that
+        belongs to a run that already wrote ``{"run": "complete"}``.
+        """
+        src_a, dst = _setup(tmp_path, n=1)
+        execute_plan(_plan(src_a, dst),
+                     OrganizeOptions(source_dir=src_a, dest_dir=dst))
+        natural = dst / "2024" / "07 July" / "IMG_0.jpg"
+        original = natural.read_bytes()
+        assert find_unfinished_journal(dst) is None
+
+        src_b = tmp_path / "src_b"
+        src_b.mkdir()
+        make_jpeg_with_exif(src_b / "B_0.jpg", datetime(2024, 8, 2, 11, 0, 0))
+        make_jpeg_with_exif(src_b / "B_1.jpg", datetime(2024, 8, 2, 11, 1, 0))
+        options_b = OrganizeOptions(source_dir=src_b, dest_dir=dst, copy_mode=True)
+        plan_b = _plan(src_b, dst, copy_mode=True)
+        real_copy = atomic_copy
+        calls = {"n": 0}
+
+        def fail_second(source, final):
+            calls["n"] += 1
+            if calls["n"] >= 2:
+                raise OSError("injected copy failure")
+            return real_copy(source, final)
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor.atomic_copy", fail_second)
+        _log, summary = execute_plan(plan_b, options_b)
+
+        assert summary["errors"] >= 1
+        assert find_unfinished_journal(dst) is not None
+        assert natural.read_bytes() == original
+        again = _plan(src_a, dst)
+        assert again[0].destination == natural.with_name("IMG_0_1.jpg")
+        rescanned_b = _plan(src_b, dst, copy_mode=True)
+        by_id = {path_identity(item.source): item for item in rescanned_b}
+        assert by_id[path_identity(plan_b[0].source)].destination == (
+            plan_b[0].destination)
 
 
 class TestUndoDiscardsOverlappingJournal:

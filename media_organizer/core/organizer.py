@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 from .geodata import location_label
-from .journal import files_identical, find_unfinished_journal, path_identity
+from .journal import (completed_operations, files_identical,
+                       find_unfinished_journal, path_identity)
 from .metadata import (CaptureDate, DateSource, extract_capture_date,
                        extract_gps)
 from .plan import saved_run_destinations
@@ -288,7 +289,8 @@ def _unique_destination(dest_dir: Path, filename: str, taken: set[str]) -> Path:
 
 
 def _planned_destination(dest_dir: Path, src: Path, taken: set[str], *,
-                         reuse_identical: bool, owned: set[str]) -> Path:
+                         reuse_identical: bool, owned: set[str],
+                         open_by_dest: dict[str, set[str]]) -> Path:
     """Destination for ``src``, reusing a published match on resume.
 
     The crash window is a final name already on disk with no journal line
@@ -297,14 +299,20 @@ def _planned_destination(dest_dir: Path, src: Path, taken: set[str], *,
 
     A path a saved run already logged is not reused. That copy belongs to
     the earlier run, so a newer organize still gets a collision suffix and
-    undo of the newer run can leave the earlier file in place. A file that
-    merely exists and does not match is never overwritten.
+    undo of the newer run can leave the earlier file in place. The open
+    journal is not an earlier run: a source it already recorded at this
+    path keeps the natural name. Otherwise a rescan after a per-file error
+    would plan ``name_1`` for work that already finished, because that
+    error still calls ``save_log``. A file that merely exists and does not
+    match is never overwritten.
     """
     natural = dest_dir / src.name
     key = str(natural).lower()
+    ident = path_identity(natural)
+    this_run = path_identity(src) in open_by_dest.get(ident, ())
     if (reuse_identical
             and key not in taken
-            and path_identity(natural) not in owned
+            and (ident not in owned or this_run)
             and files_identical(src, natural)):
         taken.add(key)
         return natural
@@ -338,10 +346,24 @@ def build_plan(
     plan: list[PlannedFile] = []
     taken: set[str] = set()
     # Only an interrupted run should adopt a file it already published.
-    # A finished journal means the next organize is a new run.
-    resuming = find_unfinished_journal(options.dest_dir) is not None
+    # A finished journal means the next organize is a new run. Do not
+    # treat a successful complete as resumable.
+    journal = find_unfinished_journal(options.dest_dir)
+    resuming = journal is not None
     owned = (saved_run_destinations(options.dest_dir)
              if resuming else set())
+    # Dest identity -> sources this open journal already finished there.
+    # ``owned`` includes the partial run's save_log. Those sources are
+    # this run, so that log must not force a collision suffix for them.
+    open_by_dest: dict[str, set[str]] = {}
+    if journal is not None:
+        for op in completed_operations(journal):
+            source = op.get("source") or ""
+            dest = op.get("destination") or ""
+            if not source or not dest:
+                continue
+            open_by_dest.setdefault(path_identity(dest), set()).add(
+                path_identity(source))
     strategy = get_strategy(options.strategy)
     geo_cache: dict[tuple[float, float], Optional[str]] = {}
     analysis = analysis or {}
@@ -386,7 +408,8 @@ def build_plan(
         dest_dir = Path(options.dest_dir).joinpath(*rel.split("/"))
 
         dest = _planned_destination(
-            dest_dir, src, taken, reuse_identical=resuming, owned=owned)
+            dest_dir, src, taken, reuse_identical=resuming, owned=owned,
+            open_by_dest=open_by_dest)
         plan.append(PlannedFile(src, dest, size, capture, kind,
                                 location=location))
 

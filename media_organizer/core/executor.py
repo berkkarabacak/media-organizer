@@ -4,10 +4,12 @@ Safety features:
 - dry_run: full pipeline simulation, writes nothing
 - crash journal: every completed file is journaled (JSONL) so an interrupted
   run can be resumed. A new organize replaces a finished journal; a resume
-  appends to the unfinished one. Copies are fsynced to a temp name, then
-  atomically renamed. A cross-volume move journals that copy before the
-  source is removed. Resume still removes that source when the done line
-  is already there and the destination bytes still match; a missing or
+  appends to the unfinished one. Per-file errors leave the journal
+  unfinished so Resume can skip the files already recorded. Copies are
+  fsynced to a temp name, then atomically renamed. A cross-volume move
+  journals that copy before the source is removed. Resume still removes
+  that source when the done line is already there and the destination
+  bytes still match; a missing or
   different destination is left alone. A destination that already holds
   this source's bytes is journaled and not copied again. A different file
   at that path still gets a collision suffix.
@@ -314,9 +316,18 @@ def execute_plan(
         # is how resume keeps the files already organized in this run.
         journal = JournalWriter(options.dest_dir)
 
-    # complete() only after the plan loop finishes with no break and no
-    # unexpected exception. Cancel breaks out and must stay resumable.
-    # Per-file OSError is caught inside the loop and is not this case.
+    # complete() only when the plan loop finishes with no break, no
+    # unexpected exception, and no per-file error. Cancel breaks out and
+    # must stay resumable. A per-file OSError (copy, move, or journal) and
+    # a plan row with ``item.error`` or no destination are caught inside
+    # the loop and counted in ``summary["errors"]``. Those used to take
+    # this path and write {"run": "complete"} anyway. Resume then had no
+    # unfinished journal, so the next Copy treated destinations that
+    # already held the successful files as collisions (``photo_1.jpg``).
+    # A publish that landed before ``JournalWriter.record`` failed was
+    # also closed, so the identical-destination reuse path could not
+    # adopt it. Leaving the journal open keeps the done lines that were
+    # recorded; Resume skips those sources and retries the rest.
     # Anything else (a bug, MemoryError, a runtime failure) used to reach
     # finally with cancelled still false and write {"run": "complete"}, so
     # the next launch treated the crash as finished and could replace the
@@ -425,7 +436,8 @@ def execute_plan(
         if journal is not None:
             try:
                 if (finished_normally and aborted is None
-                        and not summary["cancelled"]):
+                        and not summary["cancelled"]
+                        and summary["errors"] == 0):
                     journal.complete()
             finally:
                 journal.close()
