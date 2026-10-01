@@ -30,6 +30,14 @@ is recognized, and `UploadResult.bytes_sent` is the size Drive accepted.
 Cancel and resume are unchanged. This slice still does not delete local or
 remote files.
 
+Slice 5 is the message a person sees when the upload cannot continue.
+`drive_upload` turns a Drive or network failure into one short sentence.
+The dialog status line and the warning show that sentence. They do not
+show an HTTP status, a response body, or a stack trace. A hard failure
+stops the pass. Files already saved with a Drive file id stay skippable.
+A resumable session that was already opened stays, so that file can
+continue on the next run. Later files in the same pass are not started.
+
 ## Where Drive sits
 
 Organize stays local. Drive is a destination for a library that has already
@@ -240,6 +248,7 @@ that file is updated. A path with no file id is created once. Intermediate
 folders are created under the bound folder so the library-relative path is
 kept. `mark_uploaded` runs only after Drive returns a file id, then
 `save_sync_record` runs, then the session URI for that path is removed.
+`DriveUploadError` stops the pass. See "Errors the upload shows".
 
 ## Later slices
 
@@ -257,16 +266,39 @@ kept. `mark_uploaded` runs only after Drive returns a file id, then
    A new path is created. Skipped and uploaded counts are reported while
    the pass runs, and the byte totals leave out unchanged files.
 5. Errors a non-technical user can read (quota, expired sign-in, offline).
-   Not started. A failure still stops the pass and shows a short message.
+   Done: `drive_upload` and the status line in `gui/drive_dialog`. The
+   sentences are in "Errors the upload shows".
 6. Docs. The README currently says the app is offline and has no network
    features. Update that sentence in the same release that ships upload.
    Not started.
+
+## Errors the upload shows
+
+A failure stops the upload. The pass does not skip the failed file and
+continue with the next one. Nothing is deleted on Drive or on disk.
+Organize stays local.
+
+The Drive dialog shows one of these sentences. The HTTP status and the
+API body stay out of the message.
+
+| What happened | What the user sees |
+|---|---|
+| Drive storage is full, or Drive reports `storageQuotaExceeded`, `quotaExceeded`, or HTTP 507 | Google Drive is full. Free some space, then try the upload again. |
+| The sign-in expired or was revoked: HTTP 401, `authError`, `invalid_token`, `invalid_grant`, or `UNAUTHENTICATED` | Sign in to Google Drive again. The previous sign-in expired or was revoked. |
+| This computer is offline, the connection fails, or Google cannot be reached (including HTTP 502, 503, and 504) | This computer cannot reach Google Drive. Check the internet connection, then try again. |
+| Any other Drive failure, including a rate limit | Google Drive did not accept the upload. Try again. |
+
+A rate limit is not described as a full Drive. A resumable session that
+Drive has closed (HTTP 404 or 410 on that session only) is not an expired
+sign-in: the upload starts a new session for that one file, as in slice 3.
+Files already marked uploaded are still skipped. The in-flight session URI
+stays in `upload_sessions.json` when the failure happens after the session
+was opened.
 
 ## Out of scope for this version
 
 - Two-way sync.
 - Deleting local files after a successful upload.
 - Replacing the local organize step.
-- Plain-language quota, expired sign-in, and offline errors (slice 5).
 - The README offline sentence (slice 6), in the release that ships upload.
 - A client secret, token, or credential file in the repository.

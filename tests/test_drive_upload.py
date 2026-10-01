@@ -6,7 +6,10 @@ No network. The fake Drive HTTP layer stands in for Google.
 import json
 import re
 import threading
+import urllib.error
 import urllib.parse
+
+import pytest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
@@ -20,6 +23,10 @@ from media_organizer.core.drive_sync import (
     sync_path_for,
 )
 from media_organizer.core.drive_upload import (
+    AUTH_MESSAGE,
+    GENERIC_UPLOAD_MESSAGE,
+    OFFLINE_MESSAGE,
+    QUOTA_MESSAGE,
     SESSIONS_FILENAME,
     DriveResponse,
     DriveUploadError,
@@ -28,6 +35,7 @@ from media_organizer.core.drive_upload import (
     upload_library,
 )
 from media_organizer.core.duplicates import full_hash
+from media_organizer.core.google_auth import GoogleAuthError, public_error_message
 
 _QUERY_RE = re.compile(
     r"name = '(?P<name>.*?)' and mimeType = 'application/vnd\.google-apps\.folder' "
@@ -62,6 +70,8 @@ class FakeDrive:
         self.file_seq = 0
         self.sessions = {}
         self.files = {}
+        # Return a DriveResponse, raise, or return None to let the fake continue.
+        self.fail = None
 
     def request(self, method, url, headers, body, timeout=None):
         lowered = {str(key).lower(): value for key, value in headers.items()}
@@ -76,6 +86,12 @@ class FakeDrive:
         self.calls.append(call)
         if _is_remote_delete(call):
             raise AssertionError(f"remote delete is not allowed: {method} {url}")
+        if self.fail is not None:
+            outcome = self.fail(call)
+            if isinstance(outcome, BaseException):
+                raise outcome
+            if outcome is not None:
+                return outcome
         return self._route(call)
 
     def _route(self, call):
@@ -839,3 +855,381 @@ class TestResumableHttp:
             thread.join(timeout=2)
         assert response.status == 308
         assert response.header("range") == "bytes=0-4"
+
+
+def _json_error(status, payload):
+    body = json.dumps(payload).encode("utf-8")
+    return _response(status, {"Content-Type": "application/json"}, body)
+
+
+def _storage_quota_response():
+    return _json_error(403, {
+        "error": {
+            "errors": [{
+                "domain": "usageLimits",
+                "reason": "storageQuotaExceeded",
+                "message": "The user's Drive storage quota has been exceeded.",
+            }],
+            "code": 403,
+            "message": "The user's Drive storage quota has been exceeded.",
+        }
+    })
+
+
+def _quota_exceeded_response():
+    return _json_error(403, {
+        "error": {
+            "errors": [{
+                "reason": "quotaExceeded",
+                "message": "Quota exceeded.",
+            }],
+            "code": 403,
+            "message": "Quota exceeded.",
+        }
+    })
+
+
+def _assert_user_message(exc, expected, hidden):
+    message = public_error_message(exc)
+    assert str(exc) == expected
+    assert message == expected
+    lowered = message.lower()
+    assert "traceback" not in lowered
+    assert "http" not in lowered
+    assert not any(ch.isdigit() for ch in message)
+    for item in hidden:
+        assert item not in message
+        assert item.lower() not in lowered
+
+
+def _names_in_calls(fake: FakeDrive) -> set[str]:
+    found = set()
+    for call in fake.calls:
+        text = call["body"].decode("utf-8", errors="ignore")
+        for name in ("a.jpg", "b.jpg", "c.jpg"):
+            if name in text:
+                found.add(name)
+    return found
+
+
+class TestUploadErrors:
+    """Quota, expired sign-in, and offline stop the pass with a plain message."""
+
+    def test_storage_full_stops_before_later_files(self, tmp_path):
+        library = tmp_path / "library"
+        _bind(library)
+        _write(library, "2024/a.jpg", b"aaaa")
+        _write(library, "2024/b.jpg", b"bbbb")
+        _write(library, "2024/c.jpg", b"cccc")
+        fake = FakeDrive()
+        opened = {"n": 0}
+
+        def fail(call):
+            if call["method"] == "POST" and "uploadType=resumable" in call["url"]:
+                opened["n"] += 1
+                if opened["n"] >= 2:
+                    response = _storage_quota_response()
+                    response = DriveResponse(
+                        response.status,
+                        response.headers,
+                        response.body + b" Bearer test-access-token",
+                    )
+                    return response
+            return None
+
+        fake.fail = fail
+        sessions = tmp_path / "google" / "upload_sessions.json"
+        with pytest.raises(DriveUploadError) as caught:
+            _run(library, fake, sessions)
+        _assert_user_message(
+            caught.value,
+            "Google Drive is full. Free some space, then try the upload again.",
+            ("403", "storageQuotaExceeded", "Bearer", "test-access-token"),
+        )
+        assert str(caught.value) == QUOTA_MESSAGE
+        saved = load_sync_record(library)
+        assert saved.decide(
+            "2024/a.jpg", 4, full_hash(library / "2024/a.jpg"),
+        ) == DECISION_SKIP
+        assert saved.entry_for("2024/b.jpg") is None
+        assert saved.entry_for("2024/c.jpg") is None
+        assert "c.jpg" not in _names_in_calls(fake)
+        assert b"cccc" not in b"".join(call["body"] for call in fake.calls)
+        for name, data in (("a.jpg", b"aaaa"), ("b.jpg", b"bbbb"), ("c.jpg", b"cccc")):
+            assert (library / "2024" / name).read_bytes() == data
+        _assert_additive(fake)
+        _assert_library_has_no_secrets(library)
+
+        fake.fail = None
+        calls_before = len(fake.calls)
+        second, _progress = _run(library, fake, sessions)
+        assert second.skipped == 1
+        assert second.uploaded == 2
+        assert second.cancelled is False
+        again = load_sync_record(library)
+        assert again.entry_for("2024/a.jpg").drive_file_id == saved.entry_for("2024/a.jpg").drive_file_id
+        for relative in ("2024/a.jpg", "2024/b.jpg", "2024/c.jpg"):
+            path = library.joinpath(*relative.split("/"))
+            assert again.decide(relative, path.stat().st_size, full_hash(path)) == DECISION_SKIP
+        resent = b"".join(call["body"] for call in fake.calls[calls_before:])
+        assert b"aaaa" not in resent
+        assert not any(_is_remote_delete(call) for call in fake.calls)
+
+    @pytest.mark.parametrize("response_factory", [
+        _quota_exceeded_response,
+        lambda: _response(507, {}, b"Insufficient Storage"),
+    ])
+    def test_other_quota_shapes_use_the_same_sentence(self, tmp_path, response_factory):
+        library = tmp_path / "library"
+        _bind(library)
+        _write(library, "2024/a.jpg", b"aaaa")
+        fake = FakeDrive()
+        fake.fail = lambda _call: response_factory()
+        with pytest.raises(DriveUploadError) as caught:
+            _run(library, fake, tmp_path / "sessions.json")
+        hidden = ("507", "403", "quotaExceeded", "Insufficient")
+        _assert_user_message(caught.value, QUOTA_MESSAGE, hidden)
+        assert load_sync_record(library).entry_for("2024/a.jpg") is None
+        assert (library / "2024/a.jpg").read_bytes() == b"aaaa"
+        assert not any(_is_remote_delete(call) for call in fake.calls)
+
+    @pytest.mark.parametrize("response", [
+        _json_error(401, {
+            "error": "invalid_token",
+            "error_description": "Invalid Credentials",
+        }),
+        _json_error(403, {
+            "error": {
+                "errors": [{
+                    "reason": "authError",
+                    "message": "Invalid Credentials",
+                }],
+                "code": 403,
+                "message": "Invalid Credentials",
+                "status": "UNAUTHENTICATED",
+            }
+        }),
+    ])
+    def test_expired_sign_in_stops_and_keeps_finished_files_skippable(self, tmp_path, response):
+        library = tmp_path / "library"
+        _bind(library)
+        _write(library, "2024/a.jpg", b"aaaa")
+        _write(library, "2024/b.jpg", b"bbbb")
+        _write(library, "2024/c.jpg", b"cccc")
+        record = load_sync_record(library)
+        record.mark_uploaded("2024/a.jpg", 4, full_hash(library / "2024/a.jpg"), "drive-a")
+        save_sync_record(record, library)
+        fake = FakeDrive()
+        fake.fail = lambda _call: response
+        sessions = tmp_path / "google" / "upload_sessions.json"
+        with pytest.raises(DriveUploadError) as caught:
+            _run(library, fake, sessions)
+        _assert_user_message(
+            caught.value,
+            "Sign in to Google Drive again. The previous sign-in expired or was revoked.",
+            ("401", "403", "invalid_token", "authError", "UNAUTHENTICATED", "Credentials"),
+        )
+        assert str(caught.value) == AUTH_MESSAGE
+        saved = load_sync_record(library)
+        assert saved.entry_for("2024/a.jpg").drive_file_id == "drive-a"
+        assert saved.decide("2024/a.jpg", 4, full_hash(library / "2024/a.jpg")) == DECISION_SKIP
+        assert saved.entry_for("2024/b.jpg") is None
+        assert saved.entry_for("2024/c.jpg") is None
+        assert "a.jpg" not in _names_in_calls(fake)
+        assert "c.jpg" not in _names_in_calls(fake)
+        assert b"aaaa" not in b"".join(call["body"] for call in fake.calls)
+        assert not any("uploadType=resumable" in call["url"] for call in fake.calls)
+        for name, data in (("a.jpg", b"aaaa"), ("b.jpg", b"bbbb"), ("c.jpg", b"cccc")):
+            assert (library / "2024" / name).read_bytes() == data
+        _assert_additive(fake)
+        _assert_library_has_no_secrets(library)
+
+    def test_revoked_refresh_asks_the_user_to_sign_in_again(self, tmp_path):
+        library = tmp_path / "library"
+        _bind(library)
+        _write(library, "2024/a.jpg", b"aaaa")
+        fake = FakeDrive()
+
+        def token():
+            raise GoogleAuthError("Google did not accept the sign-in.")
+
+        with pytest.raises(DriveUploadError) as caught:
+            upload_library(
+                library,
+                access_token=token,
+                request=fake.request,
+                sessions_path=tmp_path / "sessions.json",
+            )
+        _assert_user_message(caught.value, AUTH_MESSAGE, ("invalid_grant",))
+        assert fake.calls == []
+        assert load_sync_record(library).entry_for("2024/a.jpg") is None
+        assert (library / "2024/a.jpg").read_bytes() == b"aaaa"
+
+    def test_offline_stops_and_the_open_session_can_resume(self, tmp_path):
+        library = tmp_path / "library"
+        _bind(library)
+        _write(library, "2024/a.jpg", b"0123456789")
+        _write(library, "2024/b.jpg", b"zzzz")
+        fake = FakeDrive()
+
+        def fail(call):
+            if call["headers"].get("content-range", "").startswith("bytes 4-"):
+                raise ConnectionError("Network is unreachable")
+            return None
+
+        fake.fail = fail
+        sessions = tmp_path / "google" / "upload_sessions.json"
+        with pytest.raises(DriveUploadError) as caught:
+            upload_library(
+                library,
+                access_token=lambda: "test-access-token",
+                request=fake.request,
+                sessions_path=sessions,
+                chunk_size=4,
+            )
+        _assert_user_message(
+            caught.value,
+            "This computer cannot reach Google Drive. Check the internet connection, then try again.",
+            ("Network is unreachable", "ConnectionError"),
+        )
+        assert str(caught.value) == OFFLINE_MESSAGE
+        saved = load_sync_record(library)
+        assert saved.entry_for("2024/a.jpg") is None
+        assert saved.entry_for("2024/b.jpg") is None
+        assert "b.jpg" not in _names_in_calls(fake)
+        stored = UploadSessionStore(sessions).get(library, "2024/a.jpg")
+        assert stored is not None
+        assert stored.resume_uri.startswith("https://upload.example/")
+        assert stored.size == 10
+        upload_id = urllib.parse.parse_qs(
+            urllib.parse.urlparse(stored.resume_uri).query
+        )["upload_id"][0]
+        assert fake.sessions[upload_id]["received"] == 4
+        assert UploadSessionStore(sessions).get(library, "2024/b.jpg") is None
+        assert (library / "2024/a.jpg").read_bytes() == b"0123456789"
+        assert (library / "2024/b.jpg").read_bytes() == b"zzzz"
+        assert not any(_is_remote_delete(call) for call in fake.calls)
+        _assert_library_has_no_secrets(library)
+
+        failed_at = len(fake.calls)
+        fake.fail = None
+        result = upload_library(
+            library,
+            access_token=lambda: "test-access-token",
+            request=fake.request,
+            sessions_path=sessions,
+            chunk_size=4,
+        )
+        assert result.cancelled is False
+        assert result.uploaded == 2
+        assert result.skipped == 0
+        resumed = [
+            call["headers"].get("content-range", "")
+            for call in fake.calls[failed_at:]
+            if upload_id in call["url"]
+        ]
+        assert any(item.startswith("bytes */") for item in resumed)
+        assert any(item.startswith("bytes 4-") for item in resumed)
+        assert not any(item.startswith("bytes 0-") for item in resumed)
+        finished = load_sync_record(library)
+        for relative, data in (("2024/a.jpg", b"0123456789"), ("2024/b.jpg", b"zzzz")):
+            path = library.joinpath(*relative.split("/"))
+            assert path.read_bytes() == data
+            assert finished.decide(relative, len(data), full_hash(path)) == DECISION_SKIP
+        a_file = next(item for item in fake.files.values() if item["name"] == "a.jpg")
+        assert a_file["data"] == b"0123456789"
+        assert not sessions.exists()
+        _assert_additive(fake)
+        _assert_library_has_no_secrets(library)
+
+    def test_urlerror_reads_as_offline(self, tmp_path):
+        library = tmp_path / "library"
+        _bind(library)
+        _write(library, "2024/a.jpg", b"aaaa")
+        fake = FakeDrive()
+
+        def fail(_call):
+            raise urllib.error.URLError("timed out")
+
+        fake.fail = fail
+        with pytest.raises(DriveUploadError) as caught:
+            _run(library, fake, tmp_path / "sessions.json")
+        _assert_user_message(caught.value, OFFLINE_MESSAGE, ("timed out", "URLError"))
+        assert load_sync_record(library).entry_for("2024/a.jpg") is None
+        assert (library / "2024/a.jpg").read_bytes() == b"aaaa"
+
+    def test_refresh_that_cannot_reach_google_is_offline(self, tmp_path):
+        library = tmp_path / "library"
+        _bind(library)
+        _write(library, "2024/a.jpg", b"aaaa")
+        fake = FakeDrive()
+
+        def token():
+            raise GoogleAuthError(
+                "Could not reach Google. Check your internet connection."
+            ) from urllib.error.URLError("nodename nor servname provided")
+
+        with pytest.raises(DriveUploadError) as caught:
+            upload_library(
+                library,
+                access_token=token,
+                request=fake.request,
+                sessions_path=tmp_path / "sessions.json",
+            )
+        _assert_user_message(caught.value, OFFLINE_MESSAGE, ("nodename", "URLError"))
+        assert "sign in" not in str(caught.value).lower()
+        assert fake.calls == []
+        assert (library / "2024/a.jpg").read_bytes() == b"aaaa"
+
+    @pytest.mark.parametrize("status", [502, 503, 504])
+    def test_unreachable_google_statuses_read_as_offline(self, tmp_path, status):
+        library = tmp_path / "library"
+        _bind(library)
+        _write(library, "2024/a.jpg", b"aaaa")
+        fake = FakeDrive()
+        fake.fail = lambda _call: _response(status, {}, b"Bad Gateway")
+        with pytest.raises(DriveUploadError) as caught:
+            _run(library, fake, tmp_path / "sessions.json")
+        _assert_user_message(caught.value, OFFLINE_MESSAGE, (str(status), "Bad Gateway"))
+        assert load_sync_record(library).entry_for("2024/a.jpg") is None
+
+    @pytest.mark.parametrize("response", [
+        _response(
+            500,
+            {"Content-Type": "text/html"},
+            b"Traceback (most recent call last):\nHTTP 500 Internal Server Error",
+        ),
+        _json_error(403, {
+            "error": {
+                "errors": [{
+                    "reason": "userRateLimitExceeded",
+                    "message": "User rate limit exceeded.",
+                }],
+                "code": 403,
+                "message": "User rate limit exceeded.",
+            }
+        }),
+    ])
+    def test_other_failures_stay_readable_and_stop(self, tmp_path, response):
+        library = tmp_path / "library"
+        _bind(library)
+        _write(library, "2024/a.jpg", b"aaaa")
+        _write(library, "2024/b.jpg", b"bbbb")
+        fake = FakeDrive()
+        fake.fail = lambda _call: response
+        with pytest.raises(DriveUploadError) as caught:
+            _run(library, fake, tmp_path / "sessions.json")
+        _assert_user_message(
+            caught.value,
+            "Google Drive did not accept the upload. Try again.",
+            ("500", "403", "Traceback", "Internal", "userRateLimitExceeded", "rate"),
+        )
+        assert str(caught.value) == GENERIC_UPLOAD_MESSAGE
+        assert "full" not in str(caught.value).lower()
+        saved = load_sync_record(library)
+        assert saved.entry_for("2024/a.jpg") is None
+        assert saved.entry_for("2024/b.jpg") is None
+        assert "b.jpg" not in _names_in_calls(fake)
+        assert (library / "2024/a.jpg").read_bytes() == b"aaaa"
+        assert (library / "2024/b.jpg").read_bytes() == b"bbbb"
+        assert not any(_is_remote_delete(call) for call in fake.calls)

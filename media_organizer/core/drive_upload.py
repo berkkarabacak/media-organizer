@@ -15,14 +15,23 @@ has one. A finished file is recorded only after Drive returns a file id,
 and the record is saved before the next file starts. Cancel stops before
 the next file and leaves the in-flight session in place so that file can
 continue later. Nothing is deleted on Drive or on disk.
+
+A hard failure also stops the pass. Storage full, an expired or revoked
+sign-in, and a lost connection each raise ``DriveUploadError`` with a
+short message. The HTTP status and the raw response are not part of that
+message. Files already recorded stay skippable. A session that was already
+opened stays, so that file can continue later.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import mimetypes
 import os
 import re
+import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -65,6 +74,84 @@ _TOKEN_KEYS = frozenset({
     "secret",
 })
 _RANGE_RE = re.compile(r"(\d+)-(\d+)")
+
+# Shown in the Drive dialog. No HTTP status, response body, or stack trace.
+QUOTA_MESSAGE = "Google Drive is full. Free some space, then try the upload again."
+AUTH_MESSAGE = (
+    "Sign in to Google Drive again. The previous sign-in expired or was revoked."
+)
+OFFLINE_MESSAGE = (
+    "This computer cannot reach Google Drive. "
+    "Check the internet connection, then try again."
+)
+GENERIC_UPLOAD_MESSAGE = "Google Drive did not accept the upload. Try again."
+
+_QUOTA_REASONS = frozenset({
+    "storagequotaexceeded",
+    "quotaexceeded",
+})
+_AUTH_REASONS = frozenset({
+    "autherror",
+    "invalidcredentials",
+    "unauthorized",
+    "unauthenticated",
+    "invalid_token",
+    "invalid_grant",
+})
+_RATE_REASONS = frozenset({
+    "ratelimitexceeded",
+    "userratelimitexceeded",
+    "dailylimitexceeded",
+    "sharingratelimitexceeded",
+})
+_QUOTA_PHRASES = (
+    "storage quota",
+    "storagequotaexceeded",
+    "insufficient storage",
+)
+_AUTH_PHRASES = (
+    "invalid authentication",
+    "invalid credentials",
+    "autherror",
+    "invalid_token",
+    "invalid_grant",
+    "unauthenticated",
+)
+_AUTH_CALLER_PHRASES = (
+    "sign in to google drive again",
+    "expired",
+    "revoked",
+    "invalid_grant",
+    "invalid_token",
+    "unauthorized",
+    "unauthenticated",
+    "did not accept the sign-in",
+    "invalid credentials",
+)
+_OFFLINE_CALLER_PHRASES = (
+    "could not reach",
+    "internet connection",
+    "network is unreachable",
+    "name or service not known",
+)
+_OFFLINE_STATUSES = frozenset({408, 502, 503, 504})
+_REASON_KEYS = frozenset({"reason", "status", "error"})
+_OFFLINE_ERRNOS = frozenset(
+    code for code in (
+        errno.ENETDOWN,
+        errno.ENETUNREACH,
+        errno.ENETRESET,
+        errno.ECONNABORTED,
+        errno.ECONNRESET,
+        errno.ECONNREFUSED,
+        errno.EHOSTDOWN,
+        errno.EHOSTUNREACH,
+        errno.ETIMEDOUT,
+        errno.ENOTCONN,
+        getattr(errno, "ENONET", None),
+    )
+    if isinstance(code, int)
+)
 
 
 class DriveUploadError(Exception):
@@ -166,7 +253,11 @@ def default_drive_request(
         payload = exc.read() if exc.fp is not None else b""
         return DriveResponse(int(exc.code), _header_map(exc.headers), payload)
     except urllib.error.URLError as exc:
-        raise DriveUploadError("Could not reach Google Drive.") from exc
+        raise DriveUploadError(OFFLINE_MESSAGE) from exc
+    except OSError as exc:
+        if _is_offline_exception(exc):
+            raise DriveUploadError(OFFLINE_MESSAGE) from exc
+        raise DriveUploadError(GENERIC_UPLOAD_MESSAGE) from exc
 
 
 class UploadSessionStore:
@@ -265,6 +356,10 @@ def upload_library(
     token string or a callable that returns one (used so a long run can
     refresh). ``request`` defaults to urllib and is injected by tests.
     Nothing is deleted on Drive or on disk.
+
+    ``DriveUploadError`` stops the pass. Files already saved stay skippable.
+    The in-flight session is left in place. Later files in this pass are
+    not started.
     """
     library = Path(library_dir)
     if not library.is_dir():
@@ -583,7 +678,7 @@ def _query_session(drive: "_Drive", resume_uri: str, size: int):
     if response.status in (404, 410):
         raise _SessionExpired()
     _raise_for_status(response)
-    raise DriveUploadError("Google Drive did not accept the upload.")
+    raise DriveUploadError(GENERIC_UPLOAD_MESSAGE)
 
 
 def _send_file(
@@ -646,7 +741,7 @@ def _send_file(
             if response.status in (404, 410):
                 raise _SessionExpired()
             _raise_for_status(response)
-            raise DriveUploadError("Google Drive did not accept the upload.")
+            raise DriveUploadError(GENERIC_UPLOAD_MESSAGE)
     raise DriveUploadError("The upload did not finish.")
 
 
@@ -669,25 +764,155 @@ class _Drive:
             response = self._request(method, url, sent, body, self._timeout)
         except DriveUploadError:
             raise
+        except AssertionError:
+            raise
         except Exception as exc:
-            raise DriveUploadError("Could not reach Google Drive.") from exc
+            raise DriveUploadError(_message_for_caller_failure(exc)) from exc
         if not isinstance(response, DriveResponse):
             raise DriveUploadError("Google Drive returned something this app could not read.")
         return response
 
     def _token(self) -> str:
-        value = self._access_token() if callable(self._access_token) else self._access_token
+        try:
+            value = self._access_token() if callable(self._access_token) else self._access_token
+        except DriveUploadError:
+            raise
+        except AssertionError:
+            raise
+        except Exception as exc:
+            raise DriveUploadError(_message_for_caller_failure(exc)) from exc
         if not isinstance(value, str) or not value or any(ch.isspace() for ch in value):
             raise DriveUploadError("Sign in to Google Drive first.")
         return value
 
 
 def _raise_for_status(response: DriveResponse) -> None:
-    if response.status == 401:
-        raise DriveUploadError("Sign in to Google Drive again.")
     if response.status in (200, 201):
         return
-    raise DriveUploadError("Google Drive did not accept the upload.")
+    raise DriveUploadError(_drive_failure_message(response))
+
+
+def _drive_failure_message(response: DriveResponse) -> str:
+    """Plain message for one failed Drive response. The body is not included."""
+    kind = _failure_kind(response)
+    if kind == "quota":
+        return QUOTA_MESSAGE
+    if kind == "auth":
+        return AUTH_MESSAGE
+    if kind == "offline":
+        return OFFLINE_MESSAGE
+    return GENERIC_UPLOAD_MESSAGE
+
+
+def _failure_kind(response: DriveResponse) -> str:
+    status = response.status
+    reasons = _error_tokens(response.body)
+    text = _body_text(response.body)
+    if status == 401 or (reasons & _AUTH_REASONS and not (reasons & _QUOTA_REASONS)):
+        return "auth"
+    if reasons & _RATE_REASONS and not (reasons & _QUOTA_REASONS):
+        return "generic"
+    if status == 507 or reasons & _QUOTA_REASONS or _contains_any(text, _QUOTA_PHRASES):
+        return "quota"
+    if _contains_any(text, _AUTH_PHRASES):
+        return "auth"
+    if status <= 0 or status in _OFFLINE_STATUSES:
+        return "offline"
+    return "generic"
+
+
+def _message_for_caller_failure(exc: BaseException) -> str:
+    """Map a raised network or auth failure. The exception text is not shown."""
+    if _is_offline_exception(exc):
+        return OFFLINE_MESSAGE
+    lowered = str(exc).lower()
+    if any(phrase in lowered for phrase in _OFFLINE_CALLER_PHRASES):
+        return OFFLINE_MESSAGE
+    leaked = any(mark in lowered for mark in ("access_token", "refresh_token", "client_secret", "bearer "))
+    if any(phrase in lowered for phrase in _AUTH_CALLER_PHRASES):
+        return AUTH_MESSAGE
+    if leaked:
+        return GENERIC_UPLOAD_MESSAGE
+    from .google_auth import GoogleAuthError
+
+    if isinstance(exc, GoogleAuthError):
+        text = str(exc).strip()
+        if text and "traceback" not in text.lower() and not any(ch.isdigit() for ch in text):
+            return text
+    return GENERIC_UPLOAD_MESSAGE
+
+
+def _is_offline_exception(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if _offline_type(current):
+            return True
+        current = current.__cause__
+    return False
+
+
+def _offline_type(exc: BaseException) -> bool:
+    if isinstance(exc, urllib.error.HTTPError):
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError, socket.gaierror, ssl.SSLError)):
+        return True
+    if isinstance(exc, urllib.error.URLError):
+        return True
+    if isinstance(exc, OSError) and exc.errno in _OFFLINE_ERRNOS:
+        return True
+    return False
+
+
+def _error_tokens(body: bytes) -> set[str]:
+    found: set[str] = set()
+    data = _parse_error_json(body)
+    if data is not None:
+        _collect_tokens(data, found)
+        return found
+    compact = _body_text(body).replace(" ", "")
+    for token in _QUOTA_REASONS | _AUTH_REASONS | _RATE_REASONS:
+        if token in compact:
+            found.add(token)
+    return found
+
+
+def _parse_error_json(body: bytes):
+    if not body:
+        return None
+    try:
+        data = json.loads(body[:8192].decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError):
+        return None
+    return data
+
+
+def _collect_tokens(value, found: set[str]) -> None:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if str(key).lower() in _REASON_KEYS and isinstance(child, str):
+                token = _norm_token(child)
+                if token:
+                    found.add(token)
+            _collect_tokens(child, found)
+    elif isinstance(value, list):
+        for child in value:
+            _collect_tokens(child, found)
+
+
+def _norm_token(value: str) -> str:
+    return "".join(ch for ch in value.strip().lower() if ch.isalnum() or ch == "_")
+
+
+def _body_text(body: bytes) -> str:
+    if not body:
+        return ""
+    return body[:8192].decode("utf-8", errors="ignore").lower()
+
+
+def _contains_any(text: str, phrases: tuple[str, ...]) -> bool:
+    return any(phrase in text for phrase in phrases)
 
 
 def _json_object(response: DriveResponse) -> dict:

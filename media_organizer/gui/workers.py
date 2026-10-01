@@ -151,7 +151,9 @@ class DriveUploadWorker(QThread):
     ``progress`` carries an ``UploadProgress``. Byte counts stay Python ints
     so a large library cannot overflow Qt's 32-bit int. ``cancel`` is
     cooperative: the upload stops before the next file and leaves the
-    in-flight resumable session stored beside the OAuth token.
+    in-flight resumable session stored beside the OAuth token. A hard
+    failure stops the pass and ``failed`` carries a short message, not a
+    traceback or an HTTP status.
     """
 
     progress = Signal(object)

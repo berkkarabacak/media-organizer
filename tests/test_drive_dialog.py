@@ -1,6 +1,7 @@
 """Drive sign-in dialog. Offscreen, with a fake session and no network."""
 
 import hashlib
+import json
 import os
 import time
 
@@ -12,7 +13,7 @@ from PySide6.QtWidgets import QApplication, QDialog
 
 from media_organizer.core.drive_folders import DriveFolder
 from media_organizer.core.drive_sync import SyncRecord, load_sync_record, save_sync_record
-from media_organizer.core.drive_upload import UploadProgress, UploadResult
+from media_organizer.core.drive_upload import DriveResponse, UploadProgress, UploadResult, upload_library
 from media_organizer.core.google_auth import GoogleAccount
 from media_organizer.gui.drive_dialog import (
     REPLACE_FOLDER_TEXT,
@@ -289,6 +290,59 @@ def test_upload_progress_shows_unchanged_and_sent(qapp, tmp_path):
     finished = dialog.status_label.text()
     assert "2 sent (16 B)" in finished
     assert "2 unchanged" in finished
+    dialog.close()
+    dialog.deleteLater()
+    qapp.processEvents()
+
+
+def test_upload_failure_shows_a_plain_message(qapp, tmp_path, monkeypatch):
+    record = SyncRecord()
+    record.bind_folder("folder-a")
+    save_sync_record(record, tmp_path)
+    (tmp_path / "2024").mkdir()
+    (tmp_path / "2024" / "a.jpg").write_bytes(b"abcd")
+    warnings = []
+
+    def _warning(*args, **kwargs):
+        warnings.append(args)
+
+    monkeypatch.setattr("media_organizer.gui.drive_dialog.QMessageBox.warning", _warning)
+
+    def request(method, url, headers, body, timeout=None):
+        payload = json.dumps({
+            "error": {
+                "errors": [{
+                    "reason": "storageQuotaExceeded",
+                    "message": "The user's Drive storage quota has been exceeded.",
+                }],
+                "code": 403,
+                "message": "The user's Drive storage quota has been exceeded.",
+            }
+        }).encode("utf-8")
+        return DriveResponse(403, {"content-type": "application/json"}, payload)
+
+    def uploader(library_dir, *, access_token, progress=None, cancel=None, **kwargs):
+        return upload_library(
+            library_dir,
+            access_token=access_token,
+            request=request,
+            progress=progress,
+            cancel=cancel,
+            sessions_path=tmp_path / "sessions.json",
+        )
+
+    session = FakeSession()
+    session.account = GoogleAccount(email="ada@example.com", display_name="Ada")
+    dialog = DriveAccountDialog(str(tmp_path), session=session, uploader=uploader)
+    dialog.show()
+    dialog.upload_btn.click()
+    expected = "Google Drive is full. Free some space, then try the upload again."
+    _wait_until(lambda: dialog.status_label.text() == expected and dialog.upload_btn.text() == "Upload")
+    assert warnings
+    assert any(expected in args for args in warnings)
+    assert "403" not in dialog.status_label.text()
+    assert "storageQuotaExceeded" not in dialog.status_label.text()
+    assert (tmp_path / "2024" / "a.jpg").read_bytes() == b"abcd"
     dialog.close()
     dialog.deleteLater()
     qapp.processEvents()

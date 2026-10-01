@@ -493,8 +493,9 @@ class DriveAccountDialog(QDialog):
     def _on_upload_failed(self, message: str):
         self._uploading = False
         self._refresh_controls()
-        self.status_label.setText("Upload did not finish. You can try again.")
-        QMessageBox.warning(self, APP_NAME, message)
+        text = (message or "").strip() or "Upload did not finish. Try again."
+        self.status_label.setText(text)
+        QMessageBox.warning(self, APP_NAME, text)
 
     def _refresh_view(self):
         account = None
