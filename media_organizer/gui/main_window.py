@@ -1289,12 +1289,21 @@ class MainWindow(QMainWindow):
                         # unlinks a journaled cross-volume move whose
                         # destination still matches, saves the log, and
                         # marks the journal complete. File → Undo reads
-                        # that log.
+                        # that log. The in-memory plan is then dropped the
+                        # same way a finished run drops it. Leaving it
+                        # armed runs those destinations again; they still
+                        # match, so the new log is identical copies, and
+                        # Undo deletes them.
                         execute_plan(active, options)
+                        self._disarm_finished_plan()
+                        self.status_label.setText(
+                            "Everything was already organized — nothing left "
+                            "to resume.")
                         QMessageBox.information(
                             self, APP_NAME,
                             "Everything was already organized — nothing left "
-                            "to resume.")
+                            "to resume.\n\n"
+                            "File → Undo can still undo that completed run.")
                         return
                 else:
                     discard_after_preflight = True
@@ -1368,6 +1377,16 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             f"Organizing {min(i + 1, total):,} of {total:,}{current}")
 
+    def _disarm_finished_plan(self) -> None:
+        """Drop the plan after a run that must not be started again.
+
+        A normal finish and an empty Resume both end here. Organize stays
+        off until the next scan builds a new plan. The preview table is
+        left as it was: a finished run does not rebuild it either.
+        """
+        self.plan = []
+        self.organize_btn.setEnabled(False)
+
     def _on_run_finished(self, log, summary: dict):
         # finished_run is emitted from run() before the thread leaves
         # isRunning(). Join first so Done-dialog Undo is not treated as
@@ -1376,8 +1395,7 @@ class MainWindow(QMainWindow):
         QApplication.restoreOverrideCursor()
         self._set_busy(False)
         self._hide_progress_panel()
-        self.plan = []
-        self.organize_btn.setEnabled(False)
+        self._disarm_finished_plan()
         dest_dir = self.dest_card.edit.text().strip()
         self._last_run = (log, dest_dir, summary)
 

@@ -28,7 +28,7 @@ from media_organizer.core.journal import (
 )
 from media_organizer.core.metadata import CaptureDate, Confidence, DateSource
 from media_organizer.core.organizer import OrganizeOptions, PlannedFile, build_plan
-from media_organizer.core.plan import load_log, undo_log
+from media_organizer.core.plan import list_run_logs, load_log, undo_log
 from tests.helpers import make_jpeg_with_exif
 
 
@@ -627,3 +627,88 @@ class TestResumePreflight:
         _wait(window, qapp)
         assert photo.is_file()
         assert not (dst / "a.jpg").exists()
+
+    @pytest.mark.parametrize("copy_mode", [True, False])
+    def test_empty_resume_disarms_plan_and_a_second_organize_keeps_the_library(
+            self, qapp, window, tmp_path, monkeypatch, copy_mode):
+        """Empty Resume must leave Organize off, in Copy mode and Move mode.
+
+        Every source is already journaled. Resume seeds the undo log and,
+        for a move, unlinks the source. The plan is then cleared and
+        Organize is disabled, the same post-state as ``_on_run_finished``.
+        A second Organize used to re-journal destinations that still
+        match. Undo of that new log deleted the organized copies.
+        """
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        when = datetime(2024, 7, 15, 10, 0, 0)
+        photo = make_jpeg_with_exif(src / "done.jpg", when)
+        payload = photo.read_bytes()
+        plan = build_plan(OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=copy_mode))
+        assert len(plan) == 1
+        final = plan[0].destination
+        final.parent.mkdir(parents=True, exist_ok=True)
+        atomic_copy(photo, final)
+        action = "copy" if copy_mode else "move"
+        with JournalWriter(dst) as writer:
+            writer.record(action, str(photo), str(final))
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
+        seen = _install_space(monkeypatch, free=1_000_000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(copy_mode)
+        window.move_radio.setChecked(not copy_mode)
+        window._refresh_table()
+        window.organize_btn.setEnabled(True)
+
+        window.start_organize()
+
+        assert seen == []
+        if copy_mode:
+            assert "Resume" in _texts(events, "question")[0]
+        else:
+            assert events[0][1].startswith("Move mode removes")
+            assert "Resume" in events[1][1]
+        note = _texts(events, "information")[0]
+        assert "already organized" in note
+        assert "Undo" in note
+        assert "completed run" in note
+        assert find_unfinished_journal(dst) is None
+        assert window.org_worker is None
+        assert window.plan == []
+        assert window._active_plan() == []
+        assert window.organize_btn.isEnabled() is False
+        assert "already organized" in window.status_label.text()
+        if copy_mode:
+            assert photo.read_bytes() == payload
+        else:
+            assert not photo.exists()
+        assert final.read_bytes() == payload
+        seeded = load_log(dst)
+        assert seeded is not None and seeded.undone is False
+        done_ops = [op for op in seeded.operations if op.status == "done"]
+        assert [path_identity(op.source) for op in done_ops] == [
+            path_identity(photo)]
+        assert done_ops[0].action == action
+        seeded_id = seeded.run_id
+
+        events.clear()
+        window.start_organize()
+        _wait(window, qapp)
+
+        assert window.org_worker is None
+        assert window.plan == []
+        assert window.organize_btn.isEnabled() is False
+        assert _texts(events, "information") == []
+        assert _texts(events, "question") == []
+        assert final.is_file() and final.read_bytes() == payload
+        if copy_mode:
+            assert photo.is_file() and photo.read_bytes() == payload
+        else:
+            assert not photo.exists()
+        logs = list_run_logs(dst)
+        assert [item.run_id for item in logs] == [seeded_id]
+        assert all(not item.undone for item in logs)
+        assert not list(dst.rglob("*_1*"))
