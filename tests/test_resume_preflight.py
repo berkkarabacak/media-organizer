@@ -24,10 +24,11 @@ from media_organizer.core.display import format_bytes
 from media_organizer.core.executor import bytes_still_needed, free_space_status
 from media_organizer.core.journal import (
     JournalWriter, atomic_copy, completed_sources, exclude_completed_sources,
-    find_unfinished_journal,
+    find_unfinished_journal, path_identity,
 )
 from media_organizer.core.metadata import CaptureDate, Confidence, DateSource
 from media_organizer.core.organizer import OrganizeOptions, PlannedFile, build_plan
+from media_organizer.core.plan import load_log, undo_log
 from tests.helpers import make_jpeg_with_exif
 
 
@@ -251,21 +252,16 @@ class TestResumePreflight:
         dst.mkdir()
         capture = _capture()
         done = src / "done.jpg"
-        plan = [PlannedFile(done, dst / "done.jpg", 10**15, capture, "image")]
+        final = dst / "done.jpg"
+        payload = b"already-copied"
+        done.write_bytes(payload)
+        final.write_bytes(payload)
+        plan = [PlannedFile(done, final, 10**15, capture, "image")]
         with JournalWriter(dst) as writer:
-            writer.record("copy", str(done), str(dst / "done.jpg"))
+            writer.record("copy", str(done), str(final))
 
         events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
         seen = _install_space(monkeypatch, free=1000)
-        discarded = []
-        from media_organizer.gui import main_window as mw
-        real_discard = mw.discard_journal
-
-        def spy(dest):
-            discarded.append(dest)
-            return real_discard(dest)
-
-        monkeypatch.setattr(mw, "discard_journal", spy)
         _arm(window, src, dst, plan)
         window.start_organize()
 
@@ -273,9 +269,20 @@ class TestResumePreflight:
         assert _texts(events, "critical") == []
         assert events[0][0] == "question"
         assert "already organized" in _texts(events, "information")[0]
-        assert discarded
         assert find_unfinished_journal(dst) is None
         assert window.org_worker is None
+        log = load_log(dst)
+        assert log is not None
+        done_ops = [op for op in log.operations if op.status == "done"]
+        assert [path_identity(op.source) for op in done_ops] == [
+            path_identity(done)]
+        assert done_ops[0].action == "copy"
+        result = undo_log(log, dst)
+        assert result["undone"] == 1
+        assert result["failed"] == 0
+        assert done.read_bytes() == payload
+        assert not final.exists()
+        assert find_unfinished_journal(dst) is None
 
     def test_discard_blocks_on_the_plan_that_would_run(
             self, qapp, window, tmp_path, monkeypatch):
@@ -582,6 +589,18 @@ class TestResumePreflight:
         assert not list(dst.rglob("*_1*"))
         assert find_unfinished_journal(dst) is None
         assert window.org_worker is None
+        log = load_log(dst)
+        assert log is not None
+        done_ops = [op for op in log.operations if op.status == "done"]
+        assert [path_identity(op.source) for op in done_ops] == [
+            path_identity(photo)]
+        assert done_ops[0].action == "move"
+        result = undo_log(log, dst)
+        assert result["undone"] == 1
+        assert result["failed"] == 0
+        assert photo.read_bytes() == payload
+        assert not final.exists()
+        assert find_unfinished_journal(dst) is None
 
     def test_dry_run_move_skips_free_space_and_the_move_question(
             self, qapp, window, tmp_path, monkeypatch):

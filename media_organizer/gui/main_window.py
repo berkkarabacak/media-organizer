@@ -27,7 +27,7 @@ from ..core.display import (elide_middle, finished_run_lines, format_bytes,
                             relative_destination, relative_destination_fast,
                             sorted_plan_items)
 from ..core.eta import ThroughputEstimator, format_eta, format_rate
-from ..core.executor import (bytes_still_needed, finish_pending_move_unlinks,
+from ..core.executor import (bytes_still_needed, execute_plan,
                             free_space_status)
 from ..core.journal import (completed_sources, discard_journal,
                             exclude_completed_sources,
@@ -1283,18 +1283,17 @@ class MainWindow(QMainWindow):
                 if answer == QMessageBox.Yes:
                     active = exclude_completed_sources(active, done_before)
                     if not active:
-                        # The plan is empty, so execute_plan will not run.
-                        # A cross-volume move can still be waiting on
-                        # source.unlink() after its done line. Finish that
-                        # before the journal is discarded.
-                        if not options.copy_mode:
-                            finish_pending_move_unlinks(
-                                options.dest_dir, active, copy_mode=False)
+                        # The worker is not started. execute_plan([]) still
+                        # seeds the operation log from the open journal,
+                        # unlinks a journaled cross-volume move whose
+                        # destination still matches, saves the log, and
+                        # marks the journal complete. File → Undo reads
+                        # that log.
+                        execute_plan(active, options)
                         QMessageBox.information(
                             self, APP_NAME,
                             "Everything was already organized — nothing left "
                             "to resume.")
-                        discard_journal(options.dest_dir)
                         return
                 else:
                     discard_after_preflight = True
