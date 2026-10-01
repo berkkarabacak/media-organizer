@@ -444,6 +444,38 @@ def _discard_journal_if_restored(dest_dir: Path, sources: list[str]) -> None:
         discard_journal(dest_dir)
 
 
+def _log_records_written_bytes(log: RunLog) -> bool:
+    """True when a done operation recorded the bytes that were written.
+
+    A dry run marks operations ``done`` and leaves ``size`` at -1 and
+    ``sha256`` empty. It does not call ``save_log``. A real run records a
+    size or a hash, and an older saved log may omit both but is already
+    on disk.
+    """
+    return any(
+        op.status == "done" and (op.size >= 0 or bool(op.sha256))
+        for op in log.operations
+    )
+
+
+def _unsaved_log_undo_result(dest_dir: Path, log: RunLog) -> dict:
+    """Result when an unsaved dry-run log must not be reversed.
+
+    Undoing that log can delete a matching copy or relocate a destination
+    that was already there, then ``save_log`` would store a run that never
+    wrote files. Leave the files, the journal, and the undo stack alone.
+    """
+    remaining = sum(1 for item in list_run_logs(dest_dir) if not item.undone)
+    return {
+        "undone": 0,
+        "skipped": len(log.operations),
+        "failed": 0,
+        "kept": 0,
+        "remaining": remaining,
+        "closed": False,
+    }
+
+
 def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
     """Undo every successful operation in the log. Returns a summary dict.
 
@@ -452,6 +484,12 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
     or a file the user has since replaced. On Windows that removal goes to
     the Recycle Bin. A moved file is moved back only when it is still the
     file this run wrote.
+
+    An unsaved log that never recorded a size or sha256 is not reversible
+    work. That is a dry run: nothing is deleted or moved, and no operation
+    log is written. A saved log is undone even when an older version left
+    size and sha256 empty. An unsaved log that did record a size or hash
+    is still undone.
 
     ``kept`` counts files left in place on purpose. Those operations are
     marked ``kept`` so a later undo does not treat them as work still to
@@ -471,6 +509,11 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
     # Resolve the file before statuses change. A legacy log's identity
     # includes operation status, so a later lookup would miss it.
     saved_path = _find_saved_path(log, dest_dir)
+    # Dry runs are not saved, and their done rows have no size or hash.
+    # Reversing one deletes or relocates a destination that already
+    # matched, then save_log publishes a run that never wrote files.
+    if saved_path is None and not _log_records_written_bytes(log):
+        return _unsaved_log_undo_result(dest_dir, log)
     undone = skipped = failed = kept = 0
     restored: list[str] = []
     # Reverse order so suffix chains unwind cleanly

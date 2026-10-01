@@ -369,7 +369,10 @@ def execute_plan(
                     final = _final_destination(item.destination)
                 op.destination = str(final)
                 if dry_run:
-                    # simulate: no filesystem writes at all
+                    # Simulate: no filesystem writes at all. Leave size and
+                    # sha256 unset. Undo refuses an unsaved log whose done
+                    # rows look like this, so it cannot delete a file the
+                    # dry run did not write.
                     op.status = "done"
                     summary["copied" if options.copy_mode else "moved"] += 1
                     bytes_done += item.size

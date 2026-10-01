@@ -20,7 +20,9 @@ from types import SimpleNamespace
 import pytest
 
 from media_organizer.core.executor import execute_plan
-from media_organizer.core.journal import PART_SUFFIX, cleanup_stale_parts
+from media_organizer.core.journal import (
+    PART_SUFFIX, JournalWriter, cleanup_stale_parts, find_unfinished_journal,
+)
 from media_organizer.core.metadata import (
     QT_EPOCH_OFFSET, DateSource, extract_capture_date,
 )
@@ -1114,3 +1116,125 @@ class TestWindowsJunctions:
             assert count_media_files(options) == len(found)
         finally:
             monkeypatch.undo()
+
+
+class TestDryRunUndoDoesNotTouchFiles:
+    def test_copy_undo_does_not_delete_a_matching_destination(self, tmp_path):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        photo = make_jpeg_with_exif(
+            src / "IMG_1.jpg", datetime(2024, 7, 15, 10, 30, 0))
+        options = OrganizeOptions(source_dir=src, dest_dir=dst)
+        plan = build_plan(options)
+        real_log, _summary = execute_plan(plan, options)
+        copied = plan[0].destination
+        payload = copied.read_bytes()
+        saved = log_path_for(dst).read_bytes()
+        history = dst / ".media_organizer" / "history"
+        assert not history.exists()
+        assert real_log.run_id
+
+        dry = OrganizeOptions(source_dir=src, dest_dir=dst, dry_run=True)
+        log, summary = execute_plan(plan, dry)
+        assert summary["dry_run"] is True
+        assert summary["copied"] == 1
+        op = log.operations[0]
+        assert op.status == "done"
+        assert op.action == "copy"
+        assert op.size == -1
+        assert op.sha256 == ""
+        assert op.destination == str(copied)
+        assert load_log(dst).run_id == real_log.run_id
+
+        result = undo_log(log, dst)
+
+        assert result["undone"] == 0
+        assert result["failed"] == 0
+        assert result["closed"] is False
+        assert copied.is_file()
+        assert copied.read_bytes() == payload
+        assert photo.read_bytes() == payload
+        assert log.undone is False
+        assert log.operations[0].status == "done"
+        assert log_path_for(dst).read_bytes() == saved
+        assert not history.exists()
+        assert list_run_logs(dst)[0].run_id == real_log.run_id
+        assert list_run_logs(dst)[0].undone is False
+
+        real = undo_log(load_log(dst), dst)
+        assert real["undone"] == 1
+        assert not copied.exists()
+        assert photo.is_file()
+
+    def test_move_undo_does_not_relocate_a_matching_destination(self, tmp_path):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        photo = make_jpeg_with_exif(
+            src / "IMG_1.jpg", datetime(2024, 7, 15, 10, 30, 0))
+        options = OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = build_plan(options)
+        dest = plan[0].destination
+        dest.parent.mkdir(parents=True)
+        payload = photo.read_bytes()
+        dest.write_bytes(payload)
+
+        dry = OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=False, dry_run=True)
+        log, summary = execute_plan(plan, dry)
+        assert summary["dry_run"] is True
+        assert summary["moved"] == 1
+        op = log.operations[0]
+        assert op.action == "move"
+        assert op.status == "done"
+        assert op.size == -1
+        assert op.sha256 == ""
+        assert op.destination == str(dest)
+
+        result = undo_log(log, dst)
+
+        assert result["undone"] == 0
+        assert result["closed"] is False
+        assert dest.is_file()
+        assert dest.read_bytes() == payload
+        assert photo.is_file()
+        assert photo.read_bytes() == payload
+        assert not any(src.rglob("*restored*"))
+        assert not any(dst.rglob("*restored*"))
+        assert load_log(dst) is None
+        assert not log_path_for(dst).exists()
+
+    def test_undo_does_not_write_a_log_or_drop_an_open_journal(self, tmp_path):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        photo = make_jpeg_with_exif(
+            src / "IMG_1.jpg", datetime(2024, 7, 15, 10, 30, 0))
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, dry_run=True)
+        plan = build_plan(options)
+        dest = plan[0].destination
+        dest.parent.mkdir(parents=True)
+        payload = photo.read_bytes()
+        dest.write_bytes(payload)
+        with JournalWriter(dst) as writer:
+            writer.record("copy", str(photo), str(dest))
+        assert find_unfinished_journal(dst) is not None
+
+        rescanned = build_plan(options)
+        assert rescanned[0].destination == dest
+        log, summary = execute_plan(rescanned, options)
+        assert summary["dry_run"] is True
+        assert log.operations[0].destination == str(dest)
+        assert log.operations[0].size == -1
+
+        result = undo_log(log, dst)
+
+        assert result["undone"] == 0
+        assert result["closed"] is False
+        assert dest.read_bytes() == payload
+        assert photo.read_bytes() == payload
+        assert find_unfinished_journal(dst) is not None
+        assert load_log(dst) is None
+        assert not log_path_for(dst).exists()

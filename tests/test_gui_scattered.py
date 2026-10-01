@@ -15,10 +15,14 @@ import pytest
 from PySide6.QtCore import QSettings, Qt
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QTableWidgetItem
 
-from media_organizer.core.metadata import CaptureDate, Confidence, DateSource
-from media_organizer.core.organizer import PlannedFile
 from media_organizer.core.display import finished_run_lines
-from media_organizer.core.plan import UNDO_STACK_LIMIT, Operation, RunLog
+from media_organizer.core.executor import execute_plan
+from media_organizer.core.metadata import CaptureDate, Confidence, DateSource
+from media_organizer.core.organizer import OrganizeOptions, PlannedFile, build_plan
+from media_organizer.core.plan import (
+    UNDO_STACK_LIMIT, Operation, RunLog, load_log, log_path_for,
+)
+from tests.helpers import make_jpeg_with_exif
 
 
 @pytest.fixture(scope="session")
@@ -42,6 +46,10 @@ def window(qapp, tmp_path):
 
 def _labels(window) -> str:
     return "\n".join(lbl.text() for lbl in window.findChildren(QLabel))
+
+
+def _button_labels(box) -> list[str]:
+    return [button.text().replace("&", "") for button in box.buttons()]
 
 
 def _wait_scan(window, qapp):
@@ -147,6 +155,7 @@ class TestMoveAndUncertainWording:
         def fake_exec(self):
             captured["text"] = self.text()
             captured["status"] = window.status_label.text()
+            captured["buttons"] = _button_labels(self)
             return None
 
         monkeypatch.setattr(QMessageBox, "exec", fake_exec)
@@ -177,6 +186,8 @@ class TestMoveAndUncertainWording:
         assert "would move" in status
         assert "_uncertain" in captured["text"]
         assert "_undated" not in captured["text"]
+        assert "Open folder" in captured["buttons"]
+        assert "Undo" not in captured["buttons"]
 
 
 class TestUndoLimitationIsVisible:
@@ -199,6 +210,7 @@ class TestUndoLimitationIsVisible:
 
         def fake_exec(self):
             captured["text"] = self.text()
+            captured["buttons"] = _button_labels(self)
             return None
 
         monkeypatch.setattr(QMessageBox, "exec", fake_exec)
@@ -228,3 +240,76 @@ class TestUndoLimitationIsVisible:
         assert f"last {UNDO_STACK_LIMIT} organize runs" in plain
         assert "newest first" in text.lower()
         assert "replaces" not in text.lower()
+        assert "Undo" in captured["buttons"]
+        assert "Open folder" in captured["buttons"]
+
+
+def _dry_log_over_existing_copy(tmp_path):
+    """Dry-run log whose destination is a file that is already there.
+
+    The plan is built before that file exists, then the bytes are placed
+    at the planned path. ``execute_plan`` sees a match and records the
+    existing path as done without writing it. That is the log Undo would
+    treat as a copy to delete.
+    """
+    src = tmp_path / "src"
+    dst = tmp_path / "dst"
+    src.mkdir()
+    photo = make_jpeg_with_exif(
+        src / "IMG_1.jpg", datetime(2024, 7, 15, 10, 30, 0))
+    options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=True)
+    plan = build_plan(options)
+    dest = plan[0].destination
+    dest.parent.mkdir(parents=True)
+    payload = photo.read_bytes()
+    dest.write_bytes(payload)
+    dry = OrganizeOptions(
+        source_dir=src, dest_dir=dst, copy_mode=True, dry_run=True)
+    log, summary = execute_plan(plan, dry)
+    return src, dst, photo, dest, payload, log, summary
+
+
+class TestDryRunDoneDoesNotUndo:
+    def test_dialog_and_forced_undo_leave_the_matching_copy(
+            self, qapp, window, tmp_path, monkeypatch):
+        src, dst, photo, dest, payload, log, summary = (
+            _dry_log_over_existing_copy(tmp_path))
+        assert summary["dry_run"] is True
+        assert log.operations[0].size == -1
+        assert log.operations[0].sha256 == ""
+        assert log.operations[0].destination == str(dest)
+        window.dest_card.edit.setText(str(dst))
+        window._last_active_bytes = len(payload)
+        captured = {}
+
+        def fake_exec(self):
+            captured["buttons"] = _button_labels(self)
+            captured["clicked"] = next(
+                (button for button in self.buttons()
+                 if button.text().replace("&", "") == "Undo"),
+                None)
+            return 0
+
+        monkeypatch.setattr(QMessageBox, "exec", fake_exec)
+        monkeypatch.setattr(
+            QMessageBox, "clickedButton",
+            lambda self: captured.get("clicked"))
+        monkeypatch.setattr(
+            QMessageBox, "question", lambda *args, **kwargs: QMessageBox.Yes)
+        monkeypatch.setattr(
+            QMessageBox, "information", lambda *args, **kwargs: QMessageBox.Ok)
+
+        window._on_run_finished(log, summary)
+        # The button is absent, so the dialog cannot choose Undo. Call the
+        # handler anyway: a dry-run log must not delete the file or be saved.
+        window._undo_log(log, dst)
+
+        assert "Open folder" in captured["buttons"]
+        assert "Undo" not in captured["buttons"]
+        assert dest.is_file()
+        assert dest.read_bytes() == payload
+        assert photo.read_bytes() == payload
+        assert not any(src.rglob("*restored*"))
+        assert load_log(dst) is None
+        assert not log_path_for(dst).exists()
+        assert log.undone is False

@@ -1387,14 +1387,19 @@ class MainWindow(QMainWindow):
         box.setText(text)
         open_btn = box.addButton("Open folder", QMessageBox.AcceptRole)
         open_btn.setIcon(icons.icon("external-link", theme.TEXT, 14))
-        undo_btn = box.addButton("Undo", QMessageBox.DestructiveRole)
-        undo_btn.setIcon(icons.icon("undo", theme.TEXT, 14))
+        # A dry run writes nothing and does not save a log. Undo of that
+        # in-memory log can delete or relocate a file that was already in
+        # the destination, then persist a fake operation log.
+        undo_btn = None
+        if not dry:
+            undo_btn = box.addButton("Undo", QMessageBox.DestructiveRole)
+            undo_btn.setIcon(icons.icon("undo", theme.TEXT, 14))
         box.addButton(QMessageBox.Close)
         box.exec()
         clicked = box.clickedButton()
         if clicked is open_btn:
             QDesktopServices.openUrl(QUrl.fromLocalFile(dest_dir))
-        elif clicked is undo_btn:
+        elif undo_btn is not None and clicked is undo_btn:
             self._undo_log(log, dest_dir)
 
     def cancel_work(self):
