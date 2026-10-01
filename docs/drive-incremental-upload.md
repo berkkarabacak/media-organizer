@@ -13,6 +13,13 @@ Slice 2 is sign-in and the folder picker:
 `media_organizer.gui.drive_dialog` (Sign in, Sign out, Choose Drive folder).
 Slice 2 does not upload file bytes and does not create Drive files.
 
+Slice 3 is the first upload. `media_organizer.core.drive_upload` sends the
+organized tree into the bound folder, one file at a time, through Drive's
+resumable upload. `gui/drive_dialog` enables Upload when the user is signed
+in and a folder is bound. Cancel stops before the next file. The in-flight
+session can continue on the next run. This slice does not delete local or
+remote files.
+
 ## Where Drive sits
 
 Organize stays local. Drive is a destination for a library that has already
@@ -177,8 +184,10 @@ The upload slice resumes the in-flight file's bytes on top of that rule:
 
 - Use Drive's resumable upload for the single file in flight.
 - Store the session URI next to the OAuth token, under
-  `%LOCALAPPDATA%\MediaOrganizer\google\`, keyed by the library path and the
-  local path. Do not store it in `drive_sync.json`.
+  `%LOCALAPPDATA%\MediaOrganizer\google\` (or
+  `~/.local/share/MediaOrganizer/google/`), keyed by the library path and the
+  local path. The file is `upload_sessions.json`, beside `token.json`.
+  Do not store it in `drive_sync.json`.
 - On restart, continue that session when the local size and hash are
   unchanged and the session is still valid. Otherwise start a new session.
 - Call `mark_uploaded` only after Drive returns a file id, then save.
@@ -203,10 +212,21 @@ the slice 2 modules named above.
 ```text
 resolve_client_id() -> str
 GoogleSession.sign_in() / sign_out() / signed_in_account()
+GoogleSession.access_token()
 GoogleSession.list_folders() / pick_drive_folder()
 commit_folder_choice(record, folder_id, replace_confirmed=...)
 commit_listed_folder(record, folders, folder_id, replace_confirmed=...)
+upload_library(library_dir, *, access_token, progress=None, cancel=None) -> UploadResult
 ```
+
+`UploadProgress` reports the current library-relative path, files done and
+total, and bytes done and total. `access_token` may be a string or a
+callable that returns one. When `decide` says upload and the entry already
+has a Drive file id, that file is updated. A path with no file id is
+created once. Intermediate folders are created under the bound folder so
+the library-relative path is kept. `mark_uploaded` runs only after Drive
+returns a file id, then `save_sync_record` runs, then the session URI for
+that path is removed.
 
 ## Later slices
 
@@ -214,15 +234,22 @@ commit_listed_folder(record, folders, folder_id, replace_confirmed=...)
 2. Sign in, and let the user pick one Drive folder. Still no upload.
    Done: `google_auth`, `drive_folders`, and `gui/drive_dialog`.
 3. First upload of an organized library, with progress, cancel, and resume.
-4. Incremental pass: skip unchanged files, upload new and changed ones.
+   Done: `drive_upload` and the Upload button in `gui/drive_dialog`.
+   The session URI is `upload_sessions.json` next to the OAuth token.
+   `decide` chooses skip or upload, including when the same library is
+   uploaded again.
+4. Incremental pass polish beyond that skip/upload decision. Not started.
 5. Errors a non-technical user can read (quota, expired sign-in, offline).
+   Not started. A failure still stops the pass and shows a short message.
 6. Docs. The README currently says the app is offline and has no network
    features. Update that sentence in the same release that ships upload.
+   Not started.
 
 ## Out of scope for this version
 
 - Two-way sync.
 - Deleting local files after a successful upload.
 - Replacing the local organize step.
-- The upload itself (later slices). Sign-in and the folder picker are slice 2.
+- Plain-language quota, expired sign-in, and offline errors (slice 5).
+- The README offline sentence (slice 6), in the release that ships upload.
 - A client secret, token, or credential file in the repository.

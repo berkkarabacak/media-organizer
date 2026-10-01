@@ -384,7 +384,7 @@ class MainWindow(QMainWindow):
         help_menu.addAction(about_action)
 
     def open_drive_dialog(self):
-        """Sign in and choose one Drive folder. This does not upload."""
+        """Sign in, choose one Drive folder, or upload the organized library."""
         from .drive_dialog import DriveAccountDialog
         library = self.dest_card.edit.text().strip()
         DriveAccountDialog(library, parent=self).exec()

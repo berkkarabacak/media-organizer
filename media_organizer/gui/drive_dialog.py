@@ -1,4 +1,8 @@
-"""Sign in to Google Drive and choose one folder. Nothing is uploaded."""
+"""Sign in, choose one Drive folder, and upload the organized library.
+
+Upload is one-way and additive. It copies the organized tree into the
+bound folder. It does not delete local files or remote files.
+"""
 
 from __future__ import annotations
 
@@ -18,8 +22,11 @@ from ..core.drive_folders import (
     commit_listed_folder,
     folder_bind_effect,
 )
+from ..core.display import format_bytes
 from ..core.drive_sync import SyncRecordError, load_sync_record, save_sync_record
+from ..core.drive_upload import UploadResult
 from ..core.google_auth import GoogleSession, public_error_message
+from .workers import DriveUploadWorker
 
 REPLACE_FOLDER_TEXT = (
     "This library is already linked to a different Drive folder.\n\n"
@@ -181,14 +188,18 @@ class FolderListDialog(QDialog):
 
 
 class DriveAccountDialog(QDialog):
-    """Sign in, sign out, and link one Drive folder to an organized library."""
+    """Sign in, sign out, choose one Drive folder, and upload the library."""
 
-    def __init__(self, library_dir: str = "", session=None, parent=None):
+    def __init__(self, library_dir: str = "", session=None, parent=None, uploader=None):
         super().__init__(parent)
         self.setWindowTitle("Google Drive")
         self.setMinimumWidth(520)
         self.session = session or GoogleSession()
+        self._uploader = uploader
         self._worker: _CallWorker | None = None
+        self._upload_worker: DriveUploadWorker | None = None
+        self._call_active = False
+        self._uploading = False
         self._settings = QSettings("MediaOrganizer", "MediaOrganizer")
 
         layout = QVBoxLayout(self)
@@ -198,7 +209,9 @@ class DriveAccountDialog(QDialog):
         title = QLabel("Google Drive")
         title.setObjectName("cardQuestion")
         layout.addWidget(title)
-        subtitle = QLabel("Sign in and choose one folder. Nothing is uploaded yet.")
+        subtitle = QLabel(
+            "Sign in, choose one folder, then upload the organized library."
+        )
         subtitle.setObjectName("muted")
         subtitle.setWordWrap(True)
         layout.addWidget(subtitle)
@@ -253,19 +266,16 @@ class DriveAccountDialog(QDialog):
         self.choose_btn.clicked.connect(self._on_choose)
         self.upload_btn = QPushButton("Upload")
         self.upload_btn.setObjectName("driveUploadButton")
-        self.upload_btn.setEnabled(False)
-        self.upload_btn.setToolTip(
-            "Upload comes later. Choosing a folder does not send any files."
-        )
+        self.upload_btn.clicked.connect(self._on_upload)
         actions.addWidget(self.choose_btn)
         actions.addWidget(self.upload_btn)
         actions.addStretch(1)
         layout.addLayout(actions)
 
         note = QLabel(
-            "Organize stays on this computer. Upload comes later, and it only "
-            "copies into the folder you choose. Files already in Drive stay "
-            "where they are."
+            "Organize stays on this computer. Upload copies the organized "
+            "folders into the Drive folder you chose. Files already in Drive "
+            "stay where they are. Nothing on this computer is deleted."
         )
         note.setObjectName("muted")
         note.setWordWrap(True)
@@ -290,7 +300,7 @@ class DriveAccountDialog(QDialog):
         self._refresh_view()
 
     def _on_sign_out(self):
-        if self._worker_running():
+        if self._call_active or self._uploading or self._upload_thread_running():
             return
         try:
             self.session.sign_out()
@@ -411,19 +421,81 @@ class DriveAccountDialog(QDialog):
             return None
         return path
 
+    def _on_upload(self):
+        if self._upload_thread_running() or self._uploading:
+            if self._upload_worker is not None:
+                self._upload_worker.cancel()
+            self.upload_btn.setEnabled(False)
+            self.status_label.setText(
+                "Stopping… Files already sent will be skipped next time."
+            )
+            return
+        if self._call_busy():
+            return
+        try:
+            signed_in = self.session.signed_in_account() is not None
+        except Exception:
+            signed_in = False
+        if not signed_in:
+            return
+        library = self._library_path()
+        if library is None or not self._bound_folder_id():
+            return
+        self._uploading = True
+        self._upload_worker = DriveUploadWorker(
+            str(library),
+            self.session.access_token,
+            uploader=self._uploader,
+            parent=self,
+        )
+        self._upload_worker.progress.connect(self._on_upload_progress)
+        self._upload_worker.finished_upload.connect(self._on_upload_finished)
+        self._upload_worker.failed.connect(self._on_upload_failed)
+        self._upload_worker.finished.connect(self._refresh_controls)
+        self._upload_worker.start()
+        self.status_label.setText("Starting upload…")
+        self._refresh_controls()
+
+    def _on_upload_progress(self, update):
+        name = update.current_file or "the library"
+        verb = "Uploading" if update.uploading else "Checking"
+        self.status_label.setText(
+            f"{verb} {name} — {update.files_done} of {update.files_total} files, "
+            f"{format_bytes(update.bytes_done)} of {format_bytes(update.bytes_total)}"
+        )
+
+    def _on_upload_finished(self, result):
+        self._uploading = False
+        self._refresh_controls()
+        if not isinstance(result, UploadResult):
+            self.status_label.setText("Upload finished.")
+            return
+        if result.cancelled:
+            self.status_label.setText(
+                "Upload stopped. Files already sent will be skipped next time. "
+                "The file that was in progress can continue when you upload again."
+            )
+            return
+        if result.files_total == 0:
+            self.status_label.setText("There are no files to upload in this library.")
+            return
+        self.status_label.setText(
+            f"Upload finished. {result.uploaded} sent, {result.skipped} already there."
+        )
+
+    def _on_upload_failed(self, message: str):
+        self._uploading = False
+        self._refresh_controls()
+        self.status_label.setText("Upload did not finish. You can try again.")
+        QMessageBox.warning(self, APP_NAME, message)
+
     def _refresh_view(self):
         account = None
         try:
             account = self.session.signed_in_account()
         except Exception:
             account = None
-        signed_in = account is not None
         self.account_label.setText(account.label if account is not None else "Not signed in")
-        self.sign_in_btn.setEnabled(not signed_in and not self._worker_running())
-        self.sign_out_btn.setEnabled(signed_in and not self._worker_running())
-        self.choose_btn.setEnabled(signed_in and not self._worker_running())
-        self.upload_btn.setEnabled(False)
-        self._restyle(signed_in)
         self._show_bound_folder()
 
     def _show_bound_folder(self):
@@ -432,15 +504,18 @@ class DriveAccountDialog(QDialog):
             self._set_folder_text("", "")
             if self.library_edit.text().strip():
                 self.folder_label.setText("Choose an existing library folder")
+            self._refresh_controls()
             return
         try:
             record = load_sync_record(library)
         except SyncRecordError:
             self.folder_label.setText("The Drive record in this library could not be read.")
             self.folder_id_label.setVisible(False)
+            self._refresh_controls()
             return
         name = self._remembered_name(record.drive_folder_id)
         self._set_folder_text(record.drive_folder_id, name)
+        self._refresh_controls()
 
     def _set_folder_text(self, folder_id: str, name: str):
         if not folder_id:
@@ -469,8 +544,9 @@ class DriveAccountDialog(QDialog):
         return value if isinstance(value, str) else ""
 
     def _start(self, fn, on_ok, waiting: str):
-        if self._worker_running():
+        if self._call_active or self._worker_running():
             return
+        self._call_active = True
         self._set_busy(True, waiting)
         self._worker = _CallWorker(fn, self)
         self._worker.succeeded.connect(lambda result: self._finish_ok(on_ok, result))
@@ -478,31 +554,70 @@ class DriveAccountDialog(QDialog):
         self._worker.start()
 
     def _finish_ok(self, on_ok, result):
+        self._call_active = False
         self._set_busy(False, "")
         on_ok(result)
 
     def _on_failed(self, message: str):
+        self._call_active = False
         self._set_busy(False, "")
         QMessageBox.warning(self, APP_NAME, message)
 
     def _set_busy(self, busy: bool, message: str):
         self.status_label.setText(message)
+        self._refresh_controls()
+
+    def _refresh_controls(self):
         signed_in = False
         try:
             signed_in = self.session.signed_in_account() is not None
         except Exception:
             signed_in = False
-        self.sign_in_btn.setEnabled(not busy and not signed_in)
-        self.sign_out_btn.setEnabled(not busy and signed_in)
-        self.choose_btn.setEnabled(not busy and signed_in)
-        self.library_btn.setEnabled(not busy)
-        self.upload_btn.setEnabled(False)
-        self._restyle(signed_in)
+        call_busy = self._call_busy()
+        upload_busy = self._uploading or self._upload_thread_running()
+        self.sign_in_btn.setEnabled(not signed_in and not call_busy and not upload_busy)
+        self.sign_out_btn.setEnabled(signed_in and not call_busy and not upload_busy)
+        self.choose_btn.setEnabled(signed_in and not call_busy and not upload_busy)
+        self.library_btn.setEnabled(not call_busy and not upload_busy)
+        if upload_busy:
+            self.upload_btn.setText("Cancel")
+            self.upload_btn.setEnabled(self._uploading)
+            self.upload_btn.setToolTip(
+                "Stop before the next file. Files already uploaded stay on Drive "
+                "and are skipped next time."
+            )
+        else:
+            self.upload_btn.setText("Upload")
+            self.upload_btn.setEnabled(
+                signed_in and not call_busy and bool(self._bound_folder_id())
+            )
+            self.upload_btn.setToolTip(
+                "Copy this organized library into the chosen Drive folder. "
+                "Files on this computer stay here. Nothing already in Drive is deleted."
+            )
+        self._restyle(signed_in, upload_busy)
 
-    def _restyle(self, signed_in: bool):
-        """The amber button is the next step: Sign in, then Choose Drive folder."""
-        self._set_primary(self.sign_in_btn, not signed_in)
-        self._set_primary(self.choose_btn, signed_in)
+    def _bound_folder_id(self) -> str:
+        library = self._library_path()
+        if library is None:
+            return ""
+        try:
+            return load_sync_record(library).drive_folder_id
+        except SyncRecordError:
+            return ""
+
+    def _call_busy(self) -> bool:
+        return self._call_active
+
+    def _upload_thread_running(self) -> bool:
+        return self._upload_worker is not None and self._upload_worker.isRunning()
+
+    def _restyle(self, signed_in: bool, upload_busy: bool = False):
+        """The amber button is the next step: Sign in, then folder, then Upload."""
+        can_upload = signed_in and bool(self._bound_folder_id()) and not upload_busy
+        self._set_primary(self.sign_in_btn, not signed_in and not upload_busy)
+        self._set_primary(self.choose_btn, signed_in and not can_upload and not upload_busy)
+        self._set_primary(self.upload_btn, can_upload)
 
     def _set_primary(self, button: QPushButton, primary: bool):
         button.setObjectName("primaryButton" if primary else "")
@@ -510,13 +625,14 @@ class DriveAccountDialog(QDialog):
         button.style().polish(button)
 
     def _worker_running(self) -> bool:
-        return self._worker is not None and self._worker.isRunning()
+        running = self._worker is not None and self._worker.isRunning()
+        return self._call_active or running or self._upload_thread_running()
 
     def _warn(self, text: str) -> None:
         QMessageBox.warning(self, APP_NAME, text)
 
     def closeEvent(self, event):
-        if self._worker_running():
+        if self._call_busy() or self._upload_thread_running():
             event.ignore()
             return
         super().closeEvent(event)

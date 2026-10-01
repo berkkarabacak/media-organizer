@@ -7,6 +7,7 @@ not use a client secret.
 Tokens are written only under the per-user Google directory (next to
 ``crash.log``). They are never written into an organized library, the sync
 record, a log, or this repository. Sign-out deletes the token file.
+Resumable upload sessions live in that same directory, not in the library.
 
 The desktop client id is public. Set ``MEDIA_ORGANIZER_GOOGLE_CLIENT_ID``,
 or replace ``BUNDLED_CLIENT_ID`` below with the Desktop OAuth client id
@@ -299,7 +300,10 @@ def delete_token_file(path: Path | None = None) -> None:
 
 def public_error_message(exc: BaseException) -> str:
     """A message safe to show. Token material is not included."""
-    if isinstance(exc, (GoogleAuthError, DriveFolderError)):
+    from .drive_sync import SyncRecordError
+    from .drive_upload import DriveUploadError
+
+    if isinstance(exc, (GoogleAuthError, DriveFolderError, DriveUploadError, SyncRecordError)):
         text = str(exc).strip() or "Something went wrong talking to Google Drive."
     else:
         text = "Something went wrong talking to Google Drive."
@@ -400,6 +404,10 @@ class GoogleSession:
     def sign_out(self) -> None:
         """Delete the local token file. The sync record is left alone."""
         delete_token_file(self._path())
+
+    def access_token(self) -> str:
+        """Access token for Drive calls, refreshed when it is about to expire."""
+        return self._access_token()
 
     def list_folders(self) -> list[DriveFolder]:
         """Folders this app can already see. Does not create or upload files."""

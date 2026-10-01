@@ -1,4 +1,4 @@
-"""Background workers (QThread) for scanning and executing."""
+"""Background workers (QThread) for scanning, organizing, and Drive upload."""
 
 from __future__ import annotations
 
@@ -7,8 +7,10 @@ from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
 
+from ..core.drive_upload import upload_library
 from ..core.duplicates import find_duplicates
 from ..core.executor import execute_plan
+from ..core.google_auth import public_error_message
 from ..core.metadata import analyze_media_batch
 from ..core.organizer import (OrganizeOptions, PlannedFile, build_plan,
                               scan_media_files)
@@ -141,3 +143,60 @@ class OrganizeWorker(QThread):
             self.finished_run.emit(log, summary)
         except Exception as exc:
             self.failed.emit(str(exc))
+
+
+class DriveUploadWorker(QThread):
+    """Uploads one organized library off the UI thread.
+
+    ``progress`` carries an ``UploadProgress``. Byte counts stay Python ints
+    so a large library cannot overflow Qt's 32-bit int. ``cancel`` is
+    cooperative: the upload stops before the next file and leaves the
+    in-flight resumable session stored beside the OAuth token.
+    """
+
+    progress = Signal(object)
+    finished_upload = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, library_dir, access_token, *, uploader=None, parent=None):
+        super().__init__(parent)
+        self.library_dir = library_dir
+        self._access_token = access_token
+        self._uploader = uploader or upload_library
+        self._cancelled = False
+        self._last_emit = 0.0
+        self._last_name = None
+        self._last_done = -1
+
+    def cancel(self):
+        self._cancelled = True
+
+    def _emit(self, update) -> None:
+        now = time.monotonic()
+        changed = (
+            update.current_file != self._last_name
+            or update.files_done != self._last_done
+        )
+        finished = (
+            update.files_total > 0
+            and update.files_done >= update.files_total
+            and not update.uploading
+        )
+        if not changed and not finished and now - self._last_emit < PROGRESS_INTERVAL_S:
+            return
+        self._last_emit = now
+        self._last_name = update.current_file
+        self._last_done = update.files_done
+        self.progress.emit(update)
+
+    def run(self):
+        try:
+            result = self._uploader(
+                self.library_dir,
+                access_token=self._access_token,
+                progress=self._emit,
+                cancel=lambda: self._cancelled,
+            )
+            self.finished_upload.emit(result)
+        except Exception as exc:
+            self.failed.emit(public_error_message(exc))

@@ -11,7 +11,8 @@ from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication, QDialog
 
 from media_organizer.core.drive_folders import DriveFolder
-from media_organizer.core.drive_sync import load_sync_record, save_sync_record
+from media_organizer.core.drive_sync import SyncRecord, load_sync_record, save_sync_record
+from media_organizer.core.drive_upload import UploadProgress, UploadResult
 from media_organizer.core.google_auth import GoogleAccount
 from media_organizer.gui.drive_dialog import (
     REPLACE_FOLDER_TEXT,
@@ -45,6 +46,9 @@ class FakeSession:
 
     def pick_drive_folder(self):
         return self.picked
+
+    def access_token(self):
+        return "test-access-token"
 
 
 @pytest.fixture(scope="module")
@@ -179,6 +183,78 @@ def test_binding_asks_before_replacing_a_different_folder(qapp, tmp_path):
     settings.remove("driveFolderName/folder-b")
     dialog.deleteLater()
     again.deleteLater()
+    qapp.processEvents()
+
+
+def test_upload_enables_only_when_signed_in_and_a_folder_is_bound(qapp, tmp_path):
+    record = SyncRecord()
+    record.bind_folder("folder-a")
+    save_sync_record(record, tmp_path)
+    (tmp_path / "2024").mkdir()
+    (tmp_path / "2024" / "a.jpg").write_bytes(b"abcd")
+
+    signed_out = DriveAccountDialog(str(tmp_path), session=FakeSession())
+    signed_out.show()
+    assert signed_out.upload_btn.text() == "Upload"
+    assert not signed_out.upload_btn.isEnabled()
+    signed_out.close()
+
+    session = FakeSession()
+    session.account = GoogleAccount(email="ada@example.com", display_name="Ada")
+    dialog = DriveAccountDialog("", session=session)
+    dialog.show()
+    assert not dialog.upload_btn.isEnabled()
+    dialog.library_edit.setText(str(tmp_path))
+    dialog._show_bound_folder()
+    assert dialog.upload_btn.isEnabled()
+    assert "deleted" in dialog.upload_btn.toolTip().lower()
+    assert "comes later" not in dialog.upload_btn.toolTip().lower()
+    dialog.close()
+    signed_out.deleteLater()
+    dialog.deleteLater()
+    qapp.processEvents()
+
+
+def test_upload_button_reports_progress_and_cancel(qapp, tmp_path):
+    record = SyncRecord()
+    record.bind_folder("folder-a")
+    save_sync_record(record, tmp_path)
+    (tmp_path / "2024").mkdir()
+    (tmp_path / "2024" / "a.jpg").write_bytes(b"abcd")
+    session = FakeSession()
+    session.account = GoogleAccount(email="ada@example.com", display_name="Ada")
+    state = {"token": "", "cancelled": False}
+
+    def uploader(library_dir, *, access_token, progress, cancel, **kwargs):
+        state["token"] = access_token() if callable(access_token) else access_token
+        progress(UploadProgress("2024/a.jpg", 0, 1, 0, 4, uploading=True))
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            if cancel():
+                state["cancelled"] = True
+                return UploadResult(
+                    uploaded=0, skipped=0, cancelled=True, files_done=0, files_total=1,
+                )
+            time.sleep(0.01)
+        return UploadResult(uploaded=1, skipped=0, cancelled=False, files_done=1, files_total=1)
+
+    dialog = DriveAccountDialog(str(tmp_path), session=session, uploader=uploader)
+    dialog.show()
+    assert dialog.upload_btn.isEnabled()
+    dialog.upload_btn.click()
+    _wait_until(lambda: "2024/a.jpg" in dialog.status_label.text())
+    assert dialog.upload_btn.text() == "Cancel"
+    assert "0 of 1" in dialog.status_label.text()
+    dialog.upload_btn.click()
+    _wait_until(
+        lambda: state["cancelled"] and dialog.upload_btn.text() == "Upload"
+        and "stopped" in dialog.status_label.text().lower()
+    )
+    assert state["token"] == "test-access-token"
+    assert dialog.upload_btn.isEnabled()
+    assert (tmp_path / "2024" / "a.jpg").read_bytes() == b"abcd"
+    dialog.close()
+    dialog.deleteLater()
     qapp.processEvents()
 
 
