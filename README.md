@@ -62,6 +62,27 @@ Date detection fallback chain:
   completion dialog's **Undo** button restores it.
 - Corrupt/unreadable files are logged and skipped — the run never crashes.
 
+## Upload to Google Drive (optional)
+
+Sorting stays on this computer. A Google Drive copy is extra, and only if
+you ask for it. Open **Drive → Google Drive…**.
+
+1. Organize the library first (the steps above).
+2. Press **Sign in** and sign in with Google.
+3. Choose that organized folder, then pick **one** Drive folder.
+4. Press **Upload**. The first time, the organized folders are copied into
+   that Drive folder. A later upload skips files that have not changed,
+   adds new files, and updates a file you changed.
+5. Press **Cancel** to stop before the next file. Press **Upload** again to
+   continue. Files already sent are skipped.
+6. If Drive is full, the sign-in has expired, or this computer cannot reach
+   Google, you get a short message that says what to do.
+
+Photos stay on this computer. Files already in Drive are not deleted, and
+edits you make in Drive are not copied back. This is not a two-way sync.
+
+How it is built: [docs/drive-incremental-upload.md](docs/drive-incremental-upload.md).
+
 ## Install (Windows)
 
 Download `MediaOrganizer-Setup-1.5.3.exe` from the
@@ -70,8 +91,10 @@ and run it.
 
 **Seeing a blue "Windows protected your PC" (SmartScreen) prompt?** That's
 normal for a new, independently published app — the installer isn't signed
-with a commercial certificate yet. The app is safe: it is 100% offline and
-its entire source code is this repository. Click **More info** →
+with a commercial certificate yet. Organizing photos and matching places
+from GPS stay on this computer. Google Drive upload is optional and runs
+only after you sign in and choose **Upload**. There is no telemetry. The
+entire source code is this repository. Click **More info** →
 **Run anyway** to proceed.
 
 **Something went wrong?** The app writes a crash log to
@@ -88,8 +111,9 @@ certificate by [SignPath Foundation](https://signpath.org).
 
 **Privacy policy:** This program will not transfer any information to other
 networked systems unless specifically requested by the user or the person
-installing or operating it. Media Organizer is 100% offline by design —
-there are no accounts, no telemetry, and no network features.
+installing or operating it. Organizing and GPS matching stay on this
+computer. There is no telemetry. Signing in to Google is optional, and it
+is used only when you choose **Upload** to a Drive folder you picked.
 
 ## Running from source (developers)
 
@@ -111,7 +135,10 @@ filename pattern, fallback ordering, every folder strategy (incl. quarter
 math and flat monthly), the nearest-city mapper, content-hash duplicate
 detection with renamed files, the ETA estimator, display helpers, collision
 handling, undo-log round-trips, and offscreen QTest GUI click tests.
-Core logic has no Qt imports.
+Drive upload is covered with a fake Drive HTTP layer and tiny temporary
+folders: a first upload, a later run that skips unchanged files, cancel
+and resume, and plain-language errors. Those tests do not call Google and
+do not use a real photo library. Core logic has no Qt imports.
 
 ### Project layout
 
@@ -120,9 +147,16 @@ main.py                     entry point
 media_organizer/
   core/                     pure logic (no Qt): metadata, organizer,
                             strategies, geodata, duplicates, executor,
-                            eta, display, plan (undo log)
-  gui/                      PySide6 UI: main window, workers, theme, icons
-tests/                      pytest suite for all core logic + GUI clicks
+                            eta, display, plan (undo log),
+                            drive_sync (local sync record; no network),
+                            google_auth, drive_folders, drive_upload
+                            (optional Drive upload; no client secret)
+  gui/                      PySide6 UI: main window, workers, theme, icons,
+                            drive_dialog (sign in, one folder, upload)
+tests/                      pytest suite for core logic, GUI clicks, and
+                            Drive upload against a fake HTTP layer
+docs/drive-incremental-upload.md
+                            Drive upload design (one-way, additive)
 tools/
   capture_ui.py             offscreen screenshot harness (ui_shots/)
   verify_progress.py        offscreen progress/ETA verification

@@ -371,11 +371,23 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
+        drive_menu = self.menuBar().addMenu("&Drive")
+        self.drive_action = QAction(
+            icons.icon("folder", theme.TEXT_DIM, 14), "Google Drive…", self)
+        self.drive_action.triggered.connect(self.open_drive_dialog)
+        drive_menu.addAction(self.drive_action)
+
         help_menu = self.menuBar().addMenu("&Help")
         about_action = QAction(icons.icon("info", theme.TEXT_DIM, 14),
                                f"About {APP_NAME}", self)
         about_action.triggered.connect(lambda: AboutDialog(self).exec())
         help_menu.addAction(about_action)
+
+    def open_drive_dialog(self):
+        """Sign in, choose one Drive folder, or upload the organized library."""
+        from .drive_dialog import DriveAccountDialog
+        library = self.dest_card.edit.text().strip()
+        DriveAccountDialog(library, parent=self).exec()
 
     def _build_ui(self):
         central = QWidget()

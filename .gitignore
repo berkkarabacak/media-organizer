@@ -8,3 +8,10 @@ installer/dist/
 tools/ui_shots/
 
 FastDelete/
+
+# Google account material stays on the machine. Never commit it.
+client_secret.json
+client_secret*.json
+credentials.json
+token.json
+drive_token.json
