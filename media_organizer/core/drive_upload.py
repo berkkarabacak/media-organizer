@@ -8,10 +8,13 @@ One file is in flight at a time, through Drive's resumable upload. The
 session URI is stored next to the OAuth token (``upload_sessions.json`` in
 the Google app-data directory). It is never written into ``drive_sync.json``.
 
-``SyncRecord.decide`` chooses skip or upload. A finished file is recorded
-only after Drive returns a file id, and the record is saved before the next
-file starts. Cancel stops before the next file and leaves the in-flight
-session in place so that file can continue later.
+``SyncRecord.decide`` chooses skip or upload. A later pass of the same
+library skips a file whose size and SHA-256 still match a finished entry,
+creates a path that has no Drive file id, and updates a path that already
+has one. A finished file is recorded only after Drive returns a file id,
+and the record is saved before the next file starts. Cancel stops before
+the next file and leaves the in-flight session in place so that file can
+continue later. Nothing is deleted on Drive or on disk.
 """
 
 from __future__ import annotations
@@ -78,7 +81,12 @@ class _SessionExpired(Exception):
 
 @dataclass(frozen=True)
 class UploadProgress:
-    """Snapshot the dialog can show while an upload is running."""
+    """Snapshot the dialog can show while an upload is running.
+
+    ``skipped`` and ``uploaded`` are file counts for this pass.
+    ``bytes_done`` and ``bytes_total`` count only files that transfer.
+    An unchanged file that already has a Drive file id is not included.
+    """
 
     current_file: str
     files_done: int
@@ -86,17 +94,24 @@ class UploadProgress:
     bytes_done: int
     bytes_total: int
     uploading: bool = False
+    skipped: int = 0
+    uploaded: int = 0
 
 
 @dataclass(frozen=True)
 class UploadResult:
-    """What one pass finished, skipped, or left for a later pass."""
+    """What one pass finished, skipped, or left for a later pass.
+
+    ``bytes_sent`` is the size of files that finished transferring.
+    Skipped files are not included.
+    """
 
     uploaded: int
     skipped: int
     cancelled: bool
     files_done: int
     files_total: int
+    bytes_sent: int = 0
 
 
 @dataclass(frozen=True)
@@ -244,9 +259,12 @@ def upload_library(
 ) -> UploadResult:
     """Upload the organized library under its bound Drive folder.
 
-    ``access_token`` is a token string or a callable that returns one (used
-    so a long run can refresh). ``request`` defaults to urllib and is
-    injected by tests. Nothing is deleted on Drive or on disk.
+    A file whose size and SHA-256 still match a finished sync entry is
+    skipped. A new path is created under the bound folder. A changed file
+    updates the Drive file that entry already names. ``access_token`` is a
+    token string or a callable that returns one (used so a long run can
+    refresh). ``request`` defaults to urllib and is injected by tests.
+    Nothing is deleted on Drive or on disk.
     """
     library = Path(library_dir)
     if not library.is_dir():
@@ -257,6 +275,8 @@ def upload_library(
     chunk = chunk_size if isinstance(chunk_size, int) and chunk_size > 0 else DEFAULT_CHUNK_SIZE
     files = iter_library_files(library)
     files_total = len(files)
+    # Starts as every file. Each skip removes that file, so the total becomes
+    # the bytes this pass will actually transfer.
     bytes_total = sum(size for _rel, _path, size in files)
     store = UploadSessionStore(sessions_path)
     drive = _Drive(access_token, request or default_drive_request, timeout)
@@ -276,23 +296,28 @@ def upload_library(
             bytes_done=bytes_done if sent is None else sent,
             bytes_total=bytes_total,
             uploading=uploading,
+            skipped=skipped,
+            uploaded=uploaded,
         ))
+
+    def stopped() -> UploadResult:
+        return _result(uploaded, skipped, True, files_done, files_total, bytes_done)
 
     report("", uploading=False)
     for relative, path, size in files:
         if _cancelled(cancel):
-            return _result(uploaded, skipped, True, files_done, files_total)
+            return stopped()
         report(relative, uploading=False)
         try:
             digest = full_hash(path)
         except OSError as exc:
             raise DriveUploadError("Could not read a file in the library.") from exc
         if _cancelled(cancel):
-            return _result(uploaded, skipped, True, files_done, files_total)
+            return stopped()
         if record.decide(relative, size, digest) == DECISION_SKIP:
             store.drop(library, relative)
             files_done += 1
-            bytes_done += size
+            bytes_total -= size
             skipped += 1
             report(relative, uploading=False)
             continue
@@ -319,7 +344,7 @@ def upload_library(
                 on_sent,
             )
         except _UploadCancelled:
-            return _result(uploaded, skipped, True, files_done, files_total)
+            return stopped()
         record.mark_uploaded(relative, size, digest, file_id)
         finished = record.entry_for(relative)
         if finished is not None and any(key in finished.extra for key in _SESSION_FIELDS):
@@ -335,16 +360,24 @@ def upload_library(
         bytes_done += size
         uploaded += 1
         report(relative, uploading=False)
-    return _result(uploaded, skipped, False, files_done, files_total)
+    return _result(uploaded, skipped, False, files_done, files_total, bytes_done)
 
 
-def _result(uploaded: int, skipped: int, cancelled: bool, files_done: int, files_total: int) -> UploadResult:
+def _result(
+    uploaded: int,
+    skipped: int,
+    cancelled: bool,
+    files_done: int,
+    files_total: int,
+    bytes_sent: int,
+) -> UploadResult:
     return UploadResult(
         uploaded=uploaded,
         skipped=skipped,
         cancelled=cancelled,
         files_done=files_done,
         files_total=files_total,
+        bytes_sent=bytes_sent,
     )
 
 

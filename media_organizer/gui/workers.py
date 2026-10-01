@@ -167,15 +167,21 @@ class DriveUploadWorker(QThread):
         self._last_emit = 0.0
         self._last_name = None
         self._last_done = -1
+        self._last_skipped = -1
+        self._last_uploaded = -1
 
     def cancel(self):
         self._cancelled = True
 
     def _emit(self, update) -> None:
         now = time.monotonic()
+        skipped = getattr(update, "skipped", 0)
+        uploaded = getattr(update, "uploaded", 0)
         changed = (
             update.current_file != self._last_name
             or update.files_done != self._last_done
+            or skipped != self._last_skipped
+            or uploaded != self._last_uploaded
         )
         finished = (
             update.files_total > 0
@@ -187,6 +193,8 @@ class DriveUploadWorker(QThread):
         self._last_emit = now
         self._last_name = update.current_file
         self._last_done = update.files_done
+        self._last_skipped = getattr(update, "skipped", 0)
+        self._last_uploaded = getattr(update, "uploaded", 0)
         self.progress.emit(update)
 
     def run(self):

@@ -274,8 +274,10 @@ class DriveAccountDialog(QDialog):
 
         note = QLabel(
             "Organize stays on this computer. Upload copies the organized "
-            "folders into the Drive folder you chose. Files already in Drive "
-            "stay where they are. Nothing on this computer is deleted."
+            "folders into the Drive folder you chose. A later upload skips "
+            "files that have not changed and sends only new or changed ones. "
+            "Files already in Drive stay where they are. Nothing on this "
+            "computer is deleted."
         )
         note.setObjectName("muted")
         note.setWordWrap(True)
@@ -459,9 +461,12 @@ class DriveAccountDialog(QDialog):
     def _on_upload_progress(self, update):
         name = update.current_file or "the library"
         verb = "Uploading" if update.uploading else "Checking"
+        skipped = getattr(update, "skipped", 0)
+        uploaded = getattr(update, "uploaded", 0)
         self.status_label.setText(
             f"{verb} {name} — {update.files_done} of {update.files_total} files, "
-            f"{format_bytes(update.bytes_done)} of {format_bytes(update.bytes_total)}"
+            f"{skipped} unchanged, {uploaded} sent, "
+            f"{format_bytes(update.bytes_done)} of {format_bytes(update.bytes_total)} to send"
         )
 
     def _on_upload_finished(self, result):
@@ -479,8 +484,10 @@ class DriveAccountDialog(QDialog):
         if result.files_total == 0:
             self.status_label.setText("There are no files to upload in this library.")
             return
+        sent = format_bytes(getattr(result, "bytes_sent", 0))
         self.status_label.setText(
-            f"Upload finished. {result.uploaded} sent, {result.skipped} already there."
+            f"Upload finished. {result.uploaded} sent ({sent}), "
+            f"{result.skipped} unchanged."
         )
 
     def _on_upload_failed(self, message: str):
@@ -593,6 +600,8 @@ class DriveAccountDialog(QDialog):
             )
             self.upload_btn.setToolTip(
                 "Copy this organized library into the chosen Drive folder. "
+                "Unchanged files are skipped. A new file is added, and a "
+                "changed file updates the copy already in this folder. "
                 "Files on this computer stay here. Nothing already in Drive is deleted."
             )
         self._restyle(signed_in, upload_busy)

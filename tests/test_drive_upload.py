@@ -1,4 +1,7 @@
-"""First Drive upload: resumable sessions, cancel, and resume. No network."""
+"""Drive upload: resumable sessions, cancel, resume, and incremental passes.
+
+No network. The fake Drive HTTP layer stands in for Google.
+"""
 
 import json
 import re
@@ -441,6 +444,118 @@ class TestFirstUpload:
         else:
             raise AssertionError("upload should refuse a library with no Drive folder")
         assert fake.calls == []
+
+
+class TestIncrementalPass:
+    def test_second_pass_skips_unchanged_and_uploads_new_and_changed(self, tmp_path):
+        library = tmp_path / "library"
+        _bind(library)
+        keep = "2024/Q3/07 July/keep.jpg"
+        edit = "2024/Q3/07 July/edit.jpg"
+        aside = "_uncertain/aside.jpg"
+        fresh = "2024/Q4/10 October/fresh.jpg"
+        original = {
+            keep: b"keep-me",
+            edit: b"old-pic",
+            aside: b"aside!",
+        }
+        for relative, data in original.items():
+            _write(library, relative, data)
+        fake = FakeDrive()
+        sessions = tmp_path / "google" / "upload_sessions.json"
+        first, first_progress = _run(library, fake, sessions)
+
+        assert first.uploaded == 3
+        assert first.skipped == 0
+        assert first.bytes_sent == sum(len(data) for data in original.values())
+        assert first_progress[-1].uploaded == 3
+        assert first_progress[-1].skipped == 0
+        assert first_progress[-1].bytes_done == first.bytes_sent
+        assert first_progress[-1].bytes_total == first.bytes_sent
+        before = load_sync_record(library)
+        edit_id = before.entry_for(edit).drive_file_id
+        keep_id = before.entry_for(keep).drive_file_id
+        aside_id = before.entry_for(aside).drive_file_id
+        assert edit_id and keep_id and aside_id
+        assert len({edit_id, keep_id, aside_id}) == 3
+
+        # Same length, different bytes: the hash is what changed, not the size.
+        changed = b"new-pic"
+        assert len(changed) == len(original[edit])
+        added = b"brand-new"
+        _write(library, edit, changed)
+        _write(library, fresh, added)
+        calls_before = len(fake.calls)
+        second, progress = _run(library, fake, sessions)
+        second_calls = fake.calls[calls_before:]
+
+        assert second.cancelled is False
+        assert second.uploaded == 2
+        assert second.skipped == 2
+        assert second.files_done == 4
+        assert second.files_total == 4
+        assert second.bytes_sent == len(changed) + len(added)
+        assert progress[-1].skipped == 2
+        assert progress[-1].uploaded == 2
+        assert progress[-1].bytes_done == second.bytes_sent
+        assert progress[-1].bytes_total == second.bytes_sent
+        assert any(
+            update.skipped >= 1 and update.bytes_done <= second.bytes_sent
+            for update in progress
+        )
+        skip_updates = [update for update in progress if update.current_file == keep and update.skipped]
+        assert skip_updates
+        assert all(update.uploading is False for update in skip_updates)
+        assert any(update.uploading and update.current_file == edit for update in progress)
+        assert any(update.uploading and update.current_file == fresh for update in progress)
+        assert not any(update.uploading and update.current_file in {keep, aside} for update in progress)
+
+        posts = [
+            call for call in second_calls
+            if call["method"] == "POST" and "uploadType=resumable" in call["url"]
+        ]
+        patches = [
+            call for call in second_calls
+            if call["method"] == "PATCH" and "uploadType=resumable" in call["url"]
+        ]
+        assert len(posts) == 1
+        assert len(patches) == 1
+        assert edit_id in patches[0]["url"]
+        assert "parents" not in json.loads(patches[0]["body"].decode("utf-8"))
+        assert json.loads(posts[0]["body"].decode("utf-8"))["parents"]
+        transferred = b"".join(call["body"] for call in second_calls)
+        assert original[keep] not in transferred
+        assert original[aside] not in transferred
+        assert changed in transferred
+        assert added in transferred
+        assert not any(_is_remote_delete(call) for call in second_calls)
+
+        saved = load_sync_record(library)
+        assert saved.entry_for(edit).drive_file_id == edit_id
+        assert saved.entry_for(keep).drive_file_id == keep_id
+        assert saved.entry_for(aside).drive_file_id == aside_id
+        fresh_id = saved.entry_for(fresh).drive_file_id
+        assert fresh_id and fresh_id not in {edit_id, keep_id, aside_id}
+        assert set(fake.files) == {edit_id, keep_id, aside_id, fresh_id}
+        assert fake.files[edit_id]["kind"] == "update"
+        assert fake.files[edit_id]["data"] == changed
+        assert fake.files[keep_id]["kind"] == "create"
+        assert fake.files[keep_id]["data"] == original[keep]
+        assert fake.files[aside_id]["data"] == original[aside]
+        root = "folder-bound"
+        year = fake.folders[(root, "2024")]
+        october = fake.folders[(fake.folders[(year, "Q4")], "10 October")]
+        assert fake.files[fresh_id]["parents"] == [october]
+        assert fake.files[fresh_id]["kind"] == "create"
+        assert fake.files[fresh_id]["data"] == added
+        for relative, data in {**original, edit: changed, fresh: added}.items():
+            assert (library.joinpath(*relative.split("/"))).read_bytes() == data
+            path = library.joinpath(*relative.split("/"))
+            assert saved.decide(relative, len(data), full_hash(path)) == DECISION_SKIP
+        assert saved.entry_for(keep).content_hash == full_hash(library.joinpath(*keep.split("/")))
+        _assert_additive(fake)
+        _assert_library_has_no_secrets(library)
+        assert not sessions.exists()
 
 
 class TestCancelAndResume:

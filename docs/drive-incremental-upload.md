@@ -20,6 +20,16 @@ in and a folder is bound. Cancel stops before the next file. The in-flight
 session can continue on the next run. This slice does not delete local or
 remote files.
 
+Slice 4 is the incremental pass. A later upload of the same library skips
+every file whose size and SHA-256 still match a sync entry that has a Drive
+file id. A new path is created under the bound folder. A changed file is
+updated in place when that entry already has a Drive file id. Progress
+counts skipped files separately from uploaded files. Byte totals count only
+files that transfer: each unchanged file is removed from the total when it
+is recognized, and `UploadResult.bytes_sent` is the size Drive accepted.
+Cancel and resume are unchanged. This slice still does not delete local or
+remote files.
+
 ## Where Drive sits
 
 Organize stays local. Drive is a destination for a library that has already
@@ -220,13 +230,16 @@ upload_library(library_dir, *, access_token, progress=None, cancel=None) -> Uplo
 ```
 
 `UploadProgress` reports the current library-relative path, files done and
-total, and bytes done and total. `access_token` may be a string or a
-callable that returns one. When `decide` says upload and the entry already
-has a Drive file id, that file is updated. A path with no file id is
-created once. Intermediate folders are created under the bound folder so
-the library-relative path is kept. `mark_uploaded` runs only after Drive
-returns a file id, then `save_sync_record` runs, then the session URI for
-that path is removed.
+total, how many files this pass has skipped and uploaded, and bytes done
+and total. Those byte counts are the files that transfer. An unchanged file
+is not added to `bytes_done`; its size is removed from `bytes_total` when
+the pass recognizes it. `UploadResult.bytes_sent` is the same finished
+transfer size. `access_token` may be a string or a callable that returns
+one. When `decide` says upload and the entry already has a Drive file id,
+that file is updated. A path with no file id is created once. Intermediate
+folders are created under the bound folder so the library-relative path is
+kept. `mark_uploaded` runs only after Drive returns a file id, then
+`save_sync_record` runs, then the session URI for that path is removed.
 
 ## Later slices
 
@@ -238,7 +251,11 @@ that path is removed.
    The session URI is `upload_sessions.json` next to the OAuth token.
    `decide` chooses skip or upload, including when the same library is
    uploaded again.
-4. Incremental pass polish beyond that skip/upload decision. Not started.
+4. Incremental pass: a later upload skips unchanged files and sends only
+   new or changed ones. Done: `upload_library` and the progress line in
+   `gui/drive_dialog`. A changed file with a Drive file id is updated.
+   A new path is created. Skipped and uploaded counts are reported while
+   the pass runs, and the byte totals leave out unchanged files.
 5. Errors a non-technical user can read (quota, expired sign-in, offline).
    Not started. A failure still stops the pass and shows a short message.
 6. Docs. The README currently says the app is offline and has no network

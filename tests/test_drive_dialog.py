@@ -258,6 +258,42 @@ def test_upload_button_reports_progress_and_cancel(qapp, tmp_path):
     qapp.processEvents()
 
 
+def test_upload_progress_shows_unchanged_and_sent(qapp, tmp_path):
+    record = SyncRecord()
+    record.bind_folder("folder-a")
+    save_sync_record(record, tmp_path)
+    session = FakeSession()
+    session.account = GoogleAccount(email="ada@example.com", display_name="Ada")
+    dialog = DriveAccountDialog(str(tmp_path), session=session)
+    dialog.show()
+    dialog._on_upload_progress(UploadProgress(
+        "2024/Q3/07 July/edit.jpg",
+        2,
+        4,
+        7,
+        16,
+        uploading=True,
+        skipped=1,
+        uploaded=1,
+    ))
+    text = dialog.status_label.text()
+    assert "Uploading 2024/Q3/07 July/edit.jpg" in text
+    assert "2 of 4" in text
+    assert "1 unchanged" in text
+    assert "1 sent" in text
+    assert "7 B of 16 B to send" in text
+    dialog._on_upload_finished(UploadResult(
+        uploaded=2, skipped=2, cancelled=False, files_done=4, files_total=4,
+        bytes_sent=16,
+    ))
+    finished = dialog.status_label.text()
+    assert "2 sent (16 B)" in finished
+    assert "2 unchanged" in finished
+    dialog.close()
+    dialog.deleteLater()
+    qapp.processEvents()
+
+
 def test_drive_menu_is_on_the_main_window(qapp):
     from media_organizer.gui.main_window import MainWindow
 
