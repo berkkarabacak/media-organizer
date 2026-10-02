@@ -46,6 +46,10 @@ class JournalWriter:
     either mode. When it is omitted, an existing unfinished journal is
     continued and anything else (missing file, or a run that already
     completed) is replaced.
+
+    ``record`` stores the sha256 and size of the bytes just published.
+    Resume seeds undo from those fields. It does not hash whatever file
+    is at the destination later.
     """
 
     def __init__(self, dest_dir: Path | str, *, resume: bool | None = None):
@@ -57,10 +61,26 @@ class JournalWriter:
         # an older complete marker. "a" keeps the open run's records.
         self._fh = open(self.path, "a" if resume else "w", encoding="utf-8")
 
-    def record(self, action: str, source: str, destination: str) -> None:
-        self._fh.write(json.dumps(
-            {"action": action, "source": source,
-             "destination": destination, "status": "done"}) + "\n")
+    def record(self, action: str, source: str, destination: str,
+               sha256: str = "", size: int = -1) -> None:
+        """Append one done line and fsync it.
+
+        ``sha256`` and ``size`` are the bytes at the destination when this
+        line is written. Pass them from the copy or move that just
+        published the file. Older journals omit both; resume must not
+        invent them from a later occupant of the path.
+        """
+        entry = {
+            "action": action,
+            "source": source,
+            "destination": destination,
+            "status": "done",
+        }
+        if sha256:
+            entry["sha256"] = sha256
+        if isinstance(size, int) and not isinstance(size, bool) and size >= 0:
+            entry["size"] = size
+        self._fh.write(json.dumps(entry) + "\n")
         self._fh.flush()
         os.fsync(self._fh.fileno())
 
@@ -152,14 +172,28 @@ def path_identity(path: str | os.PathLike, *, windows: bool | None = None) -> st
     return os.path.normpath(os.path.abspath(text))
 
 
+def _entry_sha256(entry: dict) -> str:
+    digest = entry.get("sha256") or ""
+    return digest if isinstance(digest, str) else ""
+
+
+def _entry_size(entry: dict) -> int:
+    size = entry.get("size", -1)
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        return -1
+    return size
+
+
 def completed_operations(journal_path: Path | str) -> list[dict]:
     """Done operations of the open run, in journal order.
 
     Each item has the ``action``, ``source``, and ``destination`` stored
-    in the journal. A run that already wrote ``{"run": "complete"}``
-    contributes nothing: those files belong to a finished organize.
-    Resume seeds the operation log from this list so undo still covers
-    files that were journaled before ``save_log`` ran.
+    in the journal, plus ``sha256`` and ``size`` when that line recorded
+    them. Missing integrity fields stay ``""`` and ``-1``. They are not
+    filled from the destination path. A run that already wrote
+    ``{"run": "complete"}`` contributes nothing: those files belong to a
+    finished organize. Resume seeds the operation log from this list so
+    undo still covers files that were journaled before ``save_log`` ran.
     """
     entries, _finished = _open_run(Path(journal_path))
     ops: list[dict] = []
@@ -171,6 +205,8 @@ def completed_operations(journal_path: Path | str) -> list[dict]:
             "action": entry.get("action") or "",
             "source": source,
             "destination": entry.get("destination") or "",
+            "sha256": _entry_sha256(entry),
+            "size": _entry_size(entry),
         })
     return ops
 

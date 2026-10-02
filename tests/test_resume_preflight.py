@@ -9,6 +9,7 @@ device, still count those bytes.
 
 from __future__ import annotations
 
+import hashlib
 import os
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -578,7 +579,10 @@ class TestResumePreflight:
         final.parent.mkdir(parents=True)
         atomic_copy(photo, final)
         with JournalWriter(dst) as writer:
-            writer.record("move", str(photo), str(final))
+            writer.record(
+                "move", str(photo), str(final),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                size=len(payload))
 
         events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
         seen = _install_space(monkeypatch, free=1000)
@@ -660,7 +664,10 @@ class TestResumePreflight:
         atomic_copy(photo, final)
         action = "copy" if copy_mode else "move"
         with JournalWriter(dst) as writer:
-            writer.record(action, str(photo), str(final))
+            writer.record(
+                action, str(photo), str(final),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                size=len(payload))
 
         events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
         seen = _install_space(monkeypatch, free=1_000_000)
@@ -750,7 +757,10 @@ class TestResumePreflight:
         kept_final.parent.mkdir(parents=True, exist_ok=True)
         atomic_copy(kept, kept_final)
         with JournalWriter(dst) as writer:
-            writer.record("copy", str(kept), str(kept_final))
+            writer.record(
+                "copy", str(kept), str(kept_final),
+                sha256=hashlib.sha256(kept_payload).hexdigest(),
+                size=len(kept_payload))
             writer.record("copy", str(gone), str(gone_final))
         assert not gone_final.exists()
 
@@ -827,7 +837,10 @@ class TestResumePreflight:
         kept_final.parent.mkdir(parents=True, exist_ok=True)
         atomic_copy(kept, kept_final)
         with JournalWriter(dst) as writer:
-            writer.record("move", str(kept), str(kept_final))
+            writer.record(
+                "move", str(kept), str(kept_final),
+                sha256=hashlib.sha256(kept_payload).hexdigest(),
+                size=len(kept_payload))
 
         events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
         _install_space(monkeypatch, free=1_000_000)
@@ -897,7 +910,10 @@ class TestResumePreflight:
         atomic_copy(photo, final)
         action = "copy" if copy_mode else "move"
         with JournalWriter(dst) as writer:
-            writer.record(action, str(photo), str(final))
+            writer.record(
+                action, str(photo), str(final),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                size=len(payload))
 
         events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
         _install_space(monkeypatch, free=1_000_000)

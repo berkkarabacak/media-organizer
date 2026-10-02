@@ -359,13 +359,22 @@ def _sha256(path: Path) -> str:
 
 
 def _still_the_moved_file(dest: Path, op: Operation) -> bool:
-    """False when `dest` is no longer the file this run moved."""
+    """False when `dest` is no longer the file this run moved.
+
+    The sha256 was recorded when the move was journaled, or when a normal
+    run finished the file. A missing sha256 means the log never saw those
+    bytes: a legacy journal line, or a destination that was missing when
+    the row was seeded. Whoever is at the path now is not assumed to be
+    that file. A recorded size that no longer matches is the same refusal.
+    """
     try:
         if not dest.is_file():
             return False
+        if not op.sha256:
+            return False
         if op.size >= 0 and dest.stat().st_size != op.size:
             return False
-        if op.sha256 and _sha256(dest) != op.sha256:
+        if _sha256(dest) != op.sha256:
             return False
     except OSError:
         return False
@@ -482,14 +491,17 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
     A copied file is removed only when the original is still there and the
     two files still match, so undo cannot destroy the only remaining copy
     or a file the user has since replaced. On Windows that removal goes to
-    the Recycle Bin. A moved file is moved back only when it is still the
-    file this run wrote.
+    the Recycle Bin. A moved file is moved back only when the destination
+    still matches the sha256 recorded for that move. A move with no
+    recorded sha256 is left in place. If the source is still a file and
+    its bytes differ from the destination, the destination stays too.
 
     An unsaved log that never recorded a size or sha256 is not reversible
     work. That is a dry run: nothing is deleted or moved, and no operation
-    log is written. A saved log is undone even when an older version left
-    size and sha256 empty. An unsaved log that did record a size or hash
-    is still undone.
+    log is written. A saved log is still opened when an older version left
+    size and sha256 empty. Copy rows in that log still compare the two
+    files. Move rows without a sha256 are not relocated. An unsaved log
+    that did record a size or hash is still undone.
 
     ``kept`` counts files left in place on purpose. Those operations are
     marked ``kept`` so a later undo does not treat them as work still to
@@ -546,6 +558,12 @@ def undo_log(log: RunLog, dest_dir: Path | str) -> dict:
             elif op.action == "move":
                 if not dest.exists():
                     skipped += 1
+                    continue
+                # Source still holds different bytes. Relocating dest would
+                # steal that occupant or park it beside the user's file.
+                if src.is_file() and dest.is_file() and not _identical(src, dest):
+                    _leave_in_place(op)
+                    kept += 1
                     continue
                 if not _still_the_moved_file(dest, op):
                     _leave_in_place(op)

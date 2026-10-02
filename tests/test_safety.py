@@ -719,12 +719,12 @@ class TestAtomicCopy:
             order.append("replace-part")
             return real_replace(src_path, dst_path)
 
-        def spy_record(self, action, source_s, destination):
+        def spy_record(self, action, source_s, destination, **kwargs):
             assert os.path.normcase(os.path.abspath(source_s)) == source_key
             assert Path(source_s).is_file()
             assert Path(destination).is_file()
             assert Path(destination).read_bytes() == payload
-            result = real_record(self, action, source_s, destination)
+            result = real_record(self, action, source_s, destination, **kwargs)
             order.append("journal")
             return result
 
@@ -771,7 +771,7 @@ class TestAtomicCopy:
                 raise OSError("simulated cross-volume rename")
             return real_replace(src_path, dst_path)
 
-        def boom(self, action, source_s, destination):
+        def boom(self, action, source_s, destination, **kwargs):
             assert Path(source_s).is_file()
             assert Path(source_s).read_bytes() == payload
             raise OSError("journal write failed")
@@ -1418,7 +1418,7 @@ class TestPartialFileErrorsLeaveJournalUnfinished:
         real_record = JournalWriter.record
         calls = {"n": 0}
 
-        def fail_second_record(self, action, source, destination):
+        def fail_second_record(self, action, source, destination, **kwargs):
             calls["n"] += 1
             if calls["n"] >= 2:
                 published = Path(destination)
@@ -1426,7 +1426,7 @@ class TestPartialFileErrorsLeaveJournalUnfinished:
                 assert published.read_bytes() == payload
                 assert published == second.destination
                 raise OSError("journal write failed")
-            return real_record(self, action, source, destination)
+            return real_record(self, action, source, destination, **kwargs)
 
         monkeypatch.setattr(JournalWriter, "record", fail_second_record)
 
@@ -1843,7 +1843,7 @@ class TestTruncatedOrphanPartResume:
             order.append(("replace", Path(src_path), Path(dst_path)))
             return real_replace(src_path, dst_path)
 
-        def spy_record(self, action, source_s, destination):
+        def spy_record(self, action, source_s, destination, **kwargs):
             order.append("journal")
             assert Path(source_s) == source
             assert source.is_file()
@@ -1851,7 +1851,7 @@ class TestTruncatedOrphanPartResume:
             assert Path(destination) == planned
             assert planned.read_bytes() == payload
             assert not part.exists()
-            return real_record(self, action, source_s, destination)
+            return real_record(self, action, source_s, destination, **kwargs)
 
         def spy_unlink(self, *args, **kwargs):
             if self == source:
@@ -1953,10 +1953,10 @@ class TestResumePublishedDestination:
         real_record = JournalWriter.record
         real_unlink = Path.unlink
 
-        def spy_record(self, action, source_text, destination):
+        def spy_record(self, action, source_text, destination, **kwargs):
             order.append("journal")
             assert source.exists()
-            return real_record(self, action, source_text, destination)
+            return real_record(self, action, source_text, destination, **kwargs)
 
         def spy_unlink(self, *args, **kwargs):
             if self == source:

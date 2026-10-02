@@ -22,7 +22,10 @@ Safety features:
   exception aborts the loop after at least one operation was recorded.
   Resume seeds that log from the unfinished journal first, so undo
   covers files journaled before a crash that never reached save_log.
-  The log is fsynced before its name is published.
+  The seeded sha256 and size are the ones stored on the journal line,
+  not a hash of whatever file is at the destination now. A move with
+  no recorded sha256 is not undone. The log is fsynced before its
+  name is published.
 """
 
 from __future__ import annotations
@@ -263,39 +266,59 @@ def saved_run_owns_plan_row(item, owned: set[str]) -> bool:
     return not source.exists()
 
 
+def _move_source_conflicts(source: str, destination: str) -> bool:
+    """True when a journaled move's source is a different file than dest.
+
+    Both paths are regular files and their bytes differ. The destination
+    is then not something undo should relocate: the source is still the
+    user's file, or it was replaced after the interrupt. A missing source
+    (same-volume rename) or a missing destination is not this case.
+    """
+    if not source or not destination:
+        return False
+    src, dest = Path(source), Path(destination)
+    try:
+        if not src.is_file() or not dest.is_file():
+            return False
+    except OSError:
+        return False
+    return not files_identical(src, dest)
+
+
 def _seed_log_from_journal(log: RunLog, dest_dir: Path | str) -> None:
     """Append the open journal's done files to ``log`` before the plan runs.
 
     A crash journals each finished file and can die before ``save_log``.
     Resume skips those sources, so a new empty log would omit them and
-    undo would leave them where the crashed run put them. Size and sha256
-    are filled when the destination is still a readable file, which is
-    what move-undo checks. A missing or unreadable file is still recorded
-    (``size=-1``, empty sha256) so copy and move undo can try to restore it.
+    undo would leave them where the crashed run put them.
+
+    Size and sha256 come from the journal line, written when the file was
+    published. They are not read from whoever occupies the destination
+    now. A line that omitted them (an older journal, or a destination
+    that was never hashed) stays ``size=-1`` and an empty sha256. Move
+    undo refuses that row instead of trusting the path.
+
+    A move whose source is still a file and does not match the destination
+    is recorded as ``kept``. Undo must not relocate that occupant back
+    onto the source or beside it.
     """
     journal = find_unfinished_journal(dest_dir)
     if journal is None:
         return
     for entry in completed_operations(journal):
         destination = entry["destination"]
-        size = -1
-        digest = ""
-        if destination:
-            path = Path(destination)
-            try:
-                if path.is_file():
-                    size = path.stat().st_size
-                    digest = file_sha256(path)
-            except OSError:
-                size = -1
-                digest = ""
+        action = entry["action"]
+        status = "done"
+        if action == "move" and _move_source_conflicts(
+                entry["source"], destination):
+            status = "kept"
         log.operations.append(Operation(
-            action=entry["action"],
+            action=action,
             source=entry["source"],
             destination=destination,
-            status="done",
-            size=size,
-            sha256=digest,
+            status=status,
+            size=entry.get("size", -1),
+            sha256=entry.get("sha256") or "",
         ))
 
 
@@ -442,7 +465,9 @@ def execute_plan(
                         op.size = item.size
                     op.status = "done"
                     bytes_done += item.size
-                    journal.record(action, str(item.source), str(final))
+                    journal.record(
+                        action, str(item.source), str(final),
+                        sha256=op.sha256, size=op.size)
                     if unlink_source_after_journal:
                         try:
                             item.source.unlink()
