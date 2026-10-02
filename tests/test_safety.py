@@ -13,6 +13,7 @@ import pytest
 
 from media_organizer.core.executor import (
     _volume_id, bytes_still_needed, execute_plan, free_space_status,
+    saved_run_owns_plan_row,
 )
 from media_organizer.core.journal import (
     PART_SUFFIX, JournalWriter, atomic_copy, atomic_move, cleanup_stale_parts,
@@ -27,7 +28,7 @@ from media_organizer.core.metadata import (
 from media_organizer.core.organizer import OrganizeOptions, PlannedFile, build_plan
 from media_organizer.core.plan import (
     Operation, list_run_logs, load_undoable_log, log_path_for, new_log,
-    save_log, undo_log,
+    save_log, saved_run_destinations, undo_log,
 )
 from tests.helpers import make_jpeg_with_exif, make_jpeg_with_gps
 
@@ -872,8 +873,18 @@ class TestJournal:
     def test_discard_journal(self, tmp_path):
         src, dst = _setup(tmp_path, n=2)
         options = OrganizeOptions(source_dir=src, dest_dir=dst)
-        execute_plan(_plan(src, dst), options, cancel=lambda: True)
-        assert find_unfinished_journal(dst) is not None
+        calls = {"n": 0}
+
+        def cancel_after_one():
+            calls["n"] += 1
+            return calls["n"] > 1
+
+        # A cancel before any file records nothing, so it does not leave a
+        # journal. Discard still has to clear one that already has done lines.
+        execute_plan(_plan(src, dst), options, cancel=cancel_after_one)
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        assert completed_sources(journal)
         discard_journal(dst)
         assert find_unfinished_journal(dst) is None
 
@@ -1562,6 +1573,109 @@ class TestPartialFileErrorsLeaveJournalUnfinished:
         by_id = {path_identity(item.source): item for item in rescanned_b}
         assert by_id[path_identity(plan_b[0].source)].destination == (
             plan_b[0].destination)
+
+
+class TestDiscardRestartCancel:
+    """Cancelling a Discard restart before a new write must not hide Undo.
+
+    Discard seeds and saves the interrupted journal, then drops it and
+    starts a new run for whatever is left. Cancelling that restart on the
+    first row used to ``save_log`` an empty ``RunLog`` in front of the
+    seeded log, and the ``JournalWriter`` opened for the restart stayed
+    unfinished with zero done lines.
+    """
+
+    def test_cancel_before_any_new_file_keeps_seeded_log(
+            self, tmp_path):
+        src, dst = _setup(tmp_path, n=3)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=True)
+        plan = _plan(src, dst, copy_mode=True)
+        calls = {"n": 0}
+
+        def cancel_after_one():
+            calls["n"] += 1
+            return calls["n"] > 1
+
+        _log, summary = execute_plan(plan, options, cancel=cancel_after_one)
+        assert summary["cancelled"] is True
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        done = completed_sources(journal)
+        assert len(done) == 1
+
+        # Same sequence as Discard after free-space preflight: seed and
+        # save from the open journal, drop it, then run only rows the
+        # seeded log does not already own.
+        seeded, seeded_summary = execute_plan([], options)
+        assert seeded_summary["cancelled"] is False
+        assert len(seeded.operations) == 1
+        assert seeded.operations[0].status == "done"
+        interrupted = Path(seeded.operations[0].destination)
+        assert interrupted.is_file()
+        discard_journal(dst)
+        assert find_unfinished_journal(dst) is None
+        owned = saved_run_destinations(dst)
+        remaining = [item for item in plan
+                     if not saved_run_owns_plan_row(item, owned)]
+        assert remaining
+        assert len(remaining) < len(plan)
+
+        restart, restart_summary = execute_plan(
+            remaining, options, cancel=lambda: True)
+        assert restart_summary["cancelled"] is True
+        assert restart.operations == []
+
+        assert find_unfinished_journal(dst) is None
+        logs = list_run_logs(dst)
+        assert logs
+        assert logs[0].run_id == seeded.run_id
+        assert logs[0].operations
+        assert restart.run_id not in {item.run_id for item in logs}
+        assert all(item.operations for item in logs)
+
+        newest = load_undoable_log(dst)
+        assert newest is not None and newest.run_id == seeded.run_id
+        result = undo_log(newest, dst)
+        assert result["undone"] == 1
+        assert result["failed"] == 0
+        assert not interrupted.exists()
+        assert Path(seeded.operations[0].source).is_file()
+
+    def test_resume_cancel_before_new_file_keeps_journal_and_seeded_log(
+            self, tmp_path):
+        """Resume that is cancelled before a new file still undoes the seed.
+
+        The open journal is the thing to continue. An empty restart after
+        Discard is the case that must not publish a log; this one already
+        has done lines.
+        """
+        src, dst = _setup(tmp_path, n=3)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=True)
+        plan = _plan(src, dst, copy_mode=True)
+        calls = {"n": 0}
+
+        def cancel_after_one():
+            calls["n"] += 1
+            return calls["n"] > 1
+
+        execute_plan(plan, options, cancel=cancel_after_one)
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        done = completed_sources(journal)
+        remaining = exclude_completed_sources(plan, done)
+        assert remaining
+
+        log, summary = execute_plan(remaining, options, cancel=lambda: True)
+        assert summary["cancelled"] is True
+        assert len(log.operations) == 1
+        assert log.operations[0].status == "done"
+        still = find_unfinished_journal(dst)
+        assert still is not None
+        assert completed_sources(still) == done
+        newest = load_undoable_log(dst)
+        assert newest is not None
+        assert newest.run_id == log.run_id
+        assert len(newest.operations) == 1
 
 
 class TestUndoDiscardsOverlappingJournal:

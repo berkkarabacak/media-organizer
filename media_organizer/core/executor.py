@@ -18,8 +18,11 @@ Safety features:
   already holds the source. A same-volume move is a rename and is not
   counted. A copy, a cross-volume move, and a move whose device cannot
   be read still count in full.
-- operation log: saved on success, on cancel, and when an unexpected
-  exception aborts the loop after at least one operation was recorded.
+- operation log: saved on success, on cancel once an operation was
+  recorded, and when an unexpected exception aborts the loop after at
+  least one operation was recorded. A cancel before any recorded
+  operation does not publish an empty log, and it does not leave an
+  unfinished journal that has zero done lines.
   Resume seeds that log from the unfinished journal first, so undo
   covers files journaled before a crash that never reached save_log.
   The seeded sha256 and size are the ones stored on the journal line,
@@ -38,7 +41,7 @@ from typing import Callable, Optional
 
 from .journal import (JournalWriter, atomic_copy, atomic_move,
                        cleanup_stale_parts, completed_operations,
-                       file_sha256, files_identical,
+                       discard_journal, file_sha256, files_identical,
                        find_unfinished_journal, path_identity)
 from .metadata import DateSource
 from .organizer import OrganizeOptions, PlannedFile
@@ -493,10 +496,21 @@ def execute_plan(
             finally:
                 journal.close()
 
-    # Cancel and a normal finish always persist the log. An unexpected
-    # exception persists it only once something was recorded, then the
-    # original error propagates. A dry run never writes a log.
-    if not dry_run and (aborted is None or log.operations):
+    # A cancel before any operation was recorded must not publish an empty
+    # undo log or leave an unfinished journal with zero done lines.
+    # Discard already saved the seeded journal and dropped it, so this
+    # restart has nothing to seed. JournalWriter still opens a new file,
+    # and saving would archive that seeded log behind a run that restores
+    # nothing. The next Organize would offer Resume for 0 files.
+    # Cancel after a recorded file, a normal finish, and an unexpected
+    # exception that already recorded work still persist. A dry run never
+    # writes a log. An unexpected exception with an empty log does not.
+    if not dry_run and summary["cancelled"] and not log.operations:
+        open_journal = find_unfinished_journal(options.dest_dir)
+        if (open_journal is not None
+                and not completed_operations(open_journal)):
+            discard_journal(options.dest_dir)
+    elif not dry_run and (aborted is None or log.operations):
         save_log(log, options.dest_dir)
     if aborted is not None:
         raise aborted
