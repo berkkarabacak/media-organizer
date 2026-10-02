@@ -29,9 +29,12 @@ Safety features:
   not a hash of whatever file is at the destination now. A legacy move
   line that omitted both still gets that pair's hash when the source
   and destination are two regular files with the same bytes and this
-  run is about to remove the source. A missing side, or two files that
-  differ, is not hashed. A move with no recorded sha256 is not undone.
-  The log is fsynced before its name is published.
+  run is about to remove the source. That hash is fsynced onto the
+  existing journal line before the source is unlinked, so a kill before
+  ``save_log`` does not drop it. A second done line is not appended.
+  A missing side, or two files that differ, is not hashed. A move with
+  no recorded sha256 is not undone. The log is fsynced before its name
+  is published.
 """
 
 from __future__ import annotations
@@ -195,8 +198,9 @@ def free_space_status(dest_dir: Path | str, needed_bytes: int) -> dict:
 
 
 def _record_legacy_move_pair(log: RunLog | None, source: Path,
-                             destination: Path) -> bool:
-    """Store sha256 and size on a seeded move that omitted both.
+                             destination: Path,
+                             writer: JournalWriter | None = None) -> bool:
+    """Store sha256 and size for a legacy move that omitted both.
 
     Called only when ``source`` and ``destination`` are two different
     regular files and ``files_identical`` just said they match, and
@@ -205,16 +209,33 @@ def _record_legacy_move_pair(log: RunLog | None, source: Path,
     source is already gone, and a row that already recorded a sha256
     or a size is left as the journal wrote it.
 
-    Returns False when a row that omitted both still has no sha256, so
-    the caller leaves the source in place. Returns True when there is
-    no such row, or this call stored the hash. A row that already
-    recorded a sha256 or a size is not changed.
+    The hash is fsynced onto the existing crash-journal line before
+    the seeded row is updated and before this returns True. ``save_log``
+    runs only at the end of the plan. A kill after the source is gone
+    and before that save still has to find the hash in the journal.
+    The line is rewritten in place. Appending a second done line would
+    seed two undo rows, and Undo would park the destination beside the
+    source when that source was still there.
+
+    Returns False when the journal line cannot be updated, so the
+    caller leaves the source in place. Returns True when the hash is
+    durable. A row that already recorded a sha256 or a size is not
+    changed; this function is not called for that row.
     """
+    if writer is None:
+        return False
+    try:
+        digest = file_sha256(destination)
+        size = destination.stat().st_size
+    except OSError:
+        return False
+    if not writer.stamp_legacy_move(
+            str(source), str(destination), digest, size):
+        return False
     if log is None:
         return True
     source_key = path_identity(source)
     dest_key = path_identity(destination)
-    pending = []
     for op in log.operations:
         if op.action != "move" or op.status != "done" or not op.destination:
             continue
@@ -224,15 +245,6 @@ def _record_legacy_move_pair(log: RunLog | None, source: Path,
             continue
         if path_identity(op.destination) != dest_key:
             continue
-        pending.append(op)
-    if not pending:
-        return True
-    try:
-        digest = file_sha256(destination)
-        size = destination.stat().st_size
-    except OSError:
-        return False
-    for op in pending:
         op.sha256 = digest
         op.size = size
     return True
@@ -240,7 +252,8 @@ def _record_legacy_move_pair(log: RunLog | None, source: Path,
 
 def finish_pending_move_unlinks(dest_dir: Path | str, plan=(), *,
                                 copy_mode: bool = False,
-                                log: RunLog | None = None) -> int:
+                                log: RunLog | None = None,
+                                writer: JournalWriter | None = None) -> int:
     """Remove sources a cross-volume move journaled but did not unlink.
 
     Returns how many sources were removed.
@@ -254,10 +267,12 @@ def finish_pending_move_unlinks(dest_dir: Path | str, plan=(), *,
 
     A journal line from before sha256 was stored has an empty hash.
     Undo cannot put the file back after this unlink unless that hash
-    is recorded first. When ``log`` has that seeded move, and both
-    files are still present and identical, the pair's sha256 and size
-    are written onto the row before the source is removed. A row that
-    already has either field is not rewritten.
+    is recorded first. When both files are still present and identical,
+    the pair's sha256 and size are fsynced onto that existing journal
+    line, then copied onto the seeded row, and only then is the source
+    removed. A row that already has either field is not rewritten.
+    ``writer`` is the journal already opened for this run. Without it
+    the hash would sit only in memory until ``save_log``.
 
     Leave the source alone when the destination is missing, the bytes
     differ, or the two paths are the same file. That source may be the
@@ -268,8 +283,8 @@ def finish_pending_move_unlinks(dest_dir: Path | str, plan=(), *,
     """
     if copy_mode:
         return 0
-    journal = find_unfinished_journal(dest_dir)
-    if journal is None:
+    journal_path = find_unfinished_journal(dest_dir)
+    if journal_path is None:
         return 0
     # Rows still in the plan take the reused-destination path: journal,
     # then unlink. Removing the source first would make that path miss
@@ -280,7 +295,7 @@ def finish_pending_move_unlinks(dest_dir: Path | str, plan=(), *,
             continue
         deferred.add(path_identity(item.source))
     removed = 0
-    for entry in completed_operations(journal):
+    for entry in completed_operations(journal_path):
         if entry["action"] != "move" or not entry["destination"]:
             continue
         source = Path(entry["source"])
@@ -295,9 +310,12 @@ def finish_pending_move_unlinks(dest_dir: Path | str, plan=(), *,
             continue
         # Hash the pair that is about to lose its source. A later Undo
         # sees only the destination, so an empty legacy sha256 would
-        # leave that only copy stuck there. If the hash cannot be
-        # stored, keep the source.
-        if not _record_legacy_move_pair(log, source, destination):
+        # leave that only copy stuck there. The hash has to be durable
+        # in the journal before the unlink: this run's save_log has not
+        # happened yet. If it cannot be stored, keep the source.
+        if (not entry["sha256"] and entry["size"] < 0
+                and not _record_legacy_move_pair(
+                    log, source, destination, writer)):
             continue
         try:
             source.unlink()
@@ -361,8 +379,9 @@ def _seed_log_from_journal(log: RunLog, dest_dir: Path | str) -> None:
     now. A line that omitted them (an older journal, or a destination
     that was never hashed) stays ``size=-1`` and an empty sha256 here.
     Move undo refuses that row instead of trusting the path. A Move
-    resume that then removes a still-matching source records the pair's
-    hash on that seeded row first; this function does not.
+    resume that then removes a still-matching source fsyncs the pair's
+    hash onto the journal line and the seeded row before the unlink.
+    This function does not.
 
     A move whose source is still a file and does not match the destination
     is recorded as ``kept``. Undo must not relocate that occupant back
@@ -457,7 +476,8 @@ def execute_plan(
         # longer matches leave the source in place.
         if journal is not None and not options.copy_mode:
             finish_pending_move_unlinks(
-                options.dest_dir, plan, copy_mode=False, log=log)
+                options.dest_dir, plan, copy_mode=False, log=log,
+                writer=journal)
         for i, item in enumerate(plan):
             if cancel and cancel():
                 summary["cancelled"] = True

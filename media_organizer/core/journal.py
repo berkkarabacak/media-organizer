@@ -49,7 +49,10 @@ class JournalWriter:
 
     ``record`` stores the sha256 and size of the bytes just published.
     Resume seeds undo from those fields. It does not hash whatever file
-    is at the destination later.
+    is at the destination later. A legacy move line that omitted both
+    can be filled in place, before the source is removed, so a crash
+    before the operation log is saved still has a hash to seed. That
+    update does not append a second done line.
     """
 
     def __init__(self, dest_dir: Path | str, *, resume: bool | None = None):
@@ -90,7 +93,61 @@ class JournalWriter:
         os.fsync(self._fh.fileno())
 
     def close(self) -> None:
+        fh = self._fh
+        if fh is not None and not fh.closed:
+            fh.close()
+
+    def stamp_legacy_move(self, source: str, destination: str,
+                          sha256: str, size: int) -> bool:
+        """Fsync sha256 and size onto each matching legacy move line.
+
+        The line is a done move in the open run that names this pair and
+        omitted both fields. Other lines stay as they were, including a
+        line that already recorded a hash or a size. Nothing is appended:
+        a second done line would seed a second undo row.
+
+        The append handle is closed for the replace, then reopened at the
+        end of the new file so a later ``record`` or ``complete`` still
+        appends. Returns False when the line cannot be updated. The
+        caller must not remove the source in that case.
+        """
+        if (not sha256 or isinstance(size, bool) or not isinstance(size, int)
+                or size < 0):
+            return False
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+        try:
+            original = self.path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        rewritten = _stamp_legacy_move_text(
+            original, source, destination, sha256, size)
+        if rewritten is None:
+            return False
+        # Same publish order as save_log: fsync the temp file, then
+        # replace. The append handle has to be closed first. On Windows
+        # a replace of a file this process still has open fails, and on
+        # Linux a later write would hit the old inode.
+        tmp = self.path.with_name(self.path.name + ".stamp")
         self._fh.close()
+        replaced = False
+        try:
+            with open(tmp, "w", encoding="utf-8") as out:
+                out.write(rewritten)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(tmp, self.path)
+            replaced = True
+        except OSError:
+            replaced = False
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            self._fh = open(self.path, "a", encoding="utf-8")
+        return replaced
 
     def __enter__(self):
         return self
@@ -182,6 +239,68 @@ def _entry_size(entry: dict) -> int:
     if isinstance(size, bool) or not isinstance(size, int) or size < 0:
         return -1
     return size
+
+
+def _parse_journal_line(line: str) -> dict | None:
+    stripped = line.strip()
+    if not stripped:
+        return None
+    try:
+        entry = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(entry, dict):
+        return None
+    return entry
+
+
+def _stamp_legacy_move_text(text: str, source: str, destination: str,
+                            sha256: str, size: int) -> str | None:
+    """Return journal text with this legacy move line filled in.
+
+    ``None`` when no open-run done move for this pair omitted both
+    sha256 and size. Lines before the last complete marker, torn lines,
+    and every other done line are copied through unchanged.
+    """
+    source_key = path_identity(source)
+    dest_key = path_identity(destination)
+    lines = text.splitlines(keepends=True)
+    parsed: list[dict | None] = []
+    last_complete = -1
+    for index, line in enumerate(lines):
+        entry = _parse_journal_line(line)
+        parsed.append(entry)
+        if entry is not None and entry.get("run") == "complete":
+            last_complete = index
+    changed = False
+    for index, entry in enumerate(parsed):
+        if index <= last_complete or entry is None:
+            continue
+        if entry.get("status") != "done" or entry.get("action") != "move":
+            continue
+        src = entry.get("source") or ""
+        dest = entry.get("destination") or ""
+        if not isinstance(src, str) or not isinstance(dest, str):
+            continue
+        if not src or not dest:
+            continue
+        if path_identity(src) != source_key or path_identity(dest) != dest_key:
+            continue
+        if _entry_sha256(entry) or _entry_size(entry) >= 0:
+            continue
+        entry["sha256"] = sha256
+        entry["size"] = size
+        newline = ""
+        raw = lines[index]
+        if raw.endswith("\r\n"):
+            newline = "\r\n"
+        elif raw.endswith("\n"):
+            newline = "\n"
+        lines[index] = json.dumps(entry) + newline
+        changed = True
+    if not changed:
+        return None
+    return "".join(lines)
 
 
 def completed_operations(journal_path: Path | str) -> list[dict]:
