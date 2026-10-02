@@ -23,8 +23,10 @@ Safety features:
 - free-space preflight helper. The byte total is what this run will
   still write, not rows Resume will skip and not a destination that
   already holds the source. A same-volume move is a rename and is not
-  counted. A copy, a cross-volume move, and a move whose device cannot
-  be read still count in full.
+  counted. On Windows a shared device id is that rename only when the
+  drive anchors match, because ``st_dev`` is often 0 on every drive.
+  A copy, a cross-volume move, and a move whose device cannot be read
+  still count in full.
 - operation log: saved on success, on cancel once an operation was
   recorded, and when an unexpected exception aborts the loop after at
   least one operation was recorded. A clean finish fsyncs that log
@@ -50,10 +52,11 @@ Safety features:
 
 from __future__ import annotations
 
+import ntpath
 import os
 import re
 import shutil
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Callable, Optional
 
 from .journal import (JournalWriter, atomic_copy, atomic_move,
@@ -139,11 +142,53 @@ def _volume_id(path: Path | str) -> int | None:
         return None
 
 
+def _windows_anchor(path: Path | str) -> str:
+    """Case-folded Windows drive or UNC root of ``path``.
+
+    ``C:/Photos`` and ``c:\\photos`` are both ``c:\\``. A relative path
+    with no drive and no UNC share is ``""``. ``PureWindowsPath`` parses
+    the string the same way on Linux, so tests can pass drive-letter
+    paths without a Windows runner.
+    """
+    return ntpath.normcase(PureWindowsPath(os.fspath(path)).anchor)
+
+
+def _same_volume(
+    source: Path | str,
+    dest_dir: Path | str,
+    source_dev: int | None,
+    dest_dev: int | None,
+    *,
+    windows: bool | None = None,
+) -> bool:
+    """True when Move can rename ``source`` onto ``dest_dir``.
+
+    A missing device id is not the same volume: the caller counts those
+    bytes. Unequal ids are a copy. On POSIX, equal ids are a rename.
+
+    On Windows, and when ``windows=True``, equal ids are a rename only
+    when the drive or UNC anchors also match. ``st_dev`` is often 0 on
+    every drive, so ``C:\\`` and ``D:\\`` must not look like one volume
+    just because both devices are 0. Matching anchors (``C:\\`` and
+    ``c:/Organized``) still omit, including when both ids are 0.
+    ``windows=False`` keeps the POSIX comparison. ``None`` follows
+    ``os.name``.
+    """
+    if source_dev is None or dest_dev is None or source_dev != dest_dev:
+        return False
+    if windows is None:
+        windows = os.name == "nt"
+    if not windows:
+        return True
+    return _windows_anchor(source) == _windows_anchor(dest_dir)
+
+
 def bytes_still_needed(
     plan,
     *,
     copy_mode: bool = True,
     dest_dir: Path | str | None = None,
+    windows: bool | None = None,
 ) -> int:
     """Bytes ``execute_plan`` will still write for ``plan``.
 
@@ -157,11 +202,16 @@ def bytes_still_needed(
     collision suffix.
 
     Move mode (``copy_mode=False``) omits a row whose source is on the
-    same device as ``dest_dir``. ``atomic_move`` renames that file with
+    same volume as ``dest_dir``. ``atomic_move`` renames that file with
     ``os.replace`` and does not need a second copy of those bytes. A
     different device still needs the durable copy before the source is
     unlinked, so that size counts. If either device cannot be read, or
     ``dest_dir`` was not passed, the size counts too.
+
+    On Windows, equal ``st_dev`` values (including 0) are that rename
+    only when the drive or UNC anchors match. ``windows=True`` applies
+    the same anchor check on other systems. ``windows=False`` does not.
+    ``None`` follows ``os.name``.
     """
     total = 0
     dest_dev = None
@@ -172,8 +222,11 @@ def bytes_still_needed(
             continue
         if files_identical(item.source, item.destination):
             continue
-        if (not copy_mode and dest_dev is not None
-                and _volume_id(item.source) == dest_dev):
+        if (not copy_mode and dest_dir is not None and dest_dev is not None
+                and _same_volume(
+                    item.source, dest_dir,
+                    _volume_id(item.source), dest_dev,
+                    windows=windows)):
             continue
         total += item.size
     return total

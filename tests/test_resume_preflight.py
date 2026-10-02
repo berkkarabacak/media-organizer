@@ -4,7 +4,8 @@ Free space used to be summed before the crash-journal question, so files
 Resume will skip could block the run. A destination that already holds
 the source is journaled only and must not inflate ``needed`` either.
 Move mode omits a same-volume rename. Copy mode, and a move onto another
-device, still count those bytes.
+device, still count those bytes. A Windows ``st_dev`` of 0 is not one
+volume when the drive letters differ.
 """
 
 from __future__ import annotations
@@ -472,6 +473,81 @@ class TestResumePreflight:
         assert window.org_worker is None
         assert find_unfinished_journal(dst) is not None
         assert done.is_file() and fresh.is_file()
+
+    def test_move_windows_zero_device_different_drives_blocks(
+            self, qapp, window, tmp_path, monkeypatch):
+        """Move C: → D: with st_dev 0 still hits the free-space block.
+
+        The folders are relative ``C:/Photos`` and ``D:/Organized`` under
+        the temp dir. ``windows=True`` is the branch the GUI takes on
+        Windows. A blocked check must not start the worker or rewrite
+        the open journal.
+        """
+        if os.name == "nt":
+            pytest.skip("relative drive-letter fixture is for non-Windows")
+        monkeypatch.chdir(tmp_path)
+        src = Path("C:/Photos")
+        dst = Path("D:/Organized")
+        src.mkdir(parents=True)
+        dst.mkdir(parents=True)
+        capture = _capture()
+        done = src / "done.jpg"
+        fresh = src / "fresh.jpg"
+        done.write_bytes(b"done")
+        fresh.write_bytes(b"fresh")
+        plan = [
+            PlannedFile(done, dst / "done.jpg", 111, capture, "image"),
+            PlannedFile(fresh, dst / "fresh.jpg", 10**15, capture, "image"),
+        ]
+        with JournalWriter(dst) as writer:
+            writer.record("move", str(done), str(dst / "done.jpg"))
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        before = journal.read_bytes()
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", lambda _path: 0)
+        # Do not assign os.name = "nt": Path() would then build Windows
+        # paths and C:/Photos would stop being the directory created above.
+        # windows=True is the same branch Windows takes when os.name is nt.
+        real_needed = bytes_still_needed
+
+        def needed(plan, **kwargs):
+            kwargs["windows"] = True
+            return real_needed(plan, **kwargs)
+
+        monkeypatch.setattr(
+            "media_organizer.gui.main_window.bytes_still_needed", needed)
+
+        def ancestor(path):
+            # Off Windows a drive-letter string is not climbed into cwd.
+            # These directories exist under the temp dir, so free-space
+            # can read them. disk_usage itself is stubbed below.
+            candidate = Path(path)
+            return candidate if candidate.exists() else Path(".")
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._existing_ancestor", ancestor)
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
+        seen = _install_space(monkeypatch, free=1000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.start_organize()
+
+        assert events[0][1].startswith("Move mode removes")
+        assert events[1][0] == "question"
+        assert "Resume" in events[1][1]
+        assert seen == [10**15]
+        critical = _texts(events, "critical")
+        assert len(critical) == 1
+        assert "Not enough free space" in critical[0]
+        assert format_bytes(10**15) in critical[0]
+        assert window.org_worker is None
+        assert find_unfinished_journal(dst) == journal
+        assert journal.read_bytes() == before
+        assert done.is_file() and fresh.is_file()
+        assert not (dst / "fresh.jpg").exists()
 
     def test_resume_move_same_volume_measures_only_the_remainder(
             self, qapp, window, tmp_path, monkeypatch):

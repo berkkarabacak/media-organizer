@@ -1271,6 +1271,8 @@ class MainWindow(QMainWindow):
         # that will actually run still has to write. Copy mode counts each
         # remaining file. Move mode omits a same-volume rename and still
         # counts a cross-volume copy, or a row whose device cannot be read.
+        # Windows often reports st_dev 0 on every drive; different drive
+        # letters still count.
         # A blocked check leaves the journal in place so the same choice
         # can be made again.
         discard_after_preflight = False
