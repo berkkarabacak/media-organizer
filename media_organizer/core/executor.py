@@ -26,9 +26,12 @@ Safety features:
   Resume seeds that log from the unfinished journal first, so undo
   covers files journaled before a crash that never reached save_log.
   The seeded sha256 and size are the ones stored on the journal line,
-  not a hash of whatever file is at the destination now. A move with
-  no recorded sha256 is not undone. The log is fsynced before its
-  name is published.
+  not a hash of whatever file is at the destination now. A legacy move
+  line that omitted both still gets that pair's hash when the source
+  and destination are two regular files with the same bytes and this
+  run is about to remove the source. A missing side, or two files that
+  differ, is not hashed. A move with no recorded sha256 is not undone.
+  The log is fsynced before its name is published.
 """
 
 from __future__ import annotations
@@ -191,8 +194,53 @@ def free_space_status(dest_dir: Path | str, needed_bytes: int) -> dict:
     }
 
 
+def _record_legacy_move_pair(log: RunLog | None, source: Path,
+                             destination: Path) -> bool:
+    """Store sha256 and size on a seeded move that omitted both.
+
+    Called only when ``source`` and ``destination`` are two different
+    regular files and ``files_identical`` just said they match, and
+    only because this run is about to remove ``source``. The hash is
+    those shared bytes. It is not taken from a destination whose
+    source is already gone, and a row that already recorded a sha256
+    or a size is left as the journal wrote it.
+
+    Returns False when a row that omitted both still has no sha256, so
+    the caller leaves the source in place. Returns True when there is
+    no such row, or this call stored the hash. A row that already
+    recorded a sha256 or a size is not changed.
+    """
+    if log is None:
+        return True
+    source_key = path_identity(source)
+    dest_key = path_identity(destination)
+    pending = []
+    for op in log.operations:
+        if op.action != "move" or op.status != "done" or not op.destination:
+            continue
+        if op.sha256 or op.size >= 0:
+            continue
+        if path_identity(op.source) != source_key:
+            continue
+        if path_identity(op.destination) != dest_key:
+            continue
+        pending.append(op)
+    if not pending:
+        return True
+    try:
+        digest = file_sha256(destination)
+        size = destination.stat().st_size
+    except OSError:
+        return False
+    for op in pending:
+        op.sha256 = digest
+        op.size = size
+    return True
+
+
 def finish_pending_move_unlinks(dest_dir: Path | str, plan=(), *,
-                                copy_mode: bool = False) -> int:
+                                copy_mode: bool = False,
+                                log: RunLog | None = None) -> int:
     """Remove sources a cross-volume move journaled but did not unlink.
 
     Returns how many sources were removed.
@@ -203,6 +251,13 @@ def finish_pending_move_unlinks(dest_dir: Path | str, plan=(), *,
     unlink it when the journal action is move, this ``plan`` will not move
     it itself, and the destination is still a byte-for-byte match of a
     different file.
+
+    A journal line from before sha256 was stored has an empty hash.
+    Undo cannot put the file back after this unlink unless that hash
+    is recorded first. When ``log`` has that seeded move, and both
+    files are still present and identical, the pair's sha256 and size
+    are written onto the row before the source is removed. A row that
+    already has either field is not rewritten.
 
     Leave the source alone when the destination is missing, the bytes
     differ, or the two paths are the same file. That source may be the
@@ -237,6 +292,12 @@ def finish_pending_move_unlinks(dest_dir: Path | str, plan=(), *,
         if not files_identical(source, destination):
             continue
         if _same_file(source, destination):
+            continue
+        # Hash the pair that is about to lose its source. A later Undo
+        # sees only the destination, so an empty legacy sha256 would
+        # leave that only copy stuck there. If the hash cannot be
+        # stored, keep the source.
+        if not _record_legacy_move_pair(log, source, destination):
             continue
         try:
             source.unlink()
@@ -298,8 +359,10 @@ def _seed_log_from_journal(log: RunLog, dest_dir: Path | str) -> None:
     Size and sha256 come from the journal line, written when the file was
     published. They are not read from whoever occupies the destination
     now. A line that omitted them (an older journal, or a destination
-    that was never hashed) stays ``size=-1`` and an empty sha256. Move
-    undo refuses that row instead of trusting the path.
+    that was never hashed) stays ``size=-1`` and an empty sha256 here.
+    Move undo refuses that row instead of trusting the path. A Move
+    resume that then removes a still-matching source records the pair's
+    hash on that seeded row first; this function does not.
 
     A move whose source is still a file and does not match the destination
     is recorded as ``kept``. Undo must not relocate that occupant back
@@ -394,7 +457,7 @@ def execute_plan(
         # longer matches leave the source in place.
         if journal is not None and not options.copy_mode:
             finish_pending_move_unlinks(
-                options.dest_dir, plan, copy_mode=False)
+                options.dest_dir, plan, copy_mode=False, log=log)
         for i, item in enumerate(plan):
             if cancel and cancel():
                 summary["cancelled"] = True

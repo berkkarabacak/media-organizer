@@ -4,6 +4,11 @@ The crash journal used to omit sha256 and size. Resume then hashed whatever
 was at the destination when the log was seeded, and move undo trusted that
 snapshot. Replacing the destination, or putting a new file there after a
 seed that saw nothing, made Undo move the user's file.
+
+A legacy move line still has no hash. Seeding must not adopt a destination
+whose source is already gone. When both sides are still present and
+identical, empty Move Resume records that pair's hash before it unlinks
+the source, so Undo can put the file back.
 """
 
 import hashlib
@@ -149,6 +154,82 @@ def test_source_with_different_bytes_is_not_an_undoable_move(tmp_path):
     assert result["undone"] == 0
     assert dest.read_bytes() == _REPLACEMENT
     assert source.read_bytes() == b"still-in-the-library"
+    assert not list(src.rglob("*restored*"))
+    assert not list(dst.rglob("*restored*"))
+
+
+def test_legacy_matching_move_resume_unlinks_and_undo_restores(tmp_path):
+    """Pre-hash journal, both sides still identical, then empty Move Resume.
+
+    Resume removes the source. The saved log must carry the hash of that
+    pair, and Undo must put those bytes back at the source and remove
+    the destination. Same end state as a journal that stored the hash.
+    """
+    src, dst = _dirs(tmp_path)
+    source = src / "shot.jpg"
+    dest = dst / "2024" / "shot.jpg"
+    dest.parent.mkdir(parents=True)
+    source.write_bytes(_ORIGINAL)
+    dest.write_bytes(_ORIGINAL)
+    with JournalWriter(dst) as writer:
+        writer.record("move", str(source), str(dest))
+    recorded = json.loads(
+        journal_path_for(dst).read_text(encoding="utf-8").strip())
+    assert "sha256" not in recorded
+    assert "size" not in recorded
+
+    log, summary = execute_plan(
+        [], OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False))
+
+    assert summary["moved"] == 0
+    assert not source.exists()
+    assert dest.read_bytes() == _ORIGINAL
+    assert log.operations[0].status == "done"
+    assert log.operations[0].sha256 == _digest(_ORIGINAL)
+    assert log.operations[0].size == len(_ORIGINAL)
+    saved = load_log(dst)
+    assert saved is not None
+    assert saved.operations[0].sha256 == _digest(_ORIGINAL)
+    assert saved.operations[0].size == len(_ORIGINAL)
+    result = undo_log(saved, dst)
+    assert result["undone"] == 1
+    assert result["kept"] == 0
+    assert result["failed"] == 0
+    assert source.read_bytes() == _ORIGINAL
+    assert not dest.exists()
+    assert not list(src.rglob("*restored*"))
+    assert not list(dst.rglob("*restored*"))
+
+
+def test_legacy_matching_move_copy_resume_does_not_hash_or_unlink(tmp_path):
+    """Copy Resume does not remove the source, so it must not invent a hash.
+
+    Undo of that log leaves both copies where they are. A hash here would
+    relocate the destination beside the source.
+    """
+    src, dst = _dirs(tmp_path)
+    source = src / "shot.jpg"
+    dest = dst / "2024" / "shot.jpg"
+    dest.parent.mkdir(parents=True)
+    source.write_bytes(_ORIGINAL)
+    dest.write_bytes(_ORIGINAL)
+    with JournalWriter(dst) as writer:
+        writer.record("move", str(source), str(dest))
+
+    log, summary = execute_plan(
+        [], OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=True))
+
+    assert summary["copied"] == 0
+    assert source.read_bytes() == _ORIGINAL
+    assert dest.read_bytes() == _ORIGINAL
+    assert log.operations[0].status == "done"
+    assert log.operations[0].sha256 == ""
+    assert log.operations[0].size == -1
+    result = undo_log(log, dst)
+    assert result["undone"] == 0
+    assert result["kept"] == 1
+    assert source.read_bytes() == _ORIGINAL
+    assert dest.read_bytes() == _ORIGINAL
     assert not list(src.rglob("*restored*"))
     assert not list(dst.rglob("*restored*"))
 
