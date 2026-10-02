@@ -1560,6 +1560,177 @@ def _resume_plan(plan, dest):
     return exclude_completed_sources(plan, completed_sources(journal))
 
 
+class TestUndoLogBeforeJournalComplete:
+    """A clean Move must fsync the undo log before the journal is finished.
+
+    ``complete()`` used to run in ``finally``, and ``save_log`` only after
+    that. A kill or a failed publish in the gap left ``{"run": "complete"}``
+    and no ``operation_log.json``. Resume would not seed, so Undo could
+    not put the files back even though they were already at the destination.
+    """
+
+    def test_undo_log_fsyncs_before_journal_complete(self, tmp_path, monkeypatch):
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        assert len(plan) == 2
+        payloads = {item.source: item.source.read_bytes() for item in plan}
+        log_path = log_path_for(dst)
+        tmp_log = log_path.with_name(log_path.name + ".tmp")
+        journal = journal_path_for(dst)
+        order = []
+        real_fsync = os.fsync
+        real_complete = JournalWriter.complete
+
+        def spy_fsync(fd):
+            try:
+                target = Path(os.readlink(f"/proc/self/fd/{fd}"))
+            except OSError:
+                target = None
+            if target == tmp_log and "fsync-log" not in order:
+                order.append("fsync-log")
+                assert tmp_log.is_file()
+                assert not log_path.exists()
+                published = json.loads(tmp_log.read_text(encoding="utf-8"))
+                ops = published["operations"]
+                assert len(ops) == len(plan)
+                assert all(
+                    op["action"] == "move" and op["status"] == "done"
+                    and op["sha256"]
+                    for op in ops)
+                text = journal.read_text(encoding="utf-8")
+                assert '"run": "complete"' not in text
+                assert find_unfinished_journal(dst) == journal
+                done = completed_operations(journal)
+                assert {path_identity(op["source"]) for op in done} == {
+                    path_identity(item.source) for item in plan}
+            return real_fsync(fd)
+
+        def spy_complete(self):
+            order.append("complete")
+            assert order == ["fsync-log", "complete"]
+            assert log_path.is_file()
+            assert not tmp_log.exists()
+            saved = json.loads(log_path.read_text(encoding="utf-8"))
+            assert len(saved["operations"]) == len(plan)
+            assert '"run": "complete"' not in journal.read_text(encoding="utf-8")
+            assert find_unfinished_journal(dst) == journal
+            return real_complete(self)
+
+        monkeypatch.setattr("media_organizer.core.plan.os.fsync", spy_fsync)
+        monkeypatch.setattr(JournalWriter, "complete", spy_complete)
+
+        log, summary = execute_plan(plan, options)
+
+        assert order == ["fsync-log", "complete"]
+        assert summary["moved"] == 2
+        assert summary["errors"] == 0
+        assert summary["cancelled"] is False
+        assert find_unfinished_journal(dst) is None
+        lines = journal.read_text(encoding="utf-8").splitlines()
+        assert lines[-1] == '{"run": "complete"}'
+        assert all(not item.source.exists() for item in plan)
+        result = undo_log(log, dst)
+        assert result["undone"] == 2
+        assert result["kept"] == 0
+        assert result["failed"] == 0
+        for item in plan:
+            assert item.source.read_bytes() == payloads[item.source]
+            assert not item.destination.exists()
+
+    def test_failed_save_log_after_clean_move_seeds_undo_on_resume(
+            self, tmp_path, monkeypatch):
+        """A failed publish after every file moved stays resumable.
+
+        The journal's done lines still carry the move hash. The next
+        Resume seeds Undo from those lines and puts the files back.
+        """
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        assert len(plan) == 2
+        payloads = {item.source: item.source.read_bytes() for item in plan}
+        for item in plan:
+            assert item.destination is not None
+        real_save = save_log
+        real_complete = JournalWriter.complete
+        armed = {"on": True}
+
+        def spy_complete(self):
+            if armed["on"]:
+                raise AssertionError(
+                    "journal.complete ran without a durable undo log")
+            return real_complete(self)
+
+        def fail_save(log, dest_dir):
+            assert armed["on"]
+            assert len(log.operations) == len(plan)
+            assert all(
+                op.action == "move" and op.status == "done" and op.sha256
+                for op in log.operations)
+            text = journal_path_for(dst).read_text(encoding="utf-8")
+            assert '"run": "complete"' not in text
+            for item in plan:
+                assert not item.source.exists()
+                assert item.destination.read_bytes() == payloads[item.source]
+            raise OSError("operation log publish failed")
+
+        monkeypatch.setattr(JournalWriter, "complete", spy_complete)
+        monkeypatch.setattr(
+            "media_organizer.core.executor.save_log", fail_save)
+
+        with pytest.raises(OSError, match="operation log publish failed"):
+            execute_plan(plan, options)
+
+        assert load_undoable_log(dst) is None
+        assert not log_path_for(dst).exists()
+        open_journal = find_unfinished_journal(dst)
+        assert open_journal is not None
+        text = open_journal.read_text(encoding="utf-8")
+        assert '"run": "complete"' not in text
+        done = completed_operations(open_journal)
+        assert len(done) == len(plan)
+        for item in plan:
+            match = next(
+                op for op in done
+                if path_identity(op["source"]) == path_identity(item.source))
+            assert match["action"] == "move"
+            assert match["sha256"] == hashlib.sha256(
+                payloads[item.source]).hexdigest()
+            assert match["size"] == len(payloads[item.source])
+            assert not item.source.exists()
+            assert item.destination.read_bytes() == payloads[item.source]
+
+        armed["on"] = False
+        monkeypatch.setattr(
+            "media_organizer.core.executor.save_log", real_save)
+        remaining = _resume_plan(plan, dst)
+        assert remaining == []
+
+        log, summary = execute_plan(remaining, options)
+
+        assert summary["moved"] == 0
+        assert summary["errors"] == 0
+        assert summary["cancelled"] is False
+        assert find_unfinished_journal(dst) is None
+        assert len(log.operations) == len(plan)
+        assert all(
+            op.action == "move" and op.status == "done" and op.sha256
+            for op in log.operations)
+        saved = load_undoable_log(dst)
+        assert saved is not None
+        assert saved.run_id == log.run_id
+        result = undo_log(saved, dst)
+        assert result["undone"] == 2
+        assert result["kept"] == 0
+        assert result["failed"] == 0
+        for item in plan:
+            assert item.source.read_bytes() == payloads[item.source]
+            assert not item.destination.exists()
+        assert not list(src.rglob("*restored*"))
+        assert not list(dst.rglob("*restored*"))
+
+
 class TestPartialFileErrorsLeaveJournalUnfinished:
     """A per-file failure must not close the crash journal.
 

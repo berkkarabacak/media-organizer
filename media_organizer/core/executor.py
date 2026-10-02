@@ -23,7 +23,11 @@ Safety features:
   be read still count in full.
 - operation log: saved on success, on cancel once an operation was
   recorded, and when an unexpected exception aborts the loop after at
-  least one operation was recorded. A cancel before any recorded
+  least one operation was recorded. A clean finish fsyncs that log
+  while the crash journal is still unfinished, and only then marks the
+  journal complete. A failed save leaves the journal unfinished so the
+  next Resume can seed Undo from its done lines. Cancel and a per-file
+  error still leave it unfinished. A cancel before any recorded
   operation does not publish an empty log, and it does not leave an
   unfinished journal that has zero done lines.
   Resume seeds that log from the unfinished journal first, so undo
@@ -469,11 +473,19 @@ def execute_plan(
     # Anything else (a bug, MemoryError, a runtime failure) used to reach
     # finally with cancelled still false and write {"run": "complete"}, so
     # the next launch treated the crash as finished and could replace the
-    # journal. close() always runs, including when complete() is skipped.
-    # That failure also used to skip save_log. The journal could resume,
-    # but undo had no record of the files already written. save_log runs
-    # for it when the log has any operation (including ones seeded from
-    # the open journal). The journal stays unfinished.
+    # journal. close() runs on that path without complete(). That failure
+    # also used to skip save_log. The journal could resume, but undo had
+    # no record of the files already written. save_log runs for it when
+    # the log has any operation (including ones seeded from the open
+    # journal). The journal stays unfinished.
+    #
+    # A clean finish used to complete() and close() here, then save_log.
+    # A kill or a failed save in that gap left {"run": "complete"} and no
+    # operation log. Resume would not seed, so Undo of the Move that had
+    # already renamed every file was impossible. The undo log is fsynced
+    # first, while this handle is still open and the journal has no
+    # complete marker. complete() runs only after that save returns.
+    # Reopening the journal to append the marker could truncate it.
     finished_normally = False
     aborted: Optional[Exception] = None
     try:
@@ -603,14 +615,15 @@ def execute_plan(
     except Exception as exc:
         aborted = exc
     finally:
-        if journal is not None:
-            try:
-                if (finished_normally and aborted is None
-                        and not summary["cancelled"]
-                        and summary["errors"] == 0):
-                    journal.complete()
-            finally:
-                journal.close()
+        # Cancel, a per-file error, an unexpected exception, and a kill
+        # (BaseException, which skips the save below) close here and stay
+        # resumable. A clean finish keeps the handle so complete() can
+        # append after the undo log is durable.
+        if journal is not None and not (
+                finished_normally and aborted is None
+                and not summary["cancelled"]
+                and summary["errors"] == 0):
+            journal.close()
 
     # A cancel before any operation was recorded must not publish an empty
     # undo log or leave an unfinished journal with zero done lines.
@@ -621,13 +634,28 @@ def execute_plan(
     # Cancel after a recorded file, a normal finish, and an unexpected
     # exception that already recorded work still persist. A dry run never
     # writes a log. An unexpected exception with an empty log does not.
-    if not dry_run and summary["cancelled"] and not log.operations:
-        open_journal = find_unfinished_journal(options.dest_dir)
-        if (open_journal is not None
-                and not completed_operations(open_journal)):
-            discard_journal(options.dest_dir)
-    elif not dry_run and (aborted is None or log.operations):
-        save_log(log, options.dest_dir)
+    # On a clean finish, save_log is the publish of operation_log.json.
+    # complete() is not called when that publish raises.
+    clean_finish = (
+        journal is not None
+        and finished_normally
+        and aborted is None
+        and not summary["cancelled"]
+        and summary["errors"] == 0
+    )
+    try:
+        if not dry_run and summary["cancelled"] and not log.operations:
+            open_journal = find_unfinished_journal(options.dest_dir)
+            if (open_journal is not None
+                    and not completed_operations(open_journal)):
+                discard_journal(options.dest_dir)
+        elif not dry_run and (aborted is None or log.operations):
+            save_log(log, options.dest_dir)
+            if clean_finish:
+                journal.complete()
+    finally:
+        if journal is not None:
+            journal.close()
     if aborted is not None:
         raise aborted
     if progress:
