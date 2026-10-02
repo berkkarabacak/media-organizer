@@ -1,5 +1,5 @@
 """Media Organizer - sort photos and videos by their real capture date."""
 
-__version__ = "1.5.3"
+__version__ = "1.5.4"
 APP_NAME = "Media Organizer"
 PUBLISHER = "MediaOrganizer"

@@ -10,28 +10,36 @@ from __future__ import annotations
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QSettings, QRectF, QTimer
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QUrl
 from PySide6.QtGui import (
     QAction, QColor, QDesktopServices, QKeySequence, QPainter, QPen, QShortcut,
 )
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
-    QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton, QRadioButton,
-    QStackedWidget, QStyledItemDelegate, QTableWidget, QTableWidgetItem,
+    QApplication, QAbstractItemView, QCheckBox, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
+    QLineEdit, QMainWindow, QMenu, QMessageBox, QProgressBar, QPushButton,
+    QRadioButton, QStackedWidget, QStyledItemDelegate, QTableView,
     QToolButton, QVBoxLayout, QWidget,
 )
 
 from .. import APP_NAME, __version__
-from ..core.display import (elide_middle, format_bytes, relative_destination,
+from ..core.display import (elide_middle, finished_run_keeps_plan,
+                            finished_run_lines, finished_run_offers_undo,
+                            format_bytes, relative_destination,
                             relative_destination_fast, sorted_plan_items)
 from ..core.eta import ThroughputEstimator, format_eta, format_rate
-from ..core.executor import free_space_status
+from ..core.executor import (bytes_still_needed, execute_plan,
+                            free_space_status, plan_discard_will_run,
+                            saved_run_owns_plan_row)
 from ..core.journal import (completed_sources, discard_journal,
-                            find_unfinished_journal)
+                            exclude_completed_sources,
+                            find_unfinished_journal, path_identity,
+                            promotable_prepared_moves)
 from ..core.metadata import Confidence, DateSource
-from ..core.organizer import STRATEGIES, OrganizeOptions
-from ..core.plan import load_log, undo_log
+from ..core.organizer import STRATEGIES, OrganizeOptions, destination_blocks_scan
+from ..core.plan import (UNDO_LIMITATION, list_run_logs,
+                         save_promoted_move_log, saved_run_destinations,
+                         undo_log, undo_result_message)
 from ..core.strategies import DEFAULT_STRATEGY_KEY
 from . import icons, theme
 from .workers import OrganizeWorker, ScanWorker
@@ -76,6 +84,110 @@ def _badge(icon_name: str, badge_px: int = 44, icon_px: int = 20,
     return label
 
 
+class _Cell:
+    """Stand-in for QTableWidgetItem so existing callers can read .text()."""
+
+    def __init__(self, model: "_PlanModel", row: int, column: int):
+        self._model = model
+        self._row = row
+        self._column = column
+
+    def text(self) -> str:
+        value = self._model.data(
+            self._model.index(self._row, self._column), Qt.DisplayRole)
+        return "" if value is None else str(value)
+
+    def data(self, role):
+        return self._model.data(self._model.index(self._row, self._column), role)
+
+
+class _PlanModel(QAbstractTableModel):
+    """Plan rows for the preview. The view asks only for cells it paints.
+
+    Building a QTableWidgetItem per cell froze the window after a few
+    thousand files. Strings are prepared once; icons are created when a
+    visible cell is painted.
+    """
+
+    HEADERS = ["FILE", "DATE TAKEN", "FOUND VIA", "NEW LOCATION", "SIZE"]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._rows: list[dict] = []
+
+    def rowCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()):
+        if parent.isValid():
+            return 0
+        return 5
+
+    def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if (role == Qt.DisplayRole and orientation == Qt.Horizontal
+                and 0 <= section < 5):
+            return self.HEADERS[section]
+        return None
+
+    def set_rows(self, rows: list[dict]) -> None:
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+    def haystack(self, row: int) -> str:
+        if 0 <= row < len(self._rows):
+            return self._rows[row].get("hay") or ""
+        return ""
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        row = index.row()
+        col = index.column()
+        if not (0 <= row < len(self._rows) and 0 <= col < 5):
+            return None
+        item = self._rows[row]
+        if role == Qt.DisplayRole:
+            return item["text"][col]
+        if role == Qt.ToolTipRole:
+            return item["tips"][col] or None
+        if role == Qt.UserRole and col == COL_NAME:
+            return item["hay"]
+        if role == Qt.TextAlignmentRole and col == COL_SIZE:
+            return int(Qt.AlignRight | Qt.AlignVCenter)
+        if role == Qt.ForegroundRole:
+            if item["dim"]:
+                return QColor(theme.TEXT_FAINT)
+            if col == COL_SOURCE:
+                return QColor(item["src_color"])
+            return None
+        if role == Qt.DecorationRole:
+            if col == COL_NAME:
+                color = theme.TEXT_FAINT if item["dim"] else theme.TEXT_DIM
+                return icons.icon(item["name_icon"], color, 14)
+            if col == COL_SOURCE:
+                return icons.icon(item["src_icon"], item["src_color"], 13)
+        return None
+
+
+class PlanTableView(QTableView):
+    """QTableView with the small QTableWidget reads the rest of the app uses."""
+
+    def rowCount(self) -> int:
+        model = self.model()
+        return 0 if model is None else model.rowCount()
+
+    def item(self, row: int, column: int):
+        model = self.model()
+        if model is None or row < 0 or column < 0:
+            return None
+        if row >= model.rowCount() or column >= model.columnCount():
+            return None
+        return _Cell(model, row, column)
+
+
 class _ElideMiddleDelegate(QStyledItemDelegate):
     """Paints long paths elided in the middle ('C:\\...\\file.jpg'), never
     down to a bare drive prefix."""
@@ -116,7 +228,7 @@ class AboutDialog(QDialog):
         )
         about.setWordWrap(True)
         layout.addWidget(about)
-        license_label = QLabel("License: <commercial license placeholder>")
+        license_label = QLabel("License: MIT")
         license_label.setObjectName("muted")
         layout.addWidget(license_label)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok)
@@ -366,6 +478,7 @@ class MainWindow(QMainWindow):
                               "Undo last run…", self)
         undo_action.triggered.connect(self.undo_last_run)
         file_menu.addAction(undo_action)
+        self.undo_action = undo_action
         file_menu.addSeparator()
         quit_action = QAction(icons.icon("x", theme.TEXT_DIM, 14), "E&xit", self)
         quit_action.triggered.connect(self.close)
@@ -617,9 +730,9 @@ class MainWindow(QMainWindow):
         top.addWidget(self.filter_edit)
         layout.addLayout(top)
 
-        self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(
-            ["FILE", "DATE TAKEN", "FOUND VIA", "NEW LOCATION", "SIZE"])
+        self._plan_model = _PlanModel(self)
+        self.table = PlanTableView()
+        self.table.setModel(self._plan_model)
         header = self.table.horizontalHeader()
         # user-resizable columns; the destination column absorbs extra width
         for col in range(5):
@@ -635,8 +748,11 @@ class MainWindow(QMainWindow):
         self.table.setItemDelegateForColumn(COL_DEST, _ElideMiddleDelegate(self.table))
         self.table.setSortingEnabled(False)  # custom typed sorting instead
         self.table.setAlternatingRowColors(True)
-        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setWordWrap(False)
+        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setSectionResizeMode(QHeaderView.Fixed)
+        self.table.verticalHeader().setDefaultSectionSize(28)
         self.table.setShowGrid(False)
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_row_menu)
@@ -681,6 +797,11 @@ class MainWindow(QMainWindow):
         pp.addLayout(eta_row)
         self.progress_panel.setVisible(False)
         layout.addWidget(self.progress_panel)
+
+        self.undo_limit_label = QLabel(UNDO_LIMITATION)
+        self.undo_limit_label.setObjectName("muted")
+        self.undo_limit_label.setWordWrap(True)
+        layout.addWidget(self.undo_limit_label)
 
         actions = QHBoxLayout()
         self.dry_run_step3 = QCheckBox("Dry run (simulate)")
@@ -804,7 +925,25 @@ class MainWindow(QMainWindow):
                 self, APP_NAME,
                 "Please choose where the organized copies should go.")
             return False
+        blocked = destination_blocks_scan(src, dst)
+        if blocked:
+            self._explain_blocked_destination(blocked)
+            return False
         return True
+
+    def _explain_blocked_destination(self, reason: str) -> None:
+        """Tell the user why this destination would scan nothing.
+
+        Happens before any copy or move. The sentence stays in the plan
+        summary after the dialog is dismissed.
+        """
+        self.plan = []
+        self.excluded.clear()
+        self._refresh_table()
+        self.plan_summary.setText(reason)
+        self.status_label.setText(reason)
+        self.organize_btn.setEnabled(False)
+        QMessageBox.warning(self, APP_NAME, reason)
 
     def _options(self) -> OrganizeOptions | None:
         if not self._validate_folders():
@@ -849,6 +988,7 @@ class MainWindow(QMainWindow):
         self.scan_worker = ScanWorker(options, self)
         self.scan_worker.progress.connect(self._on_scan_progress)
         self.scan_worker.finished_plan.connect(self._on_plan_ready)
+        self.scan_worker.cancelled.connect(self._on_scan_cancelled)
         self.scan_worker.failed.connect(self._on_worker_failed)
         self.scan_worker.start()
 
@@ -900,6 +1040,22 @@ class MainWindow(QMainWindow):
                                   "\"Organize now\".")
         self.organize_btn.setEnabled(bool(self._active_plan()))
 
+    def _on_scan_cancelled(self):
+        """A cancelled scan is not an empty library and not a finished plan.
+
+        Organize stays off. A partial duplicate set or a half-built plan is
+        dropped, including a plan left over from an earlier scan.
+        """
+        QApplication.restoreOverrideCursor()
+        self.plan = []
+        self.excluded.clear()
+        self._set_busy(False)
+        self._hide_progress_panel()
+        self._refresh_table()
+        self.plan_summary.setText("Scan cancelled — no plan was kept.")
+        self.status_label.setText("Scan cancelled.")
+        self.organize_btn.setEnabled(False)
+
     def _active_plan(self) -> list:
         """Plan rows not excluded by the user (duplicates already flagged)."""
         return [p for p in self.plan if str(p.source) not in self.excluded]
@@ -937,7 +1093,8 @@ class MainWindow(QMainWindow):
                 + ("set aside" if aside else "used (file date)"))
         if excl:
             parts.append(f"{excl} excluded")
-        parts.append(f"{format_bytes(copy_bytes)} to copy")
+        verb = "move" if self.move_radio.isChecked() else "copy"
+        parts.append(f"{format_bytes(copy_bytes)} to {verb}")
         self.plan_summary.setText("  ·  ".join(parts))
 
     # ----------------------------------------------------- sorting & columns
@@ -1023,11 +1180,11 @@ class MainWindow(QMainWindow):
             self._set_excluded(item, not is_excluded)
 
     def _refresh_table(self):
-        """(Re)fill the preview table in the current sort/view order.
+        """Point the preview at the current sort order.
 
-        GUI-thread cost is bounded: painting is suspended during the fill and
-        each row's filter text is precomputed once (see _apply_filter), so a
-        10k-row plan does not freeze the UI.
+        The view is a table model: it does not build a widget for every
+        file, so a few thousand rows stay responsive. Filter text is
+        precomputed once per row.
         """
         plan = self.plan
         if 0 <= self._sort_col < 5 and plan:
@@ -1040,28 +1197,15 @@ class MainWindow(QMainWindow):
         dest_root = self.dest_card.edit.text().strip()
         root_norm = (os.path.normcase(os.path.normpath(dest_root))
                      if dest_root else None)
-        dim = QColor(theme.TEXT_FAINT)
-        self.table.setUpdatesEnabled(True)  # in case a previous fill crashed
-        self.table.setUpdatesEnabled(False)
-        try:
-            self.table.setRowCount(0)
-            self.table.setRowCount(len(view))
-            for row, item in enumerate(view):
-                self._fill_row(row, item, root_norm, dim)
-        finally:
-            self.table.setUpdatesEnabled(True)
+        self._plan_model.set_rows(
+            [self._row_presentation(item, root_norm) for item in view])
         self._apply_filter(self.filter_edit.text())
 
-    def _fill_row(self, row, item, root_norm, dim):
+    def _row_presentation(self, item, root_norm) -> dict:
         is_excluded = str(item.source) in self.excluded
         kind_icon = "film" if item.kind == "video" else "image"
-        name_item = QTableWidgetItem(item.source.name)
-        name_item.setIcon(icons.icon(
-            kind_icon, theme.TEXT_FAINT if is_excluded else theme.TEXT_DIM, 14))
-        name_item.setToolTip(str(item.source) +
-                             ("\n(excluded from plan)" if is_excluded else ""))
-        self.table.setItem(row, COL_NAME, name_item)
-
+        name_tip = str(item.source) + (
+            "\n(excluded from plan)" if is_excluded else "")
         if item.is_duplicate:
             date_text, src_text = "duplicate", "exact duplicate (same content)"
             conf = Confidence.LOW
@@ -1075,37 +1219,23 @@ class MainWindow(QMainWindow):
         else:
             date_text, src_text, conf = "—", "no date found", Confidence.LOW
             src_icon = "alert-triangle"
-        self.table.setItem(row, COL_DATE, QTableWidgetItem(date_text))
-
-        src_item = QTableWidgetItem(src_text)
-        src_item.setIcon(icons.icon(src_icon, _CONFIDENCE_COLORS[conf], 13))
-        src_item.setForeground(QColor(_CONFIDENCE_COLORS[conf]))
-        src_item.setToolTip(item.capture.detail)
-        self.table.setItem(row, COL_SOURCE, src_item)
-
-        # Show the path relative to the destination root; full path in tooltip
-        # (string-only relative computation — resolve() per row froze the UI)
+        # String-only relative path — resolve() per row froze the UI.
         rel = relative_destination_fast(item.destination, root_norm)
-        dest_item = QTableWidgetItem(elide_middle(rel, 120))
-        if item.destination:
-            dest_item.setToolTip(str(item.destination))
-        self.table.setItem(row, COL_DEST, dest_item)
-
-        size_item = QTableWidgetItem(_fmt_size(item.size))
-        size_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        self.table.setItem(row, COL_SIZE, size_item)
-
-        # precomputed lowercase haystack for fast filtering (once per row)
+        dest_text = elide_middle(rel, 120)
+        dest_tip = str(item.destination) if item.destination else ""
+        size_text = _fmt_size(item.size)
         haystack = " ".join(
-            (item.source.name, date_text, src_text, rel,
-             _fmt_size(item.size))).lower()
-        name_item.setData(Qt.UserRole, haystack)
-
-        if is_excluded:
-            for col in range(5):
-                cell = self.table.item(row, col)
-                if cell:
-                    cell.setForeground(dim)
+            (item.source.name, date_text, src_text, rel, size_text)).lower()
+        tips = (name_tip, "", item.capture.detail or "", dest_tip, "")
+        return {
+            "text": (item.source.name, date_text, src_text, dest_text, size_text),
+            "tips": tips,
+            "name_icon": kind_icon,
+            "src_icon": src_icon,
+            "src_color": _CONFIDENCE_COLORS[conf],
+            "hay": haystack,
+            "dim": is_excluded,
+        }
 
     # backwards-compatible alias (used by older tools/tests)
     def _populate_table(self, plan: list):
@@ -1113,16 +1243,19 @@ class MainWindow(QMainWindow):
         self._refresh_table()
 
     def _apply_filter(self, text: str):
-        """Show/hide rows by substring match against the precomputed haystack
-        (one O(1) lookup per row — no per-cell string rebuilding)."""
+        """Show/hide rows by substring match against the precomputed haystack."""
         needle = text.strip().lower()
-        for row in range(self.table.rowCount()):
-            if not needle:
-                self.table.setRowHidden(row, False)
-                continue
-            cell = self.table.item(row, COL_NAME)
-            hay = cell.data(Qt.UserRole) if cell else ""
-            self.table.setRowHidden(row, needle not in (hay or ""))
+        model = self._plan_model
+        self.table.setUpdatesEnabled(False)
+        try:
+            for row in range(model.rowCount()):
+                if not needle:
+                    self.table.setRowHidden(row, False)
+                    continue
+                hay = model.haystack(row)
+                self.table.setRowHidden(row, needle not in (hay or ""))
+        finally:
+            self.table.setUpdatesEnabled(True)
 
     # ---------------------------------------------------------- organize
 
@@ -1134,10 +1267,80 @@ class MainWindow(QMainWindow):
         if options is None:
             return
 
-        # --- free-space preflight (skipped for dry runs) ---
+        # Resume or Discard is chosen before free-space preflight, and dry
+        # runs skip both: they write nothing. `needed` is the bytes the plan
+        # that will actually run still has to write. Resume drops sources
+        # the journal already finished. Discard drops rows the seeded undo
+        # log will own, including a move whose source is already gone while
+        # the destination file remains. Copy mode counts each remaining
+        # file. Move mode omits a same-volume rename and still counts a
+        # cross-volume copy, or a row whose device cannot be read.
+        # Windows often reports st_dev 0 on every drive; different drive
+        # letters still count.
+        # A blocked check leaves the journal in place so the same choice
+        # can be made again.
+        discard_after_preflight = False
+        done_before: set[str] = set()
+        landed_before: set[str] = set()
         if not options.dry_run:
-            needed = sum(p.size for p in active
-                         if not p.is_duplicate and p.destination)
+            journal = find_unfinished_journal(options.dest_dir)
+            if journal is not None:
+                done_before = completed_sources(journal)
+                # A same-volume rename can land before the done line.
+                # completed_sources is empty then, but the only copy is
+                # already at the destination. Count that file so Discard
+                # is not described as touching nothing.
+                landed_before = {
+                    path_identity(move["source"])
+                    for move in promotable_prepared_moves(options.dest_dir)
+                }
+                already_organized = len(
+                    {path_identity(source) for source in done_before}
+                    | landed_before)
+                answer = QMessageBox.question(
+                    self, APP_NAME,
+                    f"A previous run was interrupted (power loss?) — "
+                    f"{already_organized:,} files were already organized.\n\n"
+                    f"Yes = Resume (skip them) · No = Discard and start over",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
+                if answer == QMessageBox.Yes:
+                    active = exclude_completed_sources(active, done_before)
+                    if not active:
+                        # The worker is not started. execute_plan([]) still
+                        # seeds the operation log from the open journal,
+                        # unlinks a journaled cross-volume move whose
+                        # destination still matches, saves the log, and
+                        # marks the journal complete. File → Undo reads
+                        # that log. The in-memory plan is then dropped the
+                        # same way a finished run drops it. Leaving it
+                        # armed runs those destinations again; they still
+                        # match, so the new log is identical copies, and
+                        # Undo deletes them.
+                        execute_plan(active, options)
+                        self._disarm_finished_plan()
+                        self.status_label.setText(
+                            "Everything was already organized — nothing left "
+                            "to resume.")
+                        QMessageBox.information(
+                            self, APP_NAME,
+                            "Everything was already organized — nothing left "
+                            "to resume.\n\n"
+                            "File → Undo can still undo that completed run.")
+                        return
+                else:
+                    discard_after_preflight = True
+
+            measured = active
+            if discard_after_preflight:
+                # Seed and discard run only after this check passes. Until
+                # then the journal stays, and the byte total has to be the
+                # restart that would follow a passing check.
+                measured = plan_discard_will_run(active, options.dest_dir)
+            needed = bytes_still_needed(
+                measured,
+                copy_mode=options.copy_mode,
+                dest_dir=options.dest_dir,
+            )
             space = free_space_status(options.dest_dir, needed)
             if not space["ok"]:
                 QMessageBox.critical(
@@ -1156,31 +1359,54 @@ class MainWindow(QMainWindow):
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
                 if answer != QMessageBox.Yes:
                     return
-
-        # --- crash-journal resume ---
-            journal = find_unfinished_journal(options.dest_dir)
-            if journal is not None:
-                done_before = completed_sources(journal)
-                answer = QMessageBox.question(
-                    self, APP_NAME,
-                    f"A previous run was interrupted (power loss?) — "
-                    f"{len(done_before):,} files were already organized.\n\n"
-                    f"Yes = Resume (skip them) · No = Discard and start over",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
-                if answer == QMessageBox.Yes:
-                    active = [p for p in active
-                              if str(p.source) not in done_before]
-                    if not active:
-                        QMessageBox.information(
-                            self, APP_NAME,
-                            "Everything was already organized — nothing left "
-                            "to resume.")
-                        discard_journal(options.dest_dir)
-                        return
-                else:
-                    discard_journal(options.dest_dir)
+            if discard_after_preflight:
+                # Seed and save before the journal is dropped. execute_plan([])
+                # reads the open journal, writes the operation log, completes
+                # that journal, and for a move unlinks a source whose
+                # destination still matches. An empty journal has nothing to
+                # seed; calling it would publish an empty undo log. Discard
+                # then deletes the journal so the restart is a new run.
+                # Rows a saved log already owns are left out of that run.
+                # A match is journaled as done without a new copy, so Undo
+                # of the new log would delete a file the seeded log still
+                # owns. A source that is already gone is the same case after
+                # a move. A missing destination stays in the plan so Discard
+                # can write it.
+                # A prepared-only journal has an empty done_before even
+                # when the rename already dropped the source. execute_plan([])
+                # would publish an empty undo log, because the done line
+                # does not exist yet. save_promoted_move_log writes the undo
+                # row only when the destination still matches the prepared
+                # hash. A prepared line whose source is still present is
+                # left unpublished, and Discard really starts over.
+                if done_before:
+                    execute_plan([], options)
+                elif landed_before:
+                    save_promoted_move_log(options.dest_dir)
+                discard_journal(options.dest_dir)
+                owned = saved_run_destinations(options.dest_dir)
+                if owned:
+                    active = [item for item in active
+                              if not saved_run_owns_plan_row(item, owned)]
+                    self.plan = [item for item in self.plan
+                                 if not saved_run_owns_plan_row(item, owned)]
+                if not active:
+                    self._disarm_finished_plan()
+                    self.status_label.setText(
+                        "Everything was already organized — nothing new "
+                        "to write.")
+                    QMessageBox.information(
+                        self, APP_NAME,
+                        "Those files are already in the destination.\n\n"
+                        "File → Undo can still undo the interrupted run.")
+                    return
 
         self._set_busy(True, "Organizing…")
+        # File → Undo stays available during a scan (that worker does not
+        # write). It must not run while this worker is copying, moving, or
+        # journaling the same destination. A queued click is also refused
+        # in undo_last_run / _undo_log.
+        self.undo_action.setEnabled(False)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self._throughput.reset()
         self._last_active_bytes = sum(p.size for p in active
@@ -1218,60 +1444,88 @@ class MainWindow(QMainWindow):
         self.status_label.setText(
             f"Organizing {min(i + 1, total):,} of {total:,}{current}")
 
+    def _disarm_finished_plan(self) -> None:
+        """Drop the plan after a run that must not be started again.
+
+        A clean finish and an empty Resume both end here. Organize stays
+        off until the next scan builds a new plan. The preview table is
+        left as it was: a finished run does not rebuild it either.
+
+        Do not call this when the crash journal is still open. Resume
+        uses the plan already on screen and skips sources that succeeded.
+        """
+        self.plan = []
+        self.organize_btn.setEnabled(False)
+
     def _on_run_finished(self, log, summary: dict):
+        # finished_run is emitted from run() before the thread leaves
+        # isRunning(). Join first so dialog Undo is not treated as an
+        # in-flight organize.
+        self._join_organize_worker()
         QApplication.restoreOverrideCursor()
         self._set_busy(False)
         self._hide_progress_panel()
-        self.plan = []
-        self.organize_btn.setEnabled(False)
         dest_dir = self.dest_card.edit.text().strip()
         self._last_run = (log, dest_dir, summary)
+        # Cancel and a per-file OSError return here with the journal still
+        # open. _set_busy turns Organize back on when the plan is loaded;
+        # disarming afterwards forced a full Scan before Resume could run.
+        journal_open = bool(
+            dest_dir and find_unfinished_journal(dest_dir) is not None)
+        keep_plan = finished_run_keeps_plan(
+            summary, journal_open=journal_open)
+        if keep_plan:
+            self.organize_btn.setEnabled(bool(self._active_plan()))
+        else:
+            self._disarm_finished_plan()
 
-        mode = "copied" if summary["copied"] or not summary["moved"] else "moved"
-        done_n = summary["copied"] + summary["moved"]
         folders = len({str(Path(op.destination).parent) for op in log.operations
                        if op.status == "done"})
-        if summary.get("dry_run"):
-            self.status_label.setText(
-                f"Dry run finished — nothing was written ({done_n} would copy).")
-        else:
-            self.status_label.setText(f"Finished: {done_n} {mode}.")
+        status, text = finished_run_lines(
+            summary, folders=folders, total_bytes=self._last_active_bytes,
+            journal_open=journal_open)
+        self.status_label.setText(status)
 
         box = QMessageBox(self)
         dry = summary.get("dry_run", False)
-        box.setWindowTitle(f"{APP_NAME} — {'Dry run complete' if dry else 'Done'}")
-        box.setIconPixmap(icons.pixmap(
-            "scan" if dry else "check-circle",
-            theme.AMBER if dry else theme.GREEN, 44))
         if dry:
-            text = (f"Dry run complete — nothing was written.\n\n"
-                    f"Would copy {done_n:,} files "
-                    f"({format_bytes(self._last_active_bytes)}) "
-                    f"into {folders} folders")
+            title = "Dry run complete"
+            icon_name, icon_color = "scan", theme.AMBER
+        elif keep_plan:
+            title = "Organize stopped"
+            icon_name, icon_color = "alert-triangle", theme.AMBER
         else:
-            text = f"Done! {done_n} photos/videos {mode} into {folders} folders."
-        details = []
-        if summary["skipped_duplicates"]:
-            details.append(f"{summary['skipped_duplicates']} exact duplicates skipped")
-        if summary["undated"]:
-            details.append(f"{summary['undated']} without a date (in _undated)")
-        if summary["errors"]:
-            details.append(f"{summary['errors']} couldn't be read (skipped)")
-        if summary["cancelled"]:
-            details.append("the run was cancelled part-way")
-        if details:
-            text += "\n\n" + "\n".join(f"• {d}" for d in details)
+            title = "Done"
+            icon_name, icon_color = "check-circle", theme.GREEN
+        box.setWindowTitle(f"{APP_NAME} — {title}")
+        box.setIconPixmap(icons.pixmap(icon_name, icon_color, 44))
         box.setText(text)
+        # Resume stays on this dialog so a cancel or a per-file error does
+        # not look like a finished run whose only repair is Undo.
+        resume_btn = None
+        if keep_plan and self._active_plan():
+            resume_btn = box.addButton("Resume", QMessageBox.AcceptRole)
+            resume_btn.setIcon(icons.icon("play", theme.TEXT, 14))
+            box.setDefaultButton(resume_btn)
         open_btn = box.addButton("Open folder", QMessageBox.AcceptRole)
         open_btn.setIcon(icons.icon("external-link", theme.TEXT, 14))
-        undo_btn = box.addButton("Undo", QMessageBox.DestructiveRole)
-        undo_btn.setIcon(icons.icon("undo", theme.TEXT, 14))
+        # A dry run writes nothing and does not save a log. Undo of that
+        # in-memory log can delete or relocate a file that was already in
+        # the destination, then persist a fake operation log. An unfinished
+        # journal still has Resume as the next step. Undo there reverses
+        # files this run already finished. File → Undo last run is separate.
+        undo_btn = None
+        if finished_run_offers_undo(summary, keep_plan=keep_plan):
+            undo_btn = box.addButton("Undo", QMessageBox.DestructiveRole)
+            undo_btn.setIcon(icons.icon("undo", theme.TEXT, 14))
         box.addButton(QMessageBox.Close)
         box.exec()
         clicked = box.clickedButton()
-        if clicked is open_btn:
+        if resume_btn is not None and clicked is resume_btn:
+            self.start_organize()
+        elif clicked is open_btn:
             QDesktopServices.openUrl(QUrl.fromLocalFile(dest_dir))
-        elif clicked is undo_btn:
+        elif undo_btn is not None and clicked is undo_btn:
             self._undo_log(log, dest_dir)
 
     def cancel_work(self):
@@ -1281,48 +1535,97 @@ class MainWindow(QMainWindow):
         self.status_label.setText("Cancelling…")
 
     def undo_last_run(self):
+        if self._refuse_undo_while_organizing():
+            return
         dst = Path(self.dest_card.edit.text().strip())
         if not dst.is_dir():
             QMessageBox.warning(
                 self, APP_NAME,
                 "Choose the destination folder used by the run first.")
             return
-        log = load_log(dst)
-        if log is None:
+        # A kill after a same-volume rename and before the done line never
+        # reached save_log. The source name is gone, so a rescan has nothing
+        # to Organize. Persist that prepared move before choosing a log.
+        save_promoted_move_log(dst)
+        logs = list_run_logs(dst)
+        if not logs:
             QMessageBox.information(self, APP_NAME,
                                     "No operation log found in that folder.")
+            return
+        log = next((item for item in logs if not item.undone), None)
+        if log is None:
+            QMessageBox.information(
+                self, APP_NAME,
+                "The runs saved in that folder have already been undone.")
             return
         self._undo_log(log, dst)
 
     def _undo_log(self, log, dst):
+        if self._refuse_undo_while_organizing():
+            return
         if log.undone:
             QMessageBox.information(self, APP_NAME,
                                     "That run has already been undone.")
             return
         answer = QMessageBox.question(
             self, APP_NAME,
-            f"Undo the run from {log.started_at} "
-            f"({len(log.operations)} operations)?",
+            f"Undo the newest run that can still be undone?\n\n"
+            f"It started at {log.started_at} "
+            f"({len(log.operations)} operations).\n\n"
+            f"{UNDO_LIMITATION}",
             QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if answer != QMessageBox.Yes:
             return
         result = undo_log(log, dst)
-        QMessageBox.information(
-            self, APP_NAME,
-            f"Undo complete: {result['undone']} files restored, "
-            f"{result['skipped']} skipped, {result['failed']} failed.")
+        QMessageBox.information(self, APP_NAME, undo_result_message(result))
 
     # -------------------------------------------------------------- helpers
+
+    def _organize_running(self) -> bool:
+        worker = self.org_worker
+        return worker is not None and bool(worker.isRunning())
+
+    def _refuse_undo_while_organizing(self) -> bool:
+        """True when Undo must leave files, the log, and the journal alone.
+
+        A running OrganizeWorker may still be writing a destination that
+        undo would delete or move back, and undo_log drops an unfinished
+        journal that lists a restored source. Returning here writes nothing.
+        """
+        if not self._organize_running():
+            return False
+        QMessageBox.information(
+            self, APP_NAME,
+            "Organize is still running. Cancel it or wait for it to finish, "
+            "then undo.")
+        return True
+
+    def _join_organize_worker(self) -> None:
+        """Wait out a worker that has already reported completion or failure.
+
+        The slot runs on the GUI thread. The worker only has to leave
+        run(), so this returns as soon as isRunning() flips. Undo is then
+        allowed again.
+        """
+        worker = self.org_worker
+        if worker is not None and worker.isRunning():
+            worker.wait(5000)
 
     def _set_busy(self, busy: bool, message: str = ""):
         self.organize_btn.setEnabled(not busy and bool(self._active_plan()))
         self.cancel_btn.setEnabled(busy)
         self.next_btn.setEnabled(not busy)
         self.back_btn.setEnabled(not busy)
+        # Organize disables Undo itself, before the worker is running.
+        # Clearing busy turns it back on once that worker has stopped.
+        # A scan never disables it.
+        if not busy:
+            self.undo_action.setEnabled(not self._organize_running())
         if message:
             self.status_label.setText(message)
 
     def _on_worker_failed(self, message: str):
+        self._join_organize_worker()
         QApplication.restoreOverrideCursor()
         self._set_busy(False)
         self._hide_progress_panel()

@@ -7,13 +7,17 @@ strategies resolve coordinates through geodata.py. Pure logic, no Qt.
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Iterator, Optional
 
 from .geodata import location_label
+from .journal import (completed_operations, files_identical,
+                       find_unfinished_journal, path_identity)
 from .metadata import (CaptureDate, DateSource, extract_capture_date,
                        extract_gps)
+from .plan import saved_run_destinations
 from .strategies import (DEFAULT_STRATEGY_KEY, STRATEGIES, UNCERTAIN_FOLDER,
                          UNDATED_FOLDER, UNKNOWN_LOCATION_FOLDER,
                          get_strategy, quarter_of)
@@ -31,8 +35,44 @@ __all__ = [
     "STRATEGIES", "UNDATED_FOLDER", "UNKNOWN_LOCATION_FOLDER",
     "DEFAULT_STRATEGY_KEY", "get_strategy", "quarter_of",
     "PlannedFile", "OrganizeOptions", "scan_media_files", "count_media_files",
-    "build_plan",
+    "build_plan", "destination_blocks_scan",
 ]
+
+
+def destination_blocks_scan(source: os.PathLike | str,
+                           dest: os.PathLike | str) -> Optional[str]:
+    """Why this destination cannot be scanned, or None if it is usable.
+
+    The scan skips every file that already lives inside the destination.
+    That is right when the destination is a folder *inside* the source
+    (the usual "Organized" folder). It finds nothing — with no other
+    signal — when the destination *is* the source, or is a parent of it,
+    because the whole source is then inside the destination.
+
+    Returns a sentence the UI can show before anything is moved.
+    """
+    try:
+        src = Path(source).resolve()
+        dst = Path(dest).resolve()
+    except OSError:
+        return None
+    src_n = os.path.normcase(os.path.normpath(str(src)))
+    dst_n = os.path.normcase(os.path.normpath(str(dst)))
+    if src_n == dst_n:
+        return (
+            "The destination is the same folder as the source. "
+            "Files that already live in the destination are left alone, "
+            "so this scan would find nothing and nothing would be organized. "
+            "Choose a different folder before you continue."
+        )
+    if src_n.startswith(dst_n + os.sep):
+        return (
+            "The destination is a parent of the source folder. "
+            "Every file is already inside the destination, so this scan "
+            "would find nothing and nothing would be organized. "
+            "Choose a folder that is not above your photos."
+        )
+    return None
 
 
 @dataclass
@@ -73,20 +113,141 @@ class OrganizeOptions:
         return frozenset(exts)
 
 
+# Directory reparse points (junctions, mount points, symlink dirs). Windows
+# sets this even when os.path.islink is false, which is why os.walk follows
+# junctions with followlinks left at the default.
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def _normalized(path: str | os.PathLike) -> str:
+    return os.path.normcase(os.path.normpath(os.fspath(path)))
+
+
+def _is_same_or_inside(path_norm: str, root_norm: str) -> bool:
+    return path_norm == root_norm or path_norm.startswith(root_norm + os.sep)
+
+
+def _stat_is_non_descendable_dir(st: object, path: str) -> bool:
+    """True for a directory symlink, or a Windows junction / reparse directory.
+
+    `path` is only used for the isjunction fallback when the stat result has
+    no file-attribute field. A Windows stat that includes the field is
+    authoritative, so ordinary directories do not pay for a second check.
+    """
+    if stat.S_ISLNK(getattr(st, "st_mode", 0)):
+        return True
+    attrs = getattr(st, "st_file_attributes", None)
+    if attrs is not None and attrs & _REPARSE_POINT:
+        return True
+    if attrs is not None or os.name != "nt":
+        return False
+    isjunction = getattr(os.path, "isjunction", None)
+    if isjunction is None:
+        return False
+    try:
+        return bool(isjunction(path))
+    except OSError:
+        return False
+
+
+def _is_non_descendable_dir(path: str) -> bool:
+    """Directory symlink on any platform, or a Windows directory reparse point.
+
+    os.walk(followlinks=False) already skips directory symlinks, but a
+    junction is not a symlink: islink() is false and the walk follows it.
+    """
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return _stat_is_non_descendable_dir(st, path)
+
+
+def _under_resolved_dest(dirpath: str, dest_norm: str,
+                         link_dirs: dict[str, bool]) -> bool:
+    """Whether this walk directory is the destination or already inside it.
+
+    The walk path is compared first, with no syscall. A junction or symlink
+    is resolved only when that string is a different path from the real
+    folder — never once per file.
+    """
+    if _is_same_or_inside(_normalized(dirpath), dest_norm):
+        return True
+    key = _normalized(dirpath)
+    if key not in link_dirs:
+        link_dirs[key] = _is_non_descendable_dir(dirpath)
+    if not link_dirs[key]:
+        return False
+    try:
+        resolved = _normalized(Path(dirpath).resolve())
+    except OSError:
+        return False
+    return _is_same_or_inside(resolved, dest_norm)
+
+
+def _drop_non_descendable(dirpath: str, dirnames: list[str],
+                          link_dirs: dict[str, bool]) -> None:
+    """Remove symlink and junction directories from dirnames, in place.
+
+    os.walk reads this same list after the yield to decide where to go
+    next, so replacing the list object would not stop the descent.
+    """
+    kept: list[str] = []
+    for name in dirnames:
+        child = os.path.join(dirpath, name)
+        key = _normalized(child)
+        if key not in link_dirs:
+            link_dirs[key] = _is_non_descendable_dir(child)
+        if link_dirs[key]:
+            continue
+        kept.append(name)
+    if len(kept) != len(dirnames):
+        dirnames[:] = kept
+
+
+def _iter_candidate_dirs(options: OrganizeOptions
+                         ) -> Iterator[tuple[str, list[str]]]:
+    """Yield (dirpath, filenames) for both the scan and the progress count.
+
+    The resolved destination tree is skipped. Directory symlinks and Windows
+    junction / reparse-point directories are not descended into, so a
+    destination created with mklink /J, or a junction that loops back into
+    the source, is not scanned.
+    """
+    root = Path(options.source_dir).resolve()
+    dest_norm = _normalized(Path(options.dest_dir).resolve())
+    link_dirs: dict[str, bool] = {}
+
+    if options.recursive:
+        walker = os.walk(root, followlinks=False)
+    else:
+        try:
+            names = os.listdir(root) if root.is_dir() else []
+        except OSError:
+            names = []
+        walker = [(os.fspath(root), [], names)]
+
+    for dirpath, dirnames, filenames in walker:
+        if _under_resolved_dest(dirpath, dest_norm, link_dirs):
+            # In-place: os.walk must not descend into the destination.
+            dirnames[:] = []
+            continue
+        if options.recursive:
+            _drop_non_descendable(dirpath, dirnames, link_dirs)
+        yield dirpath, filenames
+
+
 def count_media_files(options: OrganizeOptions) -> int:
     """Fast pre-count of candidate media files (extension match only).
 
-    Used to make scan progress determinate: no per-file stat/metadata reads,
-    just one directory walk. Cheap even on large trees.
+    Uses the same directories as the scan, including the destination prune
+    and the refusal to follow junctions or directory symlinks, so a progress
+    total matches the files the scan will yield. No per-file stat or
+    metadata read.
     """
-    root = Path(options.source_dir)
     exts = options.effective_extensions()
     count = 0
-    if options.recursive:
-        walker = os.walk(root)
-    else:
-        walker = [(str(root), [], os.listdir(root) if root.is_dir() else [])]
-    for _dirpath, _dirnames, filenames in walker:
+    for _dirpath, filenames in _iter_candidate_dirs(options):
         for name in filenames:
             if Path(name).suffix.lower().lstrip(".") in exts:
                 count += 1
@@ -96,26 +257,12 @@ def count_media_files(options: OrganizeOptions) -> int:
 def scan_media_files(options: OrganizeOptions) -> Iterator[Path]:
     """Yield candidate media files under source_dir.
 
-    The destination tree is pruned at the directory level (no per-file
-    resolve() — that was the scan bottleneck on large trees).
+    The destination tree is pruned at the directory level. resolve() runs
+    on the source, the destination, and a walk directory only when that
+    directory is itself a symlink or junction — not on every file.
     """
-    root = Path(options.source_dir).resolve()  # resolved once so the
-    # dirpath strings from os.walk compare cleanly against dest_str
     exts = options.effective_extensions()
-    dest_root = Path(options.dest_dir).resolve()
-    dest_str = os.path.normcase(os.path.normpath(str(dest_root)))
-
-    if options.recursive:
-        walker = os.walk(root)
-    else:
-        walker = [(str(root), [], os.listdir(root) if root.is_dir() else [])]
-
-    for dirpath, dirnames, filenames in walker:
-        dp = os.path.normcase(os.path.normpath(dirpath))
-        if dp == dest_str or dp.startswith(dest_str + os.sep):
-            # Never organise files that already live inside the destination
-            dirnames[:] = []
-            continue
+    for dirpath, filenames in _iter_candidate_dirs(options):
         for name in sorted(filenames):
             p = Path(dirpath) / name
             if p.suffix.lower().lstrip(".") not in exts:
@@ -141,6 +288,37 @@ def _unique_destination(dest_dir: Path, filename: str, taken: set[str]) -> Path:
     return candidate
 
 
+def _planned_destination(dest_dir: Path, src: Path, taken: set[str], *,
+                         reuse_identical: bool, owned: set[str],
+                         open_by_dest: dict[str, set[str]]) -> Path:
+    """Destination for ``src``, reusing a published match on resume.
+
+    The crash window is a final name already on disk with no journal line
+    for this source. When those bytes still match, keep ``dest_dir/src.name``
+    instead of ``name_1``. Mark it taken so a later row cannot share it.
+
+    A path a saved run already logged is not reused. That copy belongs to
+    the earlier run, so a newer organize still gets a collision suffix and
+    undo of the newer run can leave the earlier file in place. The open
+    journal is not an earlier run: a source it already recorded at this
+    path keeps the natural name. Otherwise a rescan after a per-file error
+    would plan ``name_1`` for work that already finished, because that
+    error still calls ``save_log``. A file that merely exists and does not
+    match is never overwritten.
+    """
+    natural = dest_dir / src.name
+    key = str(natural).lower()
+    ident = path_identity(natural)
+    this_run = path_identity(src) in open_by_dest.get(ident, ())
+    if (reuse_identical
+            and key not in taken
+            and (ident not in owned or this_run)
+            and files_identical(src, natural)):
+        taken.add(key)
+        return natural
+    return _unique_destination(dest_dir, src.name, taken)
+
+
 def _location_for(src: Path, cache: dict[tuple[float, float], Optional[str]]
                   ) -> Optional[str]:
     """Resolve a file's GPS coordinates to a place label (cached)."""
@@ -155,7 +333,11 @@ def build_plan(
     files: Optional[list[Path]] = None,
     analysis: Optional[dict] = None,
 ) -> list[PlannedFile]:
-    """Build the full organise plan (dry run). Pure: touches nothing.
+    """Build the full organise plan (dry run). Does not write or rename.
+
+    On resume, a natural destination that is still a byte-for-byte match of
+    its source is kept. That is the crash after the final name was published
+    and before the journal line. Any other occupant gets a collision suffix.
 
     `files` and `analysis` ({path: (CaptureDate, gps)}) let the caller reuse
     an already-listed/parallel-analyzed batch (the GUI scan does this).
@@ -163,6 +345,25 @@ def build_plan(
     duplicates = duplicates or set()
     plan: list[PlannedFile] = []
     taken: set[str] = set()
+    # Only an interrupted run should adopt a file it already published.
+    # A finished journal means the next organize is a new run. Do not
+    # treat a successful complete as resumable.
+    journal = find_unfinished_journal(options.dest_dir)
+    resuming = journal is not None
+    owned = (saved_run_destinations(options.dest_dir)
+             if resuming else set())
+    # Dest identity -> sources this open journal already finished there.
+    # ``owned`` includes the partial run's save_log. Those sources are
+    # this run, so that log must not force a collision suffix for them.
+    open_by_dest: dict[str, set[str]] = {}
+    if journal is not None:
+        for op in completed_operations(journal):
+            source = op.get("source") or ""
+            dest = op.get("destination") or ""
+            if not source or not dest:
+                continue
+            open_by_dest.setdefault(path_identity(dest), set()).add(
+                path_identity(source))
     strategy = get_strategy(options.strategy)
     geo_cache: dict[tuple[float, float], Optional[str]] = {}
     analysis = analysis or {}
@@ -206,7 +407,9 @@ def build_plan(
             rel = strategy.relative_path(capture, location)
         dest_dir = Path(options.dest_dir).joinpath(*rel.split("/"))
 
-        dest = _unique_destination(dest_dir, src.name, taken)
+        dest = _planned_destination(
+            dest_dir, src, taken, reuse_identical=resuming, owned=owned,
+            open_by_dest=open_by_dest)
         plan.append(PlannedFile(src, dest, size, capture, kind,
                                 location=location))
 

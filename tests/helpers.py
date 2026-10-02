@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import struct
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from PIL import Image
@@ -73,8 +73,15 @@ def _box(btype: bytes, payload: bytes) -> bytes:
     return struct.pack(">I4s", 8 + len(payload), btype) + payload
 
 
+def _utc_unix(dt: datetime) -> int:
+    """Naive datetimes are a UTC wall clock, matching the container parsers."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+
 def make_mvhd(version: int, dt: datetime) -> bytes:
-    qt_time = int(dt.timestamp()) + QT_EPOCH_OFFSET
+    qt_time = _utc_unix(dt) + QT_EPOCH_OFFSET
     if version == 1:
         payload = struct.pack(">B3xQQI", 1, qt_time, qt_time, 1000)
     else:
@@ -93,9 +100,10 @@ def make_mp4(path: Path, dt: datetime, version: int = 0) -> Path:
 
 def make_mp4_with_track(path: Path, movie_dt: datetime, track_dt: datetime) -> Path:
     """MP4 where a track mdhd is older than the movie mvhd."""
+    track_unix = _utc_unix(track_dt)
     mdhd_payload = struct.pack(">B3xIII", 0,
-                               int(track_dt.timestamp()) + QT_EPOCH_OFFSET,
-                               int(track_dt.timestamp()) + QT_EPOCH_OFFSET, 1000)
+                               track_unix + QT_EPOCH_OFFSET,
+                               track_unix + QT_EPOCH_OFFSET, 1000)
     mdhd = _box(b"mdhd", mdhd_payload + b"\x00" * 8)
     trak = _box(b"trak", _box(b"mdia", mdhd))
     moov = _box(b"moov", make_mvhd(0, movie_dt) + trak)

@@ -304,7 +304,7 @@ export const pricingConfig: PricingConfig = {
       ],
       ctaText: "Download for Windows",
       ctaHref:
-        "https://github.com/berkkarabacak/media-organizer/releases/latest/download/MediaOrganizer-Setup-1.5.3.exe",
+        "https://github.com/berkkarabacak/media-organizer/releases/latest/download/MediaOrganizer-Setup-1.5.4.exe",
       highlighted: false,
     },
     {
@@ -403,7 +403,7 @@ export const footerConfig: FooterConfig = {
     {
       title: "Product",
       links: [
-        { label: "Download", href: "https://github.com/berkkarabacak/media-organizer/releases/latest/download/MediaOrganizer-Setup-1.5.3.exe" },
+        { label: "Download", href: "https://github.com/berkkarabacak/media-organizer/releases/latest/download/MediaOrganizer-Setup-1.5.4.exe" },
         { label: "Features", href: "#curriculum" },
         { label: "Pricing", href: "#pricing" },
         { label: "Changelog", href: "https://github.com/berkkarabacak/media-organizer/releases" },
