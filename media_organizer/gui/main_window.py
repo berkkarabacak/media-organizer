@@ -36,8 +36,8 @@ from ..core.journal import (completed_sources, discard_journal,
 from ..core.metadata import Confidence, DateSource
 from ..core.organizer import STRATEGIES, OrganizeOptions, destination_blocks_scan
 from ..core.plan import (UNDO_LIMITATION, list_run_logs,
-                         saved_run_destinations, undo_log,
-                         undo_result_message)
+                         save_promoted_move_log, saved_run_destinations,
+                         undo_log, undo_result_message)
 from ..core.strategies import DEFAULT_STRATEGY_KEY
 from . import icons, theme
 from .workers import OrganizeWorker, ScanWorker
@@ -1509,6 +1509,10 @@ class MainWindow(QMainWindow):
                 self, APP_NAME,
                 "Choose the destination folder used by the run first.")
             return
+        # A kill after a same-volume rename and before the done line never
+        # reached save_log. The source name is gone, so a rescan has nothing
+        # to Organize. Persist that prepared move before choosing a log.
+        save_promoted_move_log(dst)
         logs = list_run_logs(dst)
         if not logs:
             QMessageBox.information(self, APP_NAME,

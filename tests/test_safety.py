@@ -939,7 +939,13 @@ class TestAtomicCopy:
         assert len(copied) == 1
         assert copied[0].read_bytes() == payload
         text = journal_path_for(dst).read_text(encoding="utf-8")
-        assert str(source) not in text
+        # The rename was refused, so the hash line stays prepared. It is
+        # not done: Resume must not skip this source or unlink it until a
+        # later record publishes the copy.
+        prepared = [json.loads(line) for line in text.splitlines() if line.strip()]
+        assert [entry["status"] for entry in prepared] == ["prepared"]
+        assert path_identity(source) not in {
+            path_identity(item) for item in completed_sources(journal_path_for(dst))}
 
     def test_same_volume_journal_failure_keeps_undoable_move(
             self, tmp_path, monkeypatch):
@@ -1003,6 +1009,263 @@ class TestAtomicCopy:
         assert second.source.read_bytes() == second_payload
         assert not Path(log.operations[0].destination).exists()
         assert not Path(log.operations[1].destination).exists()
+
+    def test_kill_after_same_volume_rename_before_done_line_still_undoes(
+            self, tmp_path, monkeypatch):
+        """A kill after ``os.replace`` and before the done line must undo.
+
+        The source name is already gone, so a later scan will not find the
+        file. The hash has to be durable before that rename. Otherwise
+        Resume has nothing to seed and Undo cannot put the file back.
+        """
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        first, second = plan[0], plan[1]
+        payload = first.source.read_bytes()
+        second_payload = second.source.read_bytes()
+        final = first.destination
+        other_final = second.destination
+        assert final is not None and other_final is not None
+        real_replace = os.replace
+        killed = {"done": False}
+
+        def spy_replace(src_path, dst_path):
+            result = real_replace(src_path, dst_path)
+            if killed["done"] or Path(src_path) != first.source:
+                return result
+            killed["done"] = True
+            assert not first.source.exists()
+            assert final.is_file() and final.read_bytes() == payload
+            text = journal_path_for(dst).read_text(encoding="utf-8")
+            prepared = [
+                json.loads(line) for line in text.splitlines() if line.strip()]
+            assert len(prepared) == 1
+            assert prepared[0]["status"] == "prepared"
+            assert prepared[0]["source"] == str(first.source)
+            assert prepared[0]["destination"] == str(final)
+            assert prepared[0]["sha256"] == hashlib.sha256(payload).hexdigest()
+            assert prepared[0]["size"] == len(payload)
+            assert '"status": "done"' not in text
+            assert load_undoable_log(dst) is None
+            raise SystemExit("kill after same-volume rename")
+
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.replace", spy_replace)
+
+        with pytest.raises(SystemExit, match="kill after same-volume rename"):
+            execute_plan(plan, options)
+
+        assert killed["done"] is True
+        assert not first.source.exists()
+        assert final.read_bytes() == payload
+        assert second.source.is_file()
+        assert load_undoable_log(dst) is None
+        assert find_unfinished_journal(dst) is not None
+
+        # The plan still lists the source. Resume must not error on the
+        # missing name or publish a collision copy.
+        log, summary = execute_plan(plan, options)
+
+        assert summary["errors"] == 0
+        assert summary["cancelled"] is False
+        assert summary["moved"] == 1
+        assert not first.source.exists()
+        assert final.read_bytes() == payload
+        assert not second.source.exists()
+        assert other_final.read_bytes() == second_payload
+        assert sorted(p.name for p in dst.rglob("*.jpg")) == [
+            "IMG_0.jpg", "IMG_1.jpg"]
+        assert find_unfinished_journal(dst) is None
+        done = [op for op in log.operations if op.status == "done"]
+        assert {path_identity(op.source) for op in done} == {
+            path_identity(first.source), path_identity(second.source)}
+        assert all(op.action == "move" and op.sha256 for op in done)
+
+        result = undo_log(log, dst)
+        assert result["undone"] == 2
+        assert result["kept"] == 0
+        assert result["failed"] == 0
+        assert first.source.read_bytes() == payload
+        assert second.source.read_bytes() == second_payload
+        assert not final.exists()
+        assert not other_final.exists()
+        assert not list(src.rglob("*restored*"))
+        assert not list(dst.rglob("*restored*"))
+
+    def test_undo_without_resume_restores_move_killed_before_done_line(
+            self, tmp_path, monkeypatch):
+        """File → Undo must restore the file when a rescan finds nothing.
+
+        After the rename the source is gone, so the next scan has no plan
+        and Organize never runs. The operation log was not saved. Undo
+        still has to move that one file back.
+        """
+        from media_organizer.core.plan import save_promoted_move_log
+
+        src, dst = _setup(tmp_path, n=1)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        source = plan[0].source
+        payload = source.read_bytes()
+        final = plan[0].destination
+        assert final is not None
+        real_replace = os.replace
+
+        def spy_replace(src_path, dst_path):
+            result = real_replace(src_path, dst_path)
+            if Path(src_path) == source:
+                raise SystemExit("kill after same-volume rename")
+            return result
+
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.replace", spy_replace)
+
+        with pytest.raises(SystemExit, match="kill after same-volume rename"):
+            execute_plan(plan, options)
+
+        assert not source.exists()
+        assert final.read_bytes() == payload
+        assert load_undoable_log(dst) is None
+
+        # A different file of the same size must not be moved back.
+        replaced = bytearray(payload)
+        replaced[-1] ^= 0xFF
+        assert bytes(replaced) != payload and len(replaced) == len(payload)
+        final.write_bytes(bytes(replaced))
+        assert save_promoted_move_log(dst) is None
+        assert not source.exists()
+        assert final.read_bytes() == bytes(replaced)
+
+        final.write_bytes(payload)
+        log = save_promoted_move_log(dst)
+        assert log is not None
+        assert [(op.action, op.status, op.sha256) for op in log.operations] == [
+            ("move", "done", hashlib.sha256(payload).hexdigest())]
+        result = undo_log(log, dst)
+        assert result["undone"] == 1
+        assert result["kept"] == 0
+        assert result["failed"] == 0
+        assert source.read_bytes() == payload
+        assert not final.exists()
+        assert not list(src.rglob("*restored*"))
+        assert not list(dst.rglob("*restored*"))
+        assert find_unfinished_journal(dst) is None
+
+    def test_undo_without_resume_also_restores_the_earlier_journaled_file(
+            self, tmp_path, monkeypatch):
+        """Undoing the renamed file must not drop an earlier done line.
+
+        The crash journal is discarded once a restored source is listed
+        there. A recovery log that named only the prepared move would
+        throw away the sibling that already had a done line and no
+        operation log.
+        """
+        from media_organizer.core.plan import save_promoted_move_log
+
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        first, second = plan[0], plan[1]
+        payload = first.source.read_bytes()
+        second_payload = second.source.read_bytes()
+        final = first.destination
+        other = second.destination
+        assert final is not None and other is not None
+        real_replace = os.replace
+
+        def spy_replace(src_path, dst_path):
+            result = real_replace(src_path, dst_path)
+            if Path(src_path) == second.source:
+                raise SystemExit("kill after second rename")
+            return result
+
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.replace", spy_replace)
+
+        with pytest.raises(SystemExit, match="kill after second rename"):
+            execute_plan(plan, options)
+
+        assert not first.source.exists() and not second.source.exists()
+        assert final.read_bytes() == payload
+        assert other.read_bytes() == second_payload
+        assert load_undoable_log(dst) is None
+        text = journal_path_for(dst).read_text(encoding="utf-8")
+        statuses = [json.loads(line)["status"] for line in text.splitlines()
+                    if line.strip()]
+        assert statuses == ["done", "prepared"]
+
+        log = save_promoted_move_log(dst)
+        assert log is not None
+        assert {path_identity(op.source) for op in log.operations} == {
+            path_identity(first.source), path_identity(second.source)}
+        result = undo_log(log, dst)
+        assert result["undone"] == 2
+        assert result["kept"] == 0
+        assert result["failed"] == 0
+        assert first.source.read_bytes() == payload
+        assert second.source.read_bytes() == second_payload
+        assert not final.exists() and not other.exists()
+        assert not list(src.rglob("*restored*"))
+        assert not list(dst.rglob("*restored*"))
+        assert find_unfinished_journal(dst) is None
+
+    def test_prepared_line_with_source_still_present_is_not_skipped(
+            self, tmp_path, monkeypatch):
+        """A kill before the rename must not make Resume skip the file.
+
+        The prepared line is on disk and the source name is still there.
+        Promoting it would leave the file unorganized and Undo would have
+        no destination to move back.
+        """
+        src, dst = _setup(tmp_path, n=1)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        source = plan[0].source
+        payload = source.read_bytes()
+        final = plan[0].destination
+        assert final is not None
+        real_prepare = JournalWriter.prepare_move
+        fired = {"n": 0}
+
+        def spy_prepare(self, source_s, destination, sha256, size):
+            real_prepare(self, source_s, destination, sha256, size)
+            if Path(source_s) == source:
+                fired["n"] += 1
+                if fired["n"] == 1:
+                    assert source.is_file()
+                    assert not final.exists()
+                    raise SystemExit("kill before same-volume rename")
+
+        monkeypatch.setattr(JournalWriter, "prepare_move", spy_prepare)
+
+        with pytest.raises(SystemExit, match="kill before same-volume rename"):
+            execute_plan(plan, options)
+
+        assert source.read_bytes() == payload
+        assert not final.exists()
+        text = journal_path_for(dst).read_text(encoding="utf-8")
+        prepared = json.loads(text.splitlines()[0])
+        assert prepared["status"] == "prepared"
+        assert prepared["sha256"] == hashlib.sha256(payload).hexdigest()
+
+        log, summary = execute_plan(plan, options)
+
+        assert summary["moved"] == 1
+        assert summary["errors"] == 0
+        assert not source.exists()
+        assert final.read_bytes() == payload
+        assert not list(dst.rglob("*_1*"))
+        done = [op for op in log.operations if op.status == "done"]
+        assert len(done) == 1
+        assert done[0].source == str(source)
+        assert done[0].destination == str(final)
+        result = undo_log(log, dst)
+        assert result["undone"] == 1
+        assert result["failed"] == 0
+        assert source.read_bytes() == payload
+        assert not final.exists()
+        assert not list(src.rglob("*restored*"))
 
     def test_cleanup_stale_parts(self, tmp_path):
         (tmp_path / "a").mkdir()
