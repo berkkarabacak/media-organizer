@@ -7,12 +7,15 @@ Safety features:
   appends to the unfinished one. Per-file errors leave the journal
   unfinished so Resume can skip the files already recorded. Copies are
   fsynced to a temp name, then atomically renamed. A cross-volume move
-  journals that copy before the source is removed. Resume still removes
-  that source when the done line is already there and the destination
-  bytes still match; a missing or
-  different destination is left alone. A destination that already holds
-  this source's bytes is journaled and not copied again. A different file
-  at that path still gets a collision suffix.
+  journals that copy before the source is removed. A same-volume move
+  hashes the source before renaming it; a journal failure after that
+  rename keeps the row done so Undo can put the file back, and still
+  counts an error so the run stays resumable. Resume still removes
+  a cross-volume source when the done line is already there and the
+  destination bytes still match; a missing or different destination is
+  left alone. A destination that already holds this source's bytes is
+  journaled and not copied again. A different file at that path still
+  gets a collision suffix.
 - free-space preflight helper. The byte total is what this run will
   still write, not rows Resume will skip and not a destination that
   already holds the source. A same-volume move is a rename and is not
@@ -459,6 +462,10 @@ def execute_plan(
     # also closed, so the identical-destination reuse path could not
     # adopt it. Leaving the journal open keeps the done lines that were
     # recorded; Resume skips those sources and retries the rest.
+    # A same-volume rename has already dropped the source name by the
+    # time record runs. That row stays ``done`` when record fails: Undo
+    # only reverses ``done``, and the bytes are only at the destination.
+    # The error is still counted, so ``complete()`` is skipped.
     # Anything else (a bug, MemoryError, a runtime failure) used to reach
     # finally with cancelled still false and write {"run": "complete"}, so
     # the next launch treated the crash as finished and could replace the
@@ -524,12 +531,13 @@ def execute_plan(
                     bytes_done += item.size
                 else:
                     final.parent.mkdir(parents=True, exist_ok=True)
-                    # Copy keeps the source. Same-volume move renames it
-                    # away inside atomic_move. Cross-volume move copies and
-                    # leaves the source until the journal line below is
-                    # durable; only then is the source unlinked. A file that
-                    # is already at ``final`` takes the same order: journal,
-                    # then unlink, and only when it is not the same file.
+                    # Copy keeps the source. Same-volume move hashes the
+                    # source, then renames it away inside atomic_move.
+                    # Cross-volume move copies and leaves the source until
+                    # the journal line below is durable; only then is the
+                    # source unlinked. A file that is already at ``final``
+                    # takes the same order: journal, then unlink, and only
+                    # when it is not the same file.
                     unlink_source_after_journal = False
                     if reused:
                         digest = file_sha256(final)
@@ -560,7 +568,32 @@ def execute_plan(
                         except FileNotFoundError:
                             pass
             except OSError as exc:
-                op.status = "error"
+                # Same-volume rename already published the file and
+                # removed the source. sha256 was taken before that
+                # rename. Marking the row error would make Undo skip it
+                # for good. Keep done, count the error, and try once
+                # more to journal the line. Copy and cross-volume still
+                # have the source, so a failed record stays an error and
+                # Resume can adopt or retry it.
+                dest_path = Path(op.destination) if op.destination else None
+                published_move = (
+                    op.action == "move"
+                    and bool(op.sha256)
+                    and dest_path is not None
+                    and not Path(op.source).exists()
+                    and dest_path.is_file()
+                )
+                if published_move:
+                    op.status = "done"
+                    if journal is not None:
+                        try:
+                            journal.record(
+                                op.action, op.source, op.destination,
+                                sha256=op.sha256, size=op.size)
+                        except OSError:
+                            pass
+                else:
+                    op.status = "error"
                 op.error = str(exc)
                 summary["errors"] += 1
             log.operations.append(op)

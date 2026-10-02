@@ -691,6 +691,154 @@ class TestAtomicCopy:
         assert unlink_after is False
         assert final.exists() and not f.exists()
 
+    def test_same_volume_move_hashes_source_before_replace(
+            self, tmp_path, monkeypatch):
+        """The digest is read while the source name still exists.
+
+        A full read of ``final`` after ``os.replace`` is the crash window
+        this closes: the file would already be only at the destination.
+        """
+        src, _ = _setup(tmp_path)
+        f = src / "IMG_1.jpg"
+        payload = f.read_bytes()
+        final = tmp_path / "moved.jpg"
+        events = []
+        real_open = open
+        real_replace = os.replace
+
+        def spy_open(file, mode="r", *args, **kwargs):
+            path = Path(file)
+            if path == f or path == final:
+                events.append(("open", path, mode, f.exists(), final.exists()))
+            return real_open(file, mode, *args, **kwargs)
+
+        def spy_replace(src_path, dst_path):
+            events.append((
+                "replace", Path(src_path), Path(dst_path),
+                Path(src_path).exists(), Path(dst_path).exists()))
+            return real_replace(src_path, dst_path)
+
+        monkeypatch.setattr(
+            "media_organizer.core.journal.open", spy_open, raising=False)
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.replace", spy_replace)
+
+        digest, unlink_after = atomic_move(f, final)
+
+        assert unlink_after is False
+        assert digest == hashlib.sha256(payload).hexdigest()
+        assert final.read_bytes() == payload and not f.exists()
+        assert events == [
+            ("open", f, "rb", True, False),
+            ("replace", f, final, True, False),
+        ]
+
+    def test_same_volume_record_is_not_preceded_by_reading_final(
+            self, tmp_path, monkeypatch):
+        """``JournalWriter.record`` follows the rename with no read of final."""
+        src, dst = _setup(tmp_path, n=1)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        source = plan[0].source
+        final = plan[0].destination
+        assert final is not None and final.name == source.name
+        payload = source.read_bytes()
+        events = []
+        real_open = open
+        real_replace = os.replace
+        real_record = JournalWriter.record
+
+        def spy_open(file, mode="r", *args, **kwargs):
+            try:
+                path = Path(file)
+            except TypeError:
+                path = None
+            if path == source and "r" in str(mode) and "w" not in str(mode):
+                events.append(("open-source", source.exists(), final.exists()))
+            elif path == final:
+                events.append(("open-final", mode))
+            return real_open(file, mode, *args, **kwargs)
+
+        def spy_replace(src_path, dst_path):
+            if Path(src_path) == source and Path(dst_path) == final:
+                events.append("replace")
+                assert source.is_file() and not final.exists()
+            return real_replace(src_path, dst_path)
+
+        def spy_record(self, action, source_s, destination, **kwargs):
+            events.append("record")
+            assert not source.exists()
+            assert Path(destination) == final and final.is_file()
+            assert not any(
+                isinstance(event, tuple) and event[0] == "open-final"
+                for event in events)
+            return real_record(self, action, source_s, destination, **kwargs)
+
+        monkeypatch.setattr("builtins.open", spy_open)
+        monkeypatch.setattr(
+            "media_organizer.core.journal.os.replace", spy_replace)
+        monkeypatch.setattr(JournalWriter, "record", spy_record)
+
+        log, summary = execute_plan(plan, options)
+
+        assert summary["moved"] == 1 and summary["errors"] == 0
+        assert log.operations[0].sha256 == hashlib.sha256(payload).hexdigest()
+        assert events.index("replace") < events.index("record")
+        hashed = [event for event in events
+                  if isinstance(event, tuple) and event[0] == "open-source"]
+        assert hashed == [("open-source", True, False)]
+        assert hashed[0] and events.index(hashed[0]) < events.index("replace")
+        assert not any(
+            isinstance(event, tuple) and event[0] == "open-final"
+            for event in events)
+
+    def test_cross_volume_move_skips_prerename_hash(self, tmp_path, monkeypatch):
+        """A different device still copies and leaves the source in place.
+
+        The pre-rename hash is only for the same-volume rename. This path
+        must not read the source twice, and it must not unlink it.
+        """
+        shm = Path("/dev/shm")
+        if not shm.is_dir() or shm.stat().st_dev == tmp_path.stat().st_dev:
+            pytest.skip("need a second local volume such as /dev/shm")
+        other = Path(tempfile.mkdtemp(prefix="mo-vol-", dir=shm))
+        try:
+            source = tmp_path / "clip.jpg"
+            payload = b"clip-bytes"
+            source.write_bytes(payload)
+            final = other / "clip.jpg"
+            reads = {"n": 0}
+            real_open = open
+
+            def spy_sha(_path):
+                raise AssertionError(
+                    "cross-volume move hashed the source before copying")
+
+            def spy_open(file, mode="r", *args, **kwargs):
+                try:
+                    path = Path(file)
+                except TypeError:
+                    path = None
+                if (path == source and "r" in str(mode)
+                        and "w" not in str(mode)):
+                    reads["n"] += 1
+                return real_open(file, mode, *args, **kwargs)
+
+            monkeypatch.setattr(
+                "media_organizer.core.journal._sha256", spy_sha)
+            monkeypatch.setattr("builtins.open", spy_open)
+
+            digest, unlink_after = atomic_move(source, final)
+
+            assert unlink_after is True
+            assert reads["n"] == 1
+            assert source.read_bytes() == payload
+            assert final.read_bytes() == payload
+            assert digest == hashlib.sha256(payload).hexdigest()
+            assert not final.with_name(final.name + PART_SUFFIX).exists()
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
+
     def test_cross_volume_move_journals_before_source_unlink(
             self, tmp_path, monkeypatch):
         """Cross-volume move records the journal line before unlinking.
@@ -792,6 +940,69 @@ class TestAtomicCopy:
         assert copied[0].read_bytes() == payload
         text = journal_path_for(dst).read_text(encoding="utf-8")
         assert str(source) not in text
+
+    def test_same_volume_journal_failure_keeps_undoable_move(
+            self, tmp_path, monkeypatch):
+        """A failed record after a same-volume rename stays Undoable.
+
+        The source is already gone. status ``error`` would make Undo
+        skip that row permanently. The error is still counted, and a
+        later file is journaled, so the run stays resumable.
+        """
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        first, second = plan[0], plan[1]
+        payload = first.source.read_bytes()
+        second_payload = second.source.read_bytes()
+        real_record = JournalWriter.record
+        calls = {"n": 0}
+
+        def fail_first(self, action, source_s, destination, **kwargs):
+            if Path(source_s) == first.source:
+                calls["n"] += 1
+                assert not Path(source_s).exists()
+                published = Path(destination)
+                assert published.is_file()
+                assert published.read_bytes() == payload
+                raise OSError("journal write failed")
+            return real_record(self, action, source_s, destination, **kwargs)
+
+        monkeypatch.setattr(JournalWriter, "record", fail_first)
+
+        log, summary = execute_plan(plan, options)
+
+        assert summary["errors"] == 1
+        assert summary["moved"] == 2
+        assert summary["cancelled"] is False
+        assert not first.source.exists() and not second.source.exists()
+        assert [op.action for op in log.operations] == ["move", "move"]
+        assert [op.status for op in log.operations] == ["done", "done"]
+        assert log.operations[0].sha256 == hashlib.sha256(payload).hexdigest()
+        assert log.operations[0].error
+        assert calls["n"] == 2
+        assert Path(log.operations[0].destination).read_bytes() == payload
+        assert Path(log.operations[1].destination).read_bytes() == second_payload
+
+        jp = find_unfinished_journal(dst)
+        assert jp is not None
+        text = jp.read_text(encoding="utf-8")
+        assert '"run": "complete"' not in text
+        done_ids = {path_identity(source) for source in completed_sources(jp)}
+        assert path_identity(first.source) not in done_ids
+        assert path_identity(second.source) in done_ids
+
+        saved = load_undoable_log(dst)
+        assert saved is not None
+        assert [op.status for op in saved.operations] == ["done", "done"]
+        result = undo_log(saved, dst)
+        assert result["undone"] == 2
+        assert result["failed"] == 0
+        assert result["kept"] == 0
+        assert first.source.read_bytes() == payload
+        assert second.source.read_bytes() == second_payload
+        assert not Path(log.operations[0].destination).exists()
+        assert not Path(log.operations[1].destination).exists()
 
     def test_cleanup_stale_parts(self, tmp_path):
         (tmp_path / "a").mkdir()
@@ -1441,10 +1652,14 @@ class TestPartialFileErrorsLeaveJournalUnfinished:
 
         monkeypatch.setattr(JournalWriter, "record", fail_second_record)
 
-        _log, summary = execute_plan(plan, options)
+        log, summary = execute_plan(plan, options)
 
         assert summary["errors"] >= 1
         assert summary["copied"] == 2
+        failed = [op for op in log.operations
+                  if path_identity(op.source) == path_identity(second.source)]
+        assert [(op.action, op.status) for op in failed] == [("copy", "error")]
+        assert second.source.is_file()
         assert first.destination.is_file()
         assert second.destination.is_file()
         assert second.destination.read_bytes() == payload

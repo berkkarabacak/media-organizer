@@ -464,36 +464,65 @@ def atomic_copy(source: Path, final: Path) -> str:
     return digest.hexdigest()
 
 
+def _known_cross_volume(source: Path, final: Path) -> bool:
+    """True when ``source`` and ``final``'s parent are different devices.
+
+    Unknown (missing parent, unreadable stat) is false. The caller then
+    hashes and tries ``os.replace``. A failure still uses ``atomic_copy``.
+    Windows often reports ``st_dev`` as 0 on every drive, so those moves
+    take that path instead of this one.
+    """
+    try:
+        parent = final.parent
+        if not parent.exists():
+            return False
+        return source.stat().st_dev != parent.stat().st_dev
+    except OSError:
+        return False
+
+
 def atomic_move(source: Path, final: Path) -> tuple[str, bool]:
     """Move with crash safety.
 
     Returns ``(sha256, unlink_source_after_journal)``.
 
-    Same-volume renames are atomic: ``os.replace`` places the file at
-    ``final`` and removes the source name in one step. The flag is false.
-    The caller still journals after this returns.
+    Same-volume renames are atomic. The source is hashed first, then
+    ``os.replace`` places the file at ``final`` and removes the source
+    name in one step. The returned digest is that pre-rename hash, not
+    a second full read of ``final``. The flag is false. The caller
+    journals after this returns. A crash in that gap leaves the file
+    only at ``final``. The source name is already gone; it is not still
+    there to resume from. Hashing before the rename keeps that gap to
+    the journal write.
 
-    Across volumes ``os.replace`` fails. The file is copied durably
-    (``atomic_copy`` fsyncs the part file before rename) and the source is
-    left in place. The flag is true: the caller must journal the move,
-    then unlink the source. Unlinking first can delete the only copy.
+    Across volumes the devices already differ, or ``os.replace`` fails.
+    The file is copied durably (``atomic_copy`` fsyncs the part file
+    before rename) and the source is left in place. The flag is true:
+    the caller must journal the move, then unlink the source. Unlinking
+    first can delete the only copy. A known different device skips the
+    pre-rename hash and goes straight to that copy. A replace that
+    fails still falls through to it.
 
-    If the process dies after that rename and before the journal line, the
-    bytes are already at ``final`` and the source is still there. Resume
-    keeps that path when the bytes still match, instead of copying to a
-    collision name. A crash after the journal line and before the source
-    unlink is the other window: the done line is already there, so Resume
-    would otherwise skip the row and leave the source in place.
+    If the process dies after that cross-volume rename and before the
+    journal line, the bytes are already at ``final`` and the source is
+    still there. That is only the copy path. Resume keeps that path
+    when the bytes still match, instead of copying to a collision name.
+    A crash after the journal line and before the source unlink is the
+    other window: the done line is already there, so Resume would
+    otherwise skip the row and leave the source in place.
     ``execute_plan`` removes that source when the destination still
     matches. A crash before the rename leaves the part file and the
     source. Cleanup deletes that part; it does not rename it onto
     ``final``.
     """
+    if _known_cross_volume(source, final):
+        return atomic_copy(source, final), True
+    digest = _sha256(source)
     try:
         os.replace(source, final)  # same volume: truly atomic
     except OSError:
         return atomic_copy(source, final), True
-    return _sha256(final), False
+    return digest, False
 
 
 def cleanup_stale_parts(dest_dir: Path | str) -> int:
