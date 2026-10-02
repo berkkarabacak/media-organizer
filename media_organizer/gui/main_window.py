@@ -228,7 +228,7 @@ class AboutDialog(QDialog):
         )
         about.setWordWrap(True)
         layout.addWidget(about)
-        license_label = QLabel("License: <commercial license placeholder>")
+        license_label = QLabel("License: MIT")
         license_label.setObjectName("muted")
         layout.addWidget(license_label)
         buttons = QDialogButtonBox(QDialogButtonBox.Ok)
