@@ -13,7 +13,7 @@ import pytest
 
 from media_organizer.core.executor import (
     _volume_id, bytes_still_needed, execute_plan, free_space_status,
-    saved_run_owns_plan_row,
+    plan_discard_will_run, saved_run_owns_plan_row,
 )
 from media_organizer.core.journal import (
     PART_SUFFIX, JournalWriter, atomic_copy, atomic_move, cleanup_stale_parts,
@@ -526,6 +526,214 @@ class TestBytesStillNeeded:
         assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 10**15
         assert free_space_status(dst, 0)["ok"]
         assert not free_space_status(dst, 10**15)["ok"]
+
+
+def _other_volume(monkeypatch, *sources):
+    """Report ``sources`` on a different device from every other path."""
+    split = {Path(path) for path in sources}
+
+    def volume(path):
+        if Path(path) in split:
+            return 11
+        return 3
+
+    monkeypatch.setattr(
+        "media_organizer.core.executor._volume_id", volume)
+
+
+class TestDiscardPreflightBytes:
+    """Discard's free-space total is the restart, not the raw plan.
+
+    A cross-volume move writes the done line, then unlinks the source.
+    The destination still holds the bytes. ``files_identical`` is false
+    once that source is gone, and the volumes differ, so the raw plan
+    counts a copy the seeded undo log will own. Resume already drops
+    the source. Discard must drop the owned row too, and must still
+    count a destination that is missing or a different file.
+    """
+
+    def _moved(self, tmp_path, *, publish=True, unlink=False, fresh=True):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        dst.mkdir()
+        capture = _capture_date()
+        done = src / "done.jpg"
+        done.write_bytes(b"done-bytes")
+        rows = [done]
+        fresh_path = src / "fresh.jpg"
+        if fresh:
+            fresh_path.write_bytes(b"fresh-bytes")
+            rows.append(fresh_path)
+        plan = [
+            PlannedFile(path, dst / path.name, 10**15 if path is done else 4096,
+                        capture, "image")
+            for path in rows
+        ]
+        final = dst / "done.jpg"
+        if publish:
+            final.write_bytes(b"done-bytes")
+        if unlink:
+            done.unlink()
+        digest = hashlib.sha256(b"done-bytes").hexdigest()
+        with JournalWriter(dst) as writer:
+            writer.record(
+                "move", str(done), str(final),
+                sha256=digest, size=len(b"done-bytes"))
+        return src, dst, plan, done, fresh_path
+
+    def test_gone_cross_volume_source_is_not_counted_again(
+            self, tmp_path, monkeypatch):
+        src, dst, plan, done, fresh = self._moved(
+            tmp_path, publish=True, unlink=True)
+        _other_volume(monkeypatch, done, fresh)
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        before = journal.read_bytes()
+        restart = plan_discard_will_run(plan, dst)
+        stale = bytes_still_needed(plan, copy_mode=False, dest_dir=dst)
+        needed = bytes_still_needed(restart, copy_mode=False, dest_dir=dst)
+        copied = bytes_still_needed(restart, copy_mode=True, dest_dir=dst)
+
+        assert stale == 10**15 + 4096
+        assert needed == 4096
+        assert copied == 4096
+        assert [item.source for item in restart] == [fresh]
+        assert journal.read_bytes() == before
+        assert list_run_logs(dst) == []
+        assert find_unfinished_journal(dst) == journal
+        # A drive that cannot hold the stale total can still hold the restart.
+        assert not free_space_status(dst, stale)["ok"]
+        assert free_space_status(dst, needed)["ok"]
+
+    def test_unknown_device_still_omits_an_owned_gone_source(
+            self, tmp_path, monkeypatch):
+        _src, dst, plan, done, fresh = self._moved(
+            tmp_path, publish=True, unlink=True)
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", lambda _path: None)
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == (
+            10**15 + 4096)
+        assert bytes_still_needed(
+            plan_discard_will_run(plan, dst),
+            copy_mode=False, dest_dir=dst) == 4096
+        assert done == plan[0].source
+
+    def test_windows_zero_device_omits_owned_row_and_keeps_the_rest(
+            self, tmp_path, monkeypatch):
+        """``st_dev`` 0 on two drives still counts only the restart."""
+        _src, dst, plan, done, fresh = self._moved(
+            tmp_path, publish=True, unlink=True)
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", lambda _path: 0)
+
+        def anchor(path):
+            if Path(path) in {done, fresh}:
+                return "c:\\"
+            return "d:\\"
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._windows_anchor", anchor)
+        assert bytes_still_needed(
+            plan, copy_mode=False, dest_dir=dst, windows=True) == 10**15 + 4096
+        assert bytes_still_needed(
+            plan_discard_will_run(plan, dst),
+            copy_mode=False, dest_dir=dst, windows=True) == 4096
+        assert bytes_still_needed(
+            plan, copy_mode=False, dest_dir=dst, windows=False) == 0
+
+    def test_missing_destination_is_still_counted(self, tmp_path, monkeypatch):
+        """Resume skips a done source. Discard writes it when dest is gone."""
+        _src, dst, plan, done, fresh = self._moved(
+            tmp_path, publish=False, unlink=False)
+        assert not (dst / "done.jpg").exists()
+        _other_volume(monkeypatch, done, fresh)
+        journal = find_unfinished_journal(dst)
+        resumed = exclude_completed_sources(plan, completed_sources(journal))
+        restart = plan_discard_will_run(plan, dst)
+
+        assert bytes_still_needed(
+            resumed, copy_mode=False, dest_dir=dst) == 4096
+        assert bytes_still_needed(
+            restart, copy_mode=False, dest_dir=dst) == 10**15 + 4096
+        assert bytes_still_needed(
+            plan, copy_mode=False, dest_dir=dst) == 10**15 + 4096
+        assert not free_space_status(dst, 10**15 + 4096)["ok"]
+
+    def test_gone_source_and_missing_destination_is_still_counted(
+            self, tmp_path, monkeypatch):
+        _src, dst, plan, done, fresh = self._moved(
+            tmp_path, publish=False, unlink=True)
+        _other_volume(monkeypatch, done, fresh)
+        assert bytes_still_needed(
+            plan_discard_will_run(plan, dst),
+            copy_mode=False, dest_dir=dst) == 10**15 + 4096
+
+    def test_different_occupant_is_still_counted(self, tmp_path, monkeypatch):
+        _src, dst, plan, done, fresh = self._moved(
+            tmp_path, publish=True, unlink=False)
+        (dst / "done.jpg").write_bytes(b"not-the-moved-bytes")
+        assert done.exists()
+        _other_volume(monkeypatch, done, fresh)
+        assert bytes_still_needed(
+            plan_discard_will_run(plan, dst),
+            copy_mode=False, dest_dir=dst) == 10**15 + 4096
+
+    def test_remaining_cross_volume_bytes_still_do_not_fit(
+            self, tmp_path, monkeypatch):
+        _src, dst, plan, done, fresh = self._moved(
+            tmp_path, publish=True, unlink=True)
+        plan[1].size = 10**14
+        _other_volume(monkeypatch, done, fresh)
+        needed = bytes_still_needed(
+            plan_discard_will_run(plan, dst),
+            copy_mode=False, dest_dir=dst)
+        assert needed == 10**14
+        space = free_space_status(dst, needed)
+        assert space["ok"] is False
+        assert space["needed"] == 10**14
+
+    def test_settled_rows_alone_need_nothing(self, tmp_path, monkeypatch):
+        _src, dst, plan, done, _fresh = self._moved(
+            tmp_path, publish=True, unlink=True, fresh=False)
+        _other_volume(monkeypatch, done)
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 10**15
+        assert bytes_still_needed(
+            plan_discard_will_run(plan, dst),
+            copy_mode=False, dest_dir=dst) == 0
+        assert free_space_status(dst, 0)["ok"]
+        assert not free_space_status(dst, 10**15)["ok"]
+
+    def test_prepared_landed_rename_is_owned_without_promoting(
+            self, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        photo = src / "a.jpg"
+        payload = b"jpeg-bytes"
+        photo.write_bytes(payload)
+        final = dst / "a.jpg"
+        final.parent.mkdir()
+        digest = hashlib.sha256(payload).hexdigest()
+        with JournalWriter(dst) as writer:
+            writer.prepare_move(str(photo), str(final), digest, len(payload))
+        os.replace(photo, final)
+        capture = _capture_date()
+        plan = [PlannedFile(photo, final, 10**15, capture, "image")]
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        before = journal.read_bytes()
+        assert completed_sources(journal) == set()
+        _other_volume(monkeypatch, photo)
+
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 10**15
+        assert bytes_still_needed(
+            plan_discard_will_run(plan, dst),
+            copy_mode=False, dest_dir=dst) == 0
+        assert journal.read_bytes() == before
+        assert b'"status": "prepared"' in before or b'"prepared"' in before
+        assert list_run_logs(dst) == []
+        assert promotable_prepared_moves(dst)
 
 
 class TestVolumeId:
