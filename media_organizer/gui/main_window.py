@@ -32,7 +32,8 @@ from ..core.executor import (bytes_still_needed, execute_plan,
                             free_space_status, saved_run_owns_plan_row)
 from ..core.journal import (completed_sources, discard_journal,
                             exclude_completed_sources,
-                            find_unfinished_journal)
+                            find_unfinished_journal, path_identity,
+                            promotable_prepared_moves)
 from ..core.metadata import Confidence, DateSource
 from ..core.organizer import STRATEGIES, OrganizeOptions, destination_blocks_scan
 from ..core.plan import (UNDO_LIMITATION, list_run_logs,
@@ -1274,14 +1275,26 @@ class MainWindow(QMainWindow):
         # can be made again.
         discard_after_preflight = False
         done_before: set[str] = set()
+        landed_before: set[str] = set()
         if not options.dry_run:
             journal = find_unfinished_journal(options.dest_dir)
             if journal is not None:
                 done_before = completed_sources(journal)
+                # A same-volume rename can land before the done line.
+                # completed_sources is empty then, but the only copy is
+                # already at the destination. Count that file so Discard
+                # is not described as touching nothing.
+                landed_before = {
+                    path_identity(move["source"])
+                    for move in promotable_prepared_moves(options.dest_dir)
+                }
+                already_organized = len(
+                    {path_identity(source) for source in done_before}
+                    | landed_before)
                 answer = QMessageBox.question(
                     self, APP_NAME,
                     f"A previous run was interrupted (power loss?) — "
-                    f"{len(done_before):,} files were already organized.\n\n"
+                    f"{already_organized:,} files were already organized.\n\n"
                     f"Yes = Resume (skip them) · No = Discard and start over",
                     QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes)
                 if answer == QMessageBox.Yes:
@@ -1347,8 +1360,17 @@ class MainWindow(QMainWindow):
                 # owns. A source that is already gone is the same case after
                 # a move. A missing destination stays in the plan so Discard
                 # can write it.
+                # A prepared-only journal has an empty done_before even
+                # when the rename already dropped the source. execute_plan([])
+                # would publish an empty undo log, because the done line
+                # does not exist yet. save_promoted_move_log writes the undo
+                # row only when the destination still matches the prepared
+                # hash. A prepared line whose source is still present is
+                # left unpublished, and Discard really starts over.
                 if done_before:
                     execute_plan([], options)
+                elif landed_before:
+                    save_promoted_move_log(options.dest_dir)
                 discard_journal(options.dest_dir)
                 owned = saved_run_destinations(options.dest_dir)
                 if owned:

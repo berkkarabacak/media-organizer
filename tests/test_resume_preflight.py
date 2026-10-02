@@ -968,3 +968,242 @@ class TestResumePreflight:
         assert photo.read_bytes() == payload
         assert not final.exists()
         assert find_unfinished_journal(dst) is None
+
+
+def _prepared_rename(source: Path, final: Path, dest_dir: Path, *,
+                     replace: bool) -> tuple[bytes, str]:
+    """Prepared journal line, and the rename when ``replace`` is set.
+
+    No done line, no ``{"run": "complete"}``, and no operation log.
+    """
+    payload = source.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    final.parent.mkdir(parents=True, exist_ok=True)
+    with JournalWriter(dest_dir) as writer:
+        writer.prepare_move(str(source), str(final), digest, len(payload))
+    if replace:
+        os.replace(source, final)
+    return payload, digest
+
+
+class TestPreparedOnlyInterruptedRun:
+    """Discard and Resume after a same-volume rename that never reached done.
+
+    The dialog used to count only ``completed_sources``. A prepared-only
+    journal said 0 files, and Discard deleted the hash with no undo log.
+    """
+
+    def test_discard_keeps_the_landed_rename_undoable(
+            self, qapp, window, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        kept = make_jpeg_with_exif(
+            src / "kept.jpg", datetime(2024, 7, 15, 10, 0, 0))
+        fresh = make_jpeg_with_exif(
+            src / "new.jpg", datetime(2024, 7, 15, 10, 2, 0))
+        fresh_payload = fresh.read_bytes()
+        plan = build_plan(OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=False))
+        by_source = {item.source: item for item in plan}
+        kept_final = by_source[kept].destination
+        fresh_final = by_source[fresh].destination
+        payload, digest = _prepared_rename(kept, kept_final, dst, replace=True)
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        assert completed_sources(journal) == set()
+        assert load_undoable_log(dst) is None
+        assert '"run": "complete"' not in journal.read_text(encoding="utf-8")
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
+        _install_space(monkeypatch, free=1_000_000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.organize_btn.setEnabled(True)
+        window.start_organize()
+        _wait(window, qapp)
+
+        question = _texts(events, "question")
+        assert question[0].startswith("Move mode removes")
+        assert "1 files were already organized" in question[1]
+        assert "0 files were already organized" not in question[1]
+        assert _texts(events, "critical") == []
+        assert find_unfinished_journal(dst) is None
+        assert not kept.exists()
+        assert kept_final.read_bytes() == payload
+        assert not fresh.exists()
+        assert fresh_final.read_bytes() == fresh_payload
+        assert not list(dst.rglob("*_1*"))
+        logs = list_run_logs(dst)
+        assert len(logs) == 2
+        newest, seeded = logs
+        assert _done_ids(newest) == {path_identity(fresh)}
+        assert _done_ids(seeded) == {path_identity(kept)}
+        assert seeded.operations[0].action == "move"
+        assert seeded.operations[0].sha256 == digest
+        assert seeded.operations[0].size == len(payload)
+
+        result = undo_log(newest, dst)
+        assert result["undone"] == 1
+        assert result["failed"] == 0
+        assert fresh.read_bytes() == fresh_payload
+        assert not fresh_final.exists()
+        assert not kept.exists()
+        assert kept_final.read_bytes() == payload
+
+        older = load_undoable_log(dst)
+        assert older is not None and older.run_id == seeded.run_id
+        result = undo_log(older, dst)
+        assert result["undone"] == 1
+        assert result["kept"] == 0
+        assert result["failed"] == 0
+        assert kept.read_bytes() == payload
+        assert not kept_final.exists()
+        assert not list(src.rglob("*restored*"))
+        assert not list(dst.rglob("*restored*"))
+
+    def test_discard_of_only_the_landed_rename_disarms(
+            self, qapp, window, tmp_path, monkeypatch):
+        """The classic first-file window: nothing unpublished remains."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        photo = make_jpeg_with_exif(
+            src / "kept.jpg", datetime(2024, 7, 15, 10, 0, 0))
+        plan = build_plan(OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=False))
+        final = plan[0].destination
+        payload, _digest = _prepared_rename(photo, final, dst, replace=True)
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
+        _install_space(monkeypatch, free=1_000_000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.organize_btn.setEnabled(True)
+        window.start_organize()
+
+        assert window.org_worker is None
+        assert window.plan == []
+        assert window.organize_btn.isEnabled() is False
+        assert "nothing new" in window.status_label.text()
+        question = _texts(events, "question")
+        assert "1 files were already organized" in question[1]
+        note = _texts(events, "information")[0]
+        assert "already in the destination" in note
+        assert "Undo" in note
+        assert find_unfinished_journal(dst) is None
+        assert final.read_bytes() == payload
+        seeded = load_log(dst)
+        assert seeded is not None
+        assert _done_ids(seeded) == {path_identity(photo)}
+        result = undo_log(seeded, dst)
+        assert result["undone"] == 1
+        assert result["kept"] == 0
+        assert result["failed"] == 0
+        assert photo.read_bytes() == payload
+        assert not final.exists()
+        assert not list(src.rglob("*restored*"))
+        assert not list(dst.rglob("*restored*"))
+
+    def test_discard_unlanded_prepared_line_starts_over(
+            self, qapp, window, tmp_path, monkeypatch):
+        """A prepared line with the source still present is not an undo row."""
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        photo = make_jpeg_with_exif(
+            src / "kept.jpg", datetime(2024, 7, 15, 10, 0, 0))
+        payload = photo.read_bytes()
+        plan = build_plan(OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=False))
+        final = plan[0].destination
+        _prepared_rename(photo, final, dst, replace=False)
+        assert photo.read_bytes() == payload
+        assert not final.exists()
+
+        def refuse_empty_seed(*_args, **_kwargs):
+            raise AssertionError(
+                "Discard must not seed a run that never published a file")
+
+        def cancel_restart(plan, options, progress=None, cancel=None):
+            from media_organizer.core.executor import execute_plan
+            assert plan
+            assert load_undoable_log(dst) is None
+            return execute_plan(
+                plan, options, progress=progress, cancel=lambda: True)
+
+        monkeypatch.setattr(
+            "media_organizer.gui.main_window.execute_plan", refuse_empty_seed)
+        monkeypatch.setattr(
+            "media_organizer.gui.workers.execute_plan", cancel_restart)
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
+        _install_space(monkeypatch, free=1_000_000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.organize_btn.setEnabled(True)
+        window.start_organize()
+        _wait(window, qapp)
+
+        question = _texts(events, "question")
+        assert "0 files were already organized" in question[1]
+        assert load_undoable_log(dst) is None
+        assert find_unfinished_journal(dst) is None
+        assert photo.read_bytes() == payload
+        assert not final.exists()
+        assert not list(dst.rglob("*.jpg"))
+
+    def test_resume_promotes_prepared_rename_and_undoes(
+            self, qapp, window, tmp_path, monkeypatch):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        kept = make_jpeg_with_exif(
+            src / "kept.jpg", datetime(2024, 7, 15, 10, 0, 0))
+        fresh = make_jpeg_with_exif(
+            src / "new.jpg", datetime(2024, 7, 15, 10, 2, 0))
+        fresh_payload = fresh.read_bytes()
+        plan = build_plan(OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=False))
+        by_source = {item.source: item for item in plan}
+        kept_final = by_source[kept].destination
+        fresh_final = by_source[fresh].destination
+        payload, digest = _prepared_rename(kept, kept_final, dst, replace=True)
+        journal = find_unfinished_journal(dst)
+        assert journal is not None and completed_sources(journal) == set()
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
+        _install_space(monkeypatch, free=1_000_000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.organize_btn.setEnabled(True)
+        window.start_organize()
+        _wait(window, qapp)
+
+        question = _texts(events, "question")
+        assert "1 files were already organized" in question[1]
+        assert _texts(events, "critical") == []
+        assert find_unfinished_journal(dst) is None
+        assert not kept.exists() and not fresh.exists()
+        assert kept_final.read_bytes() == payload
+        assert fresh_final.read_bytes() == fresh_payload
+        assert not list(dst.rglob("*_1*"))
+        logs = list_run_logs(dst)
+        assert len(logs) == 1
+        log = logs[0]
+        assert _done_ids(log) == {path_identity(kept), path_identity(fresh)}
+        prepared = next(op for op in log.operations
+                        if path_identity(op.source) == path_identity(kept))
+        assert prepared.action == "move" and prepared.sha256 == digest
+        result = undo_log(log, dst)
+        assert result["undone"] == 2
+        assert result["kept"] == 0
+        assert result["failed"] == 0
+        assert kept.read_bytes() == payload
+        assert fresh.read_bytes() == fresh_payload
+        assert not kept_final.exists() and not fresh_final.exists()
+        assert not list(src.rglob("*restored*"))
+        assert not list(dst.rglob("*restored*"))

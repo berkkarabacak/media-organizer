@@ -19,7 +19,7 @@ from media_organizer.core.journal import (
     PART_SUFFIX, JournalWriter, atomic_copy, atomic_move, cleanup_stale_parts,
     completed_operations, completed_sources, discard_journal,
     exclude_completed_sources, files_identical, find_unfinished_journal,
-    journal_path_for, path_identity,
+    journal_path_for, path_identity, promotable_prepared_moves,
 )
 from media_organizer.core.metadata import (
     CaptureDate, Confidence, DateSource, analyze_media_batch,
@@ -28,7 +28,7 @@ from media_organizer.core.metadata import (
 from media_organizer.core.organizer import OrganizeOptions, PlannedFile, build_plan
 from media_organizer.core.plan import (
     Operation, list_run_logs, load_undoable_log, log_path_for, new_log,
-    save_log, saved_run_destinations, undo_log,
+    save_log, save_promoted_move_log, saved_run_destinations, undo_log,
 )
 from tests.helpers import make_jpeg_with_exif, make_jpeg_with_gps
 
@@ -1809,6 +1809,224 @@ class TestJournal:
         assert path_identity(messy) == path_identity(path)
         other = path.parent / "B.JPG"
         assert path_identity(other) != path_identity(path)
+
+
+def _prepare_same_volume_move(source: Path, final: Path, dest_dir: Path,
+                              *, replace: bool) -> tuple[bytes, str]:
+    """Fsync a prepared move line. Rename only when ``replace`` is set.
+
+    No done line and no operation log. This is the kill window between
+    ``prepare_move`` and ``record``, without injecting a crash.
+    """
+    payload = source.read_bytes()
+    digest = hashlib.sha256(payload).hexdigest()
+    final.parent.mkdir(parents=True, exist_ok=True)
+    with JournalWriter(dest_dir) as writer:
+        writer.prepare_move(str(source), str(final), digest, len(payload))
+    if replace:
+        os.replace(source, final)
+    return payload, digest
+
+
+class TestPreparedOnlyDiscard:
+    """Discard must not drop a rename that landed before the done line.
+
+    ``completed_sources`` is empty. The source name is already gone and
+    the destination matches the prepared hash. Dropping the journal
+    without an operation log leaves File → Undo with nothing to restore.
+    A prepared line whose source is still present was never published.
+    """
+
+    def test_landed_rename_is_promotable_and_undoable_after_journal_drop(
+            self, tmp_path):
+        src, dst = _setup(tmp_path, n=1)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        source = plan[0].source
+        final = plan[0].destination
+        assert final is not None
+        payload, digest = _prepare_same_volume_move(
+            source, final, dst, replace=True)
+
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        text = journal.read_text(encoding="utf-8")
+        assert '"run": "complete"' not in text
+        assert completed_sources(journal) == set()
+        assert load_undoable_log(dst) is None
+        landed = promotable_prepared_moves(dst)
+        assert journal.read_text(encoding="utf-8") == text
+        assert len(landed) == 1
+        assert landed[0]["source"] == str(source)
+        assert landed[0]["destination"] == str(final)
+        assert landed[0]["sha256"] == digest
+        assert landed[0]["size"] == len(payload)
+
+        # The gate start_organize uses when done_before is empty.
+        done_before = completed_sources(journal)
+        assert not done_before
+        if done_before:
+            execute_plan([], options)
+        else:
+            assert save_promoted_move_log(dst) is not None
+        discard_journal(dst)
+
+        assert find_unfinished_journal(dst) is None
+        assert not source.exists()
+        assert final.read_bytes() == payload
+        log = load_undoable_log(dst)
+        assert log is not None
+        done = [op for op in log.operations if op.status == "done"]
+        assert [(op.action, op.sha256, op.size) for op in done] == [
+            ("move", digest, len(payload))]
+        result = undo_log(log, dst)
+        assert result["undone"] == 1
+        assert result["kept"] == 0
+        assert result["failed"] == 0
+        assert source.read_bytes() == payload
+        assert not final.exists()
+        assert not list(src.rglob("*restored*"))
+        assert not list(dst.rglob("*restored*"))
+        assert not list(dst.rglob("*_1*"))
+
+    def test_source_still_present_is_not_promoted_or_logged(self, tmp_path):
+        src, dst = _setup(tmp_path, n=1)
+        plan = _plan(src, dst, copy_mode=False)
+        source = plan[0].source
+        final = plan[0].destination
+        assert final is not None
+        payload, _digest = _prepare_same_volume_move(
+            source, final, dst, replace=False)
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        text = journal.read_text(encoding="utf-8")
+
+        assert promotable_prepared_moves(dst) == []
+        assert journal.read_text(encoding="utf-8") == text
+        assert save_promoted_move_log(dst) is None
+        assert load_undoable_log(dst) is None
+        discard_journal(dst)
+        assert find_unfinished_journal(dst) is None
+        assert load_undoable_log(dst) is None
+        assert source.read_bytes() == payload
+        assert not final.exists()
+
+    def test_replaced_destination_is_not_promotable(self, tmp_path):
+        src, dst = _setup(tmp_path, n=1)
+        plan = _plan(src, dst, copy_mode=False)
+        source = plan[0].source
+        final = plan[0].destination
+        assert final is not None
+        payload, _digest = _prepare_same_volume_move(
+            source, final, dst, replace=True)
+        mutated = bytearray(payload)
+        mutated[-1] ^= 0xFF
+        final.write_bytes(bytes(mutated))
+
+        assert promotable_prepared_moves(dst) == []
+        assert save_promoted_move_log(dst) is None
+        assert load_undoable_log(dst) is None
+        assert not source.exists()
+        assert final.read_bytes() == bytes(mutated)
+
+    def test_resume_with_empty_done_before_promotes_and_undoes(self, tmp_path):
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        first, second = plan[0], plan[1]
+        final = first.destination
+        other = second.destination
+        assert final is not None and other is not None
+        payload, digest = _prepare_same_volume_move(
+            first.source, final, dst, replace=True)
+        second_payload = second.source.read_bytes()
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        done_before = completed_sources(journal)
+        assert done_before == set()
+        remaining = exclude_completed_sources(plan, done_before)
+        assert [path_identity(item.source) for item in remaining] == [
+            path_identity(first.source), path_identity(second.source)]
+
+        log, summary = execute_plan(remaining, options)
+
+        assert summary["errors"] == 0
+        assert summary["cancelled"] is False
+        assert not first.source.exists()
+        assert final.read_bytes() == payload
+        assert not second.source.exists()
+        assert other.read_bytes() == second_payload
+        assert sorted(p.name for p in dst.rglob("*.jpg")) == [
+            "IMG_0.jpg", "IMG_1.jpg"]
+        assert find_unfinished_journal(dst) is None
+        done = [op for op in log.operations if op.status == "done"]
+        assert {path_identity(op.source) for op in done} == {
+            path_identity(first.source), path_identity(second.source)}
+        prepared = next(op for op in done
+                        if path_identity(op.source) == path_identity(first.source))
+        assert prepared.action == "move"
+        assert prepared.sha256 == digest
+        result = undo_log(log, dst)
+        assert result["undone"] == 2
+        assert result["kept"] == 0
+        assert result["failed"] == 0
+        assert first.source.read_bytes() == payload
+        assert second.source.read_bytes() == second_payload
+        assert not final.exists() and not other.exists()
+        assert not list(src.rglob("*restored*"))
+        assert not list(dst.rglob("*restored*"))
+
+    def test_done_sibling_discard_still_seeds_the_prepared_rename(self, tmp_path):
+        """A done line keeps the execute_plan([]) path, which also promotes."""
+        src, dst = _setup(tmp_path, n=2)
+        options = OrganizeOptions(source_dir=src, dest_dir=dst, copy_mode=False)
+        plan = _plan(src, dst, copy_mode=False)
+        first, second = plan[0], plan[1]
+        final = first.destination
+        other = second.destination
+        assert final is not None and other is not None
+        payload = first.source.read_bytes()
+        digest = hashlib.sha256(payload).hexdigest()
+        second_payload = second.source.read_bytes()
+        second_digest = hashlib.sha256(second_payload).hexdigest()
+        final.parent.mkdir(parents=True, exist_ok=True)
+        other.parent.mkdir(parents=True, exist_ok=True)
+        with JournalWriter(dst) as writer:
+            writer.record(
+                "move", str(first.source), str(final),
+                sha256=digest, size=len(payload))
+            writer.prepare_move(
+                str(second.source), str(other),
+                second_digest, len(second_payload))
+        os.replace(first.source, final)
+        os.replace(second.source, other)
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+        done_before = completed_sources(journal)
+        assert done_before == {str(first.source)}
+        landed = promotable_prepared_moves(dst)
+        assert [path_identity(move["source"]) for move in landed] == [
+            path_identity(second.source)]
+
+        assert done_before
+        execute_plan([], options)
+        discard_journal(dst)
+
+        assert find_unfinished_journal(dst) is None
+        log = load_undoable_log(dst)
+        assert log is not None
+        assert {path_identity(op.source) for op in log.operations
+                if op.status == "done"} == {
+            path_identity(first.source), path_identity(second.source)}
+        result = undo_log(log, dst)
+        assert result["undone"] == 2
+        assert result["failed"] == 0
+        assert result["kept"] == 0
+        assert first.source.read_bytes() == payload
+        assert second.source.read_bytes() == second_payload
+        assert not final.exists() and not other.exists()
+        assert not list(src.rglob("*restored*"))
+        assert not list(dst.rglob("*restored*"))
 
 
 def _resume_plan(plan, dest):

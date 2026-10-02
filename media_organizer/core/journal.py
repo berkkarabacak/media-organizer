@@ -457,6 +457,45 @@ def _destination_matches_hash(dest: Path, digest: str, size: int) -> bool:
         return False
 
 
+def _landed_prepared_move(entry: dict, done_sources: set[str]) -> dict | None:
+    """Undo fields for a prepared move whose rename already landed.
+
+    ``None`` when this line must stay prepared: it is not a prepared
+    move, this source already has a done line, the hash or size is
+    missing, the source name is still on disk, or the destination bytes
+    are not the stored sha256 and size. The entry is not modified.
+    """
+    if entry.get("status") != "prepared" or entry.get("action") != "move":
+        return None
+    src = entry.get("source") or ""
+    dest = entry.get("destination") or ""
+    if not isinstance(src, str) or not isinstance(dest, str):
+        return None
+    if not src or not dest:
+        return None
+    if path_identity(src) in done_sources:
+        return None
+    digest = _entry_sha256(entry)
+    size = _entry_size(entry)
+    if not digest or size < 0:
+        return None
+    try:
+        source_exists = Path(src).exists()
+    except OSError:
+        return None
+    if source_exists:
+        return None
+    if not _destination_matches_hash(Path(dest), digest, size):
+        return None
+    return {
+        "action": "move",
+        "source": src,
+        "destination": dest,
+        "sha256": digest,
+        "size": size,
+    }
+
+
 def promote_prepared_moves(dest_dir: Path | str) -> list[dict]:
     """Mark prepared moves done when the rename already landed.
 
@@ -518,28 +557,13 @@ def promote_prepared_moves(dest_dir: Path | str) -> list[dict]:
             drop.add(index)
             changed = True
             continue
-        digest = _entry_sha256(entry)
-        size = _entry_size(entry)
-        if not digest or size < 0:
-            continue
-        try:
-            source_exists = Path(src).exists()
-        except OSError:
-            continue
-        if source_exists:
-            continue
-        if not _destination_matches_hash(Path(dest), digest, size):
+        move = _landed_prepared_move(entry, done_sources)
+        if move is None:
             continue
         entry["status"] = "done"
         lines[index] = json.dumps(entry) + _line_newline(lines[index])
         done_sources.add(source_key)
-        promoted.append({
-            "action": "move",
-            "source": src,
-            "destination": dest,
-            "sha256": digest,
-            "size": size,
-        })
+        promoted.append(move)
         changed = True
     if not changed:
         return []
@@ -547,6 +571,36 @@ def promote_prepared_moves(dest_dir: Path | str) -> list[dict]:
     if not _atomic_replace_text(path, "".join(kept), ".promote"):
         return []
     return promoted
+
+
+def promotable_prepared_moves(dest_dir: Path | str) -> list[dict]:
+    """Prepared moves :func:`promote_prepared_moves` would mark done.
+
+    The source name is already gone and the destination still matches
+    the hash fsynced before the rename. The journal is not modified.
+    A source that still exists is omitted: that rename has not happened,
+    and Discard must not invent an undo row for it. A finished journal
+    contributes nothing.
+    """
+    path = find_unfinished_journal(dest_dir)
+    if path is None:
+        return []
+    entries, _finished = _open_run(path)
+    done_sources: set[str] = set()
+    for entry in entries:
+        if entry.get("status") != "done":
+            continue
+        src = entry.get("source") or ""
+        if isinstance(src, str) and src:
+            done_sources.add(path_identity(src))
+    landed: list[dict] = []
+    for entry in entries:
+        move = _landed_prepared_move(entry, done_sources)
+        if move is None:
+            continue
+        done_sources.add(path_identity(move["source"]))
+        landed.append(move)
+    return landed
 
 
 def completed_operations(journal_path: Path | str) -> list[dict]:
