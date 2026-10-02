@@ -478,10 +478,9 @@ class TestResumePreflight:
             self, qapp, window, tmp_path, monkeypatch):
         """Move C: → D: with st_dev 0 still hits the free-space block.
 
-        Linux has no drive letters that exist as directories, so this
-        builds ``C:/Photos`` and ``D:/Organized`` under the temp dir and
-        turns on the Windows rule the GUI uses when ``os.name`` is
-        ``nt``. A blocked check must not start the worker or rewrite
+        The folders are relative ``C:/Photos`` and ``D:/Organized`` under
+        the temp dir. ``windows=True`` is the branch the GUI takes on
+        Windows. A blocked check must not start the worker or rewrite
         the open journal.
         """
         if os.name == "nt":
@@ -508,7 +507,27 @@ class TestResumePreflight:
 
         monkeypatch.setattr(
             "media_organizer.core.executor._volume_id", lambda _path: 0)
-        monkeypatch.setattr("media_organizer.core.executor.os.name", "nt")
+        # Do not assign os.name = "nt": Path() would then build Windows
+        # paths and C:/Photos would stop being the directory created above.
+        # windows=True is the same branch Windows takes when os.name is nt.
+        real_needed = bytes_still_needed
+
+        def needed(plan, **kwargs):
+            kwargs["windows"] = True
+            return real_needed(plan, **kwargs)
+
+        monkeypatch.setattr(
+            "media_organizer.gui.main_window.bytes_still_needed", needed)
+
+        def ancestor(path):
+            # Off Windows a drive-letter string is not climbed into cwd.
+            # These directories exist under the temp dir, so free-space
+            # can read them. disk_usage itself is stubbed below.
+            candidate = Path(path)
+            return candidate if candidate.exists() else Path(".")
+
+        monkeypatch.setattr(
+            "media_organizer.core.executor._existing_ancestor", ancestor)
         events = _install_dialogs(monkeypatch, resume=QMessageBox.Yes)
         seen = _install_space(monkeypatch, free=1000)
         _arm(window, src, dst, plan)
