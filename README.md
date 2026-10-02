@@ -1,6 +1,6 @@
 # Media Organizer
 
-**Version 1.5.3** — a Windows desktop app that sorts photos and videos into
+**Version 1.5.4** — a Windows desktop app that sorts photos and videos into
 tidy folders using their **real capture date** (embedded metadata), not the
 unreliable filesystem copy dates — or by **where they were taken** (GPS).
 
@@ -64,7 +64,7 @@ Date detection fallback chain:
 
 ## Install (Windows)
 
-Download `MediaOrganizer-Setup-1.5.3.exe` from the
+Download `MediaOrganizer-Setup-1.5.4.exe` from the
 [latest release](https://github.com/berkkarabacak/media-organizer/releases/latest)
 and run it.
 
@@ -142,4 +142,4 @@ iscc installer\setup.iss
 ```
 
 Produces `dist\MediaOrganizer\MediaOrganizer.exe` and
-`installer\dist\MediaOrganizer-Setup-1.5.3.exe`.
+`installer\dist\MediaOrganizer-Setup-1.5.4.exe`.

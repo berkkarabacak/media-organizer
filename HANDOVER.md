@@ -1,6 +1,6 @@
 # Media Organizer — Handover Guide
 
-**Current release: v1.5.3** · Repo: https://github.com/berkkarabacak/media-organizer · Site: https://berkkarabacak.github.io/media-organizer/
+**Current release: v1.5.4** · Repo: https://github.com/berkkarabacak/media-organizer · Site: https://berkkarabacak.github.io/media-organizer/
 
 > ⚠️ **URGENT — release v1.5.4 first.** v1.5.3's accessible strategy cards
 > (QFrame → QPushButton, a11y fix) shipped with a visual defect:
