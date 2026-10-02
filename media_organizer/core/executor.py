@@ -26,7 +26,10 @@ Safety features:
   counted. On Windows a shared device id is that rename only when the
   drive anchors match, because ``st_dev`` is often 0 on every drive.
   A copy, a cross-volume move, and a move whose device cannot be read
-  still count in full.
+  still count in full. Discard passes the rows the restart still
+  executes after the seeded undo log takes ownership. A journaled move
+  whose source is already gone, while the destination file remains, is
+  not counted again. A missing destination is.
 - operation log: saved on success, on cancel once an operation was
   recorded, and when an unexpected exception aborts the loop after at
   least one operation was recorded. A clean finish fsyncs that log
@@ -63,10 +66,11 @@ from .journal import (JournalWriter, atomic_copy, atomic_move,
                        cleanup_stale_parts, completed_operations,
                        discard_journal, file_sha256, files_identical,
                        find_unfinished_journal, path_identity,
-                       promote_prepared_moves)
+                       promotable_prepared_moves, promote_prepared_moves)
 from .metadata import DateSource
 from .organizer import OrganizeOptions, PlannedFile
-from .plan import Operation, RunLog, new_log, save_log
+from .plan import (Operation, RunLog, list_run_logs, new_log, save_log,
+                   saved_run_destinations)
 
 #: warn when the copy would consume all but this fraction of free space
 TIGHT_MARGIN = 0.05
@@ -212,6 +216,11 @@ def bytes_still_needed(
     only when the drive or UNC anchors match. ``windows=True`` applies
     the same anchor check on other systems. ``windows=False`` does not.
     ``None`` follows ``os.name``.
+
+    Pass the plan the run will execute. Resume excludes completed
+    sources first. Discard passes :func:`plan_discard_will_run` so a
+    row the seeded undo log will own is left out of this sum. This
+    function does not read the journal.
     """
     total = 0
     dest_dev = None
@@ -388,6 +397,75 @@ def finish_pending_move_unlinks(dest_dir: Path | str, plan=(), *,
             continue
         removed += 1
     return removed
+
+
+def _seeded_destinations(dest_dir: Path | str) -> set[str]:
+    """Destinations Discard's undo seed will record, without writing them.
+
+    An open journal with done lines is what ``execute_plan([])`` seeds,
+    after prepared renames that already landed are included. A journal
+    that only has those prepared lines is what
+    ``save_promoted_move_log`` saves, except a source an existing undo
+    log already covers. Nothing here promotes, saves, or deletes the
+    journal. A blocked free-space check must still find that journal.
+    """
+    journal = find_unfinished_journal(dest_dir)
+    if journal is None:
+        return set()
+    keys: set[str] = set()
+    done = completed_operations(journal)
+    promotable = promotable_prepared_moves(dest_dir)
+    if done:
+        for entry in (*done, *promotable):
+            dest = entry.get("destination") or ""
+            if dest:
+                keys.add(path_identity(dest))
+        return keys
+    if not promotable:
+        return set()
+    covered: set[str] = set()
+    for saved in list_run_logs(dest_dir):
+        if saved.undone:
+            continue
+        for op in saved.operations:
+            if op.status == "done" and op.source:
+                covered.add(path_identity(op.source))
+    for move in promotable:
+        if path_identity(move["source"]) in covered:
+            continue
+        dest = move.get("destination") or ""
+        if dest:
+            keys.add(path_identity(dest))
+    return keys
+
+
+def plan_discard_will_run(plan, dest_dir: Path | str):
+    """Plan rows a Discard restart still executes.
+
+    Discard seeds the operation log from the open journal, drops that
+    journal, then leaves out rows :func:`saved_run_owns_plan_row` already
+    owns. Those rows are not copied again. A cross-volume move can
+    unlink the source after the done line. The destination still holds
+    the bytes, ``files_identical`` is false, and the device ids do not
+    show a rename, so :func:`bytes_still_needed` on the raw plan counts
+    a full extra copy. This drops that row first.
+
+    A missing destination stays in the plan: Discard writes it. A
+    different file at the destination, with the source still on disk,
+    stays too: Discard writes a collision copy. Same-volume renames and
+    identical destinations are still omitted later by
+    :func:`bytes_still_needed`.
+
+    The journal and the operation log are left as they are. A free-space
+    check that fails must leave the unfinished journal so the user can
+    choose Resume or Discard again.
+    """
+    owned = set(saved_run_destinations(dest_dir))
+    owned.update(_seeded_destinations(dest_dir))
+    if not owned:
+        return list(plan)
+    return [item for item in plan
+            if not saved_run_owns_plan_row(item, owned)]
 
 
 def saved_run_owns_plan_row(item, owned: set[str]) -> bool:

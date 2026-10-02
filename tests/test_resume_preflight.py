@@ -23,7 +23,9 @@ from PySide6.QtCore import QSettings
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from media_organizer.core.display import format_bytes
-from media_organizer.core.executor import bytes_still_needed, free_space_status
+from media_organizer.core.executor import (
+    bytes_still_needed, free_space_status, plan_discard_will_run,
+)
 from media_organizer.core.journal import (
     JournalWriter, atomic_copy, completed_sources, exclude_completed_sources,
     find_unfinished_journal, path_identity,
@@ -1283,3 +1285,191 @@ class TestPreparedOnlyInterruptedRun:
         assert not kept_final.exists() and not fresh_final.exists()
         assert not list(src.rglob("*restored*"))
         assert not list(dst.rglob("*restored*"))
+
+
+def _other_volume(monkeypatch, *sources):
+    split = {Path(source) for source in sources}
+
+    def volume(path):
+        if Path(path) in split:
+            return 11
+        return 3
+
+    monkeypatch.setattr(
+        "media_organizer.core.executor._volume_id", volume)
+
+
+class TestDiscardCrossVolumePreflight:
+    """Discard must not refuse a restart that writes no new bytes.
+
+    The in-memory plan still lists a cross-volume move whose done line
+    is already journaled, whose source is gone, and whose destination
+    still holds the bytes. Free space below that stale total, and at
+    least the bytes the restart will still write, must let Discard
+    through. A real remainder that does not fit must still refuse, and
+    must leave the journal so the user can choose again.
+    """
+
+    def _plan(self, tmp_path, *, fresh=True, unlink=True, fresh_size=None):
+        src = tmp_path / "src"
+        dst = tmp_path / "dst"
+        src.mkdir()
+        when = datetime(2024, 7, 15, 10, 0, 0)
+        kept = make_jpeg_with_exif(src / "kept.jpg", when)
+        payload = kept.read_bytes()
+        paths = [kept]
+        fresh_path = None
+        if fresh:
+            fresh_path = make_jpeg_with_exif(
+                src / "new.jpg", datetime(2024, 7, 15, 10, 2, 0))
+            paths.append(fresh_path)
+        plan = build_plan(OrganizeOptions(
+            source_dir=src, dest_dir=dst, copy_mode=False))
+        by_source = {item.source: item for item in plan}
+        final = by_source[kept].destination
+        final.parent.mkdir(parents=True, exist_ok=True)
+        atomic_copy(kept, final)
+        if unlink:
+            kept.unlink()
+        with JournalWriter(dst) as writer:
+            writer.record(
+                "move", str(kept), str(final),
+                sha256=hashlib.sha256(payload).hexdigest(),
+                size=len(payload))
+        by_source[kept].size = 10**15
+        if fresh_path is not None and fresh_size is not None:
+            by_source[fresh_path].size = fresh_size
+        return src, dst, plan, kept, fresh_path, final, payload
+
+    def test_discard_fits_when_only_the_stale_total_does_not(
+            self, qapp, window, tmp_path, monkeypatch):
+        src, dst, plan, kept, fresh, final, payload = self._plan(tmp_path)
+        fresh_payload = fresh.read_bytes()
+        fresh_final = next(item.destination for item in plan
+                           if item.source == fresh)
+        fresh_size = next(item.size for item in plan if item.source == fresh)
+        _other_volume(monkeypatch, kept, fresh)
+        stale = bytes_still_needed(plan, copy_mode=False, dest_dir=dst)
+        restart = bytes_still_needed(
+            plan_discard_will_run(plan, dst),
+            copy_mode=False, dest_dir=dst)
+        assert stale == 10**15 + fresh_size
+        assert restart == fresh_size
+        assert restart < 1_000_000 < stale
+        journal = find_unfinished_journal(dst)
+        assert journal is not None
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
+        seen = _install_space(monkeypatch, free=1_000_000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.organize_btn.setEnabled(True)
+        window.start_organize()
+        _wait(window, qapp)
+
+        assert events[0][1].startswith("Move mode removes")
+        assert "Resume" in events[1][1]
+        assert seen == [restart]
+        assert _texts(events, "critical") == []
+        assert "Not enough free space" not in " ".join(
+            text for _name, text in events)
+        assert find_unfinished_journal(dst) is None
+        assert not kept.exists()
+        assert final.read_bytes() == payload
+        assert not fresh.exists()
+        assert fresh_final.read_bytes() == fresh_payload
+        assert not list(dst.rglob("*_1*"))
+        logs = list_run_logs(dst)
+        assert len(logs) == 2
+        newest, seeded = logs
+        assert _done_ids(newest) == {path_identity(fresh)}
+        assert _done_ids(seeded) == {path_identity(kept)}
+        result = undo_log(newest, dst)
+        assert result["undone"] == 1 and result["failed"] == 0
+        assert fresh.is_file()
+        assert final.read_bytes() == payload
+        older = load_undoable_log(dst)
+        assert older is not None and older.run_id == seeded.run_id
+        result = undo_log(older, dst)
+        assert result["undone"] == 1 and result["failed"] == 0
+        assert kept.read_bytes() == payload
+        assert not final.exists()
+
+    def test_discard_blocks_when_the_restart_still_does_not_fit(
+            self, qapp, window, tmp_path, monkeypatch):
+        src, dst, plan, kept, fresh, final, payload = self._plan(
+            tmp_path, fresh_size=10**14)
+        _other_volume(monkeypatch, kept, fresh)
+        restart = bytes_still_needed(
+            plan_discard_will_run(plan, dst),
+            copy_mode=False, dest_dir=dst)
+        stale = bytes_still_needed(plan, copy_mode=False, dest_dir=dst)
+        assert restart == 10**14
+        assert stale == 10**15 + 10**14
+        journal = find_unfinished_journal(dst)
+        before = journal.read_bytes()
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
+        seen = _install_space(monkeypatch, free=1_000_000)
+        from media_organizer.gui import main_window as mw
+        discarded = []
+        monkeypatch.setattr(
+            mw, "discard_journal", lambda dest: discarded.append(dest))
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.start_organize()
+
+        assert seen == [restart]
+        assert discarded == []
+        critical = _texts(events, "critical")
+        assert len(critical) == 1
+        assert "Not enough free space" in critical[0]
+        assert format_bytes(10**14) in critical[0]
+        assert format_bytes(stale) not in critical[0]
+        assert window.org_worker is None
+        assert journal.read_bytes() == before
+        assert find_unfinished_journal(dst) == journal
+        assert list_run_logs(dst) == []
+        assert final.read_bytes() == payload
+        assert not kept.exists()
+        assert fresh.is_file()
+
+    def test_discard_of_only_owned_rows_is_not_blocked_by_their_size(
+            self, qapp, window, tmp_path, monkeypatch):
+        src, dst, plan, kept, _fresh, final, payload = self._plan(
+            tmp_path, fresh=False)
+        _other_volume(monkeypatch, kept)
+        assert bytes_still_needed(plan, copy_mode=False, dest_dir=dst) == 10**15
+        assert bytes_still_needed(
+            plan_discard_will_run(plan, dst),
+            copy_mode=False, dest_dir=dst) == 0
+
+        events = _install_dialogs(monkeypatch, resume=QMessageBox.No)
+        seen = _install_space(monkeypatch, free=1000)
+        _arm(window, src, dst, plan)
+        window.copy_radio.setChecked(False)
+        window.move_radio.setChecked(True)
+        window.organize_btn.setEnabled(True)
+        window.start_organize()
+
+        assert seen == [0]
+        assert _texts(events, "critical") == []
+        assert "Not enough free space" not in " ".join(
+            text for _name, text in events)
+        note = _texts(events, "information")[0]
+        assert "already in the destination" in note
+        assert "Undo" in note
+        assert window.org_worker is None
+        assert window.plan == []
+        assert window.organize_btn.isEnabled() is False
+        assert find_unfinished_journal(dst) is None
+        assert final.read_bytes() == payload
+        seeded = load_log(dst)
+        assert seeded is not None
+        assert _done_ids(seeded) == {path_identity(kept)}
+        result = undo_log(seeded, dst)
+        assert result["undone"] == 1 and result["failed"] == 0
+        assert kept.read_bytes() == payload
+        assert not final.exists()

@@ -29,7 +29,8 @@ from ..core.display import (elide_middle, finished_run_keeps_plan,
                             relative_destination_fast, sorted_plan_items)
 from ..core.eta import ThroughputEstimator, format_eta, format_rate
 from ..core.executor import (bytes_still_needed, execute_plan,
-                            free_space_status, saved_run_owns_plan_row)
+                            free_space_status, plan_discard_will_run,
+                            saved_run_owns_plan_row)
 from ..core.journal import (completed_sources, discard_journal,
                             exclude_completed_sources,
                             find_unfinished_journal, path_identity,
@@ -1268,9 +1269,12 @@ class MainWindow(QMainWindow):
 
         # Resume or Discard is chosen before free-space preflight, and dry
         # runs skip both: they write nothing. `needed` is the bytes the plan
-        # that will actually run still has to write. Copy mode counts each
-        # remaining file. Move mode omits a same-volume rename and still
-        # counts a cross-volume copy, or a row whose device cannot be read.
+        # that will actually run still has to write. Resume drops sources
+        # the journal already finished. Discard drops rows the seeded undo
+        # log will own, including a move whose source is already gone while
+        # the destination file remains. Copy mode counts each remaining
+        # file. Move mode omits a same-volume rename and still counts a
+        # cross-volume copy, or a row whose device cannot be read.
         # Windows often reports st_dev 0 on every drive; different drive
         # letters still count.
         # A blocked check leaves the journal in place so the same choice
@@ -1326,8 +1330,14 @@ class MainWindow(QMainWindow):
                 else:
                     discard_after_preflight = True
 
+            measured = active
+            if discard_after_preflight:
+                # Seed and discard run only after this check passes. Until
+                # then the journal stays, and the byte total has to be the
+                # restart that would follow a passing check.
+                measured = plan_discard_will_run(active, options.dest_dir)
             needed = bytes_still_needed(
-                active,
+                measured,
                 copy_mode=options.copy_mode,
                 dest_dir=options.dest_dir,
             )
