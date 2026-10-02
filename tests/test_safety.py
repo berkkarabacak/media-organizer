@@ -130,7 +130,9 @@ class TestBytesStillNeeded:
 
     Copy mode counts every remaining row. Move mode omits a row on the
     same device as the destination: that transfer is a rename. A different
-    device, or a device that cannot be read, still counts.
+    device, or a device that cannot be read, still counts. On Windows,
+    equal ``st_dev`` values are a rename only when the drive anchors
+    match. ``st_dev`` 0 on ``C:`` and ``D:`` still counts.
     """
 
     def test_sums_rows_that_will_be_written(self, tmp_path):
@@ -324,6 +326,62 @@ class TestBytesStillNeeded:
         assert not free_space_status(dst, needed)["ok"]
         # Copy mode is unchanged by the device split.
         assert bytes_still_needed(plan, copy_mode=True, dest_dir=dst) == 10**15
+
+    @pytest.mark.parametrize("device", [0, 7])
+    def test_move_windows_shared_device_different_drives_counts(
+            self, monkeypatch, device):
+        """``C:`` and ``D:`` are a copy even when both ``st_dev`` values match.
+
+        Windows reports 0 on every drive. ``windows=True`` checks
+        ``PureWindowsPath`` anchors on Linux the way ``path_identity``
+        does. A shared nonzero id is the same rule: anchors decide.
+        """
+        photo = Path(os.fspath(PureWindowsPath(r"C:\Photos\a.jpg")))
+        dst = Path(os.fspath(PureWindowsPath(r"D:\Organized")))
+        plan = [
+            PlannedFile(photo, dst / "2024" / "a.jpg", 10**15,
+                        _capture_date(), "image"),
+        ]
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", lambda _path: device)
+        assert bytes_still_needed(
+            plan, copy_mode=False, dest_dir=dst, windows=True) == 10**15
+        assert bytes_still_needed(
+            plan, copy_mode=True, dest_dir=dst, windows=True) == 10**15
+
+    def test_move_windows_zero_device_same_drive_omits(self, monkeypatch):
+        """``c:/Photos`` and ``C:\\Organized`` are one rename, even at st_dev 0."""
+        photo = Path(os.fspath(PureWindowsPath("c:/Photos/a.jpg")))
+        dst = Path(os.fspath(PureWindowsPath(r"C:\Organized")))
+        plan = [
+            PlannedFile(photo, dst / "2024" / "a.jpg", 10**15,
+                        _capture_date(), "image"),
+        ]
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", lambda _path: 0)
+        assert bytes_still_needed(
+            plan, copy_mode=False, dest_dir=dst, windows=True) == 0
+        assert bytes_still_needed(
+            plan, copy_mode=True, dest_dir=dst, windows=True) == 10**15
+
+    def test_move_windows_unknown_device_still_counts(self, monkeypatch):
+        """A missing device counts on a matching drive letter too."""
+        photo = Path(os.fspath(PureWindowsPath(r"C:\Photos\a.jpg")))
+        same = Path(os.fspath(PureWindowsPath(r"C:\Organized")))
+        other = Path(os.fspath(PureWindowsPath(r"D:\Organized")))
+        capture = _capture_date()
+        plan_same = [
+            PlannedFile(photo, same / "a.jpg", 8192, capture, "image"),
+        ]
+        plan_other = [
+            PlannedFile(photo, other / "a.jpg", 8192, capture, "image"),
+        ]
+        monkeypatch.setattr(
+            "media_organizer.core.executor._volume_id", lambda _path: None)
+        assert bytes_still_needed(
+            plan_same, copy_mode=False, dest_dir=same, windows=True) == 8192
+        assert bytes_still_needed(
+            plan_other, copy_mode=False, dest_dir=other, windows=True) == 8192
 
     def test_move_unknown_device_still_counts(self, tmp_path, monkeypatch):
         """OSError or an unreadable anchor counts the size."""
