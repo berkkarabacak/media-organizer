@@ -8,9 +8,13 @@ Safety features:
   unfinished so Resume can skip the files already recorded. Copies are
   fsynced to a temp name, then atomically renamed. A cross-volume move
   journals that copy before the source is removed. A same-volume move
-  hashes the source before renaming it; a journal failure after that
-  rename keeps the row done so Undo can put the file back, and still
-  counts an error so the run stays resumable. Resume still removes
+  hashes the source and fsyncs that hash on a prepared journal line
+  before renaming it. A kill after the rename and before the done line
+  leaves the file only at the destination; the next run promotes that
+  line when the bytes still match, so Undo can put the file back. A
+  journal failure after the rename keeps the row done so Undo can put
+  the file back, and still counts an error so the run stays resumable.
+  Resume still removes
   a cross-volume source when the done line is already there and the
   destination bytes still match; a missing or different destination is
   left alone. A destination that already holds this source's bytes is
@@ -55,7 +59,8 @@ from typing import Callable, Optional
 from .journal import (JournalWriter, atomic_copy, atomic_move,
                        cleanup_stale_parts, completed_operations,
                        discard_journal, file_sha256, files_identical,
-                       find_unfinished_journal, path_identity)
+                       find_unfinished_journal, path_identity,
+                       promote_prepared_moves)
 from .metadata import DateSource
 from .organizer import OrganizeOptions, PlannedFile
 from .plan import Operation, RunLog, new_log, save_log
@@ -438,6 +443,10 @@ def execute_plan(
     bytes_done = 0
 
     journal: Optional[JournalWriter] = None
+    # Sources whose rename already landed and whose prepared line was
+    # just marked done. The plan may still list them: the source name is
+    # gone, so moving them again would error or write a collision copy.
+    promoted_sources: set[str] = set()
     if not dry_run:
         # Delete leftover .mediaorganizer.part files. Do not rename an
         # orphan part onto the final name: a crash before fsync can leave
@@ -445,6 +454,13 @@ def execute_plan(
         # journal line. Promoting it would publish junk, then resume would
         # write a collision copy and a move could unlink the source.
         cleanup_stale_parts(options.dest_dir)
+        # A kill after a same-volume rename and before the done line left
+        # a prepared hash. Mark it done before seeding, while the
+        # destination bytes still match, so this log can undo it.
+        promoted_sources = {
+            path_identity(entry["source"])
+            for entry in promote_prepared_moves(options.dest_dir)
+        }
         # Read the open run before JournalWriter opens it. A finished
         # journal is truncated on open; an unfinished one is appended to.
         # Seeding first is how undo covers files journaled before a crash
@@ -501,6 +517,10 @@ def execute_plan(
             if cancel and cancel():
                 summary["cancelled"] = True
                 break
+            # Promoted above from a prepared line. The bytes are already
+            # at the destination and the seeded log owns the undo row.
+            if path_identity(item.source) in promoted_sources:
+                continue
             if progress:
                 progress(i, total, item.source.name, bytes_done, total_bytes)
 
@@ -561,8 +581,17 @@ def execute_plan(
                         digest = atomic_copy(item.source, final)
                         summary["copied"] += 1
                     else:
+                        def _persist_move_hash(digest: str) -> None:
+                            try:
+                                size = item.source.stat().st_size
+                            except OSError:
+                                size = item.size
+                            journal.prepare_move(
+                                str(item.source), str(final), digest, size)
+
                         digest, unlink_source_after_journal = atomic_move(
-                            item.source, final)
+                            item.source, final,
+                            before_rename=_persist_move_hash)
                         summary["moved"] += 1
                     op.sha256 = digest
                     try:

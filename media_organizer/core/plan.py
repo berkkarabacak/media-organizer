@@ -24,8 +24,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from .journal import (completed_sources, discard_journal, files_identical,
-                      find_unfinished_journal, path_identity)
+from .journal import (completed_operations, completed_sources, discard_journal,
+                      files_identical, find_unfinished_journal, path_identity,
+                      promote_prepared_moves)
 
 LOG_DIRNAME = ".media_organizer"
 LOG_FILENAME = "operation_log.json"
@@ -257,6 +258,50 @@ def _find_saved_path(log: RunLog, dest_dir: Path) -> Optional[Path]:
         if existing is not None and _stable_key(existing) == key:
             return path
     return None
+
+
+def save_promoted_move_log(dest_dir: Path | str) -> Optional[RunLog]:
+    """Save undo rows for a same-volume rename that beat the done line.
+
+    ``None`` when no prepared move can be promoted, or when a saved run
+    already covers every done line in the open journal. Promotion
+    requires the source name to be gone and the destination bytes to
+    match the hash fsynced before the rename. A different file at that
+    path is left where it is.
+
+    The new log also includes every other done line in that open run
+    that no current undo log covers. Undoing only the renamed file would
+    discard the journal and leave a sibling file with no undo row.
+    """
+    dest_dir = Path(dest_dir)
+    if not promote_prepared_moves(dest_dir):
+        return None
+    journal = find_unfinished_journal(dest_dir)
+    if journal is None:
+        return None
+    covered: set[str] = set()
+    for saved in list_run_logs(dest_dir):
+        if saved.undone:
+            continue
+        for op in saved.operations:
+            if op.status == "done" and op.source:
+                covered.add(path_identity(op.source))
+    missing = [entry for entry in completed_operations(journal)
+               if path_identity(entry["source"]) not in covered]
+    if not missing:
+        return None
+    log = new_log(dest_dir)
+    for entry in missing:
+        log.operations.append(Operation(
+            action=entry["action"] or "move",
+            source=entry["source"],
+            destination=entry["destination"],
+            status="done",
+            size=entry["size"],
+            sha256=entry["sha256"],
+        ))
+    save_log(log, dest_dir)
+    return log
 
 
 def save_log(log: RunLog, dest_dir: Path | str) -> Path:

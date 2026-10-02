@@ -21,7 +21,7 @@ import ntpath
 import os
 import shutil
 from pathlib import Path
-from typing import Iterable, Iterator, Optional
+from typing import Callable, Iterable, Iterator, Optional
 
 JOURNAL_DIRNAME = ".mediaorganizer-journal"
 JOURNAL_FILENAME = "operations.jsonl"
@@ -53,6 +53,13 @@ class JournalWriter:
     can be filled in place, before the source is removed, so a crash
     before the operation log is saved still has a hash to seed. That
     update does not append a second done line.
+
+    A same-volume move can ``prepare_move`` before ``os.replace``. That
+    line is ``prepared``, not ``done``. ``record`` turns it into the
+    done line instead of appending a second one. A kill after the
+    rename leaves the prepared line; ``promote_prepared_moves`` marks
+    it done only when the source name is gone and the destination
+    bytes still match.
     """
 
     def __init__(self, dest_dir: Path | str, *, resume: bool | None = None):
@@ -64,6 +71,32 @@ class JournalWriter:
         # an older complete marker. "a" keeps the open run's records.
         self._fh = open(self.path, "a" if resume else "w", encoding="utf-8")
 
+    def prepare_move(self, source: str, destination: str,
+                     sha256: str, size: int) -> None:
+        """Fsync a same-volume move before ``os.replace`` drops the source.
+
+        The line is ``prepared``, not ``done``. Resume must not skip the
+        source while that name still exists, and Undo must not treat the
+        line as a finished move. ``record`` rewrites it to ``done`` after
+        the rename. A kill between this return and ``record`` leaves the
+        hash on disk so the rename can still be undone when the
+        destination bytes match.
+        """
+        if (not sha256 or isinstance(size, bool) or not isinstance(size, int)
+                or size < 0):
+            raise OSError("prepared move needs a sha256 and a size")
+        entry = {
+            "action": "move",
+            "source": source,
+            "destination": destination,
+            "status": "prepared",
+            "sha256": sha256,
+            "size": size,
+        }
+        self._fh.write(json.dumps(entry) + "\n")
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+
     def record(self, action: str, source: str, destination: str,
                sha256: str = "", size: int = -1) -> None:
         """Append one done line and fsync it.
@@ -72,7 +105,14 @@ class JournalWriter:
         line is written. Pass them from the copy or move that just
         published the file. Older journals omit both; resume must not
         invent them from a later occupant of the path.
+
+        A prepared move for this source is rewritten to this done line
+        instead of appending. A second done line would seed two undo
+        rows for one file.
         """
+        if self._upgrade_prepared_move(
+                action, source, destination, sha256, size):
+            return
         entry = {
             "action": action,
             "source": source,
@@ -124,10 +164,39 @@ class JournalWriter:
             original, source, destination, sha256, size)
         if rewritten is None:
             return False
-        # Same publish order as save_log: fsync the temp file, then
-        # replace. The append handle has to be closed first. On Windows
-        # a replace of a file this process still has open fails, and on
-        # Linux a later write would hit the old inode.
+        return self._publish_rewrite(rewritten)
+
+    def _upgrade_prepared_move(self, action: str, source: str,
+                               destination: str, sha256: str,
+                               size: int) -> bool:
+        """Rewrite this source's prepared line into one done line.
+
+        False when no open-run prepared move names this source, or when
+        the rewrite could not be published. The caller then appends.
+        """
+        if action != "move" or not sha256:
+            return False
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            return False
+        self._fh.flush()
+        os.fsync(self._fh.fileno())
+        try:
+            original = self.path.read_text(encoding="utf-8")
+        except OSError:
+            return False
+        rewritten = _upgrade_prepared_move_text(
+            original, source, destination, sha256, size)
+        if rewritten is None:
+            return False
+        return self._publish_rewrite(rewritten)
+
+    def _publish_rewrite(self, rewritten: str) -> bool:
+        """Fsync ``rewritten`` over the journal and reopen the append handle.
+
+        The append handle is closed first. On Windows a replace of a file
+        this process still has open fails, and on Linux a later write
+        would hit the old inode.
+        """
         tmp = self.path.with_name(self.path.name + ".stamp")
         self._fh.close()
         replaced = False
@@ -301,6 +370,183 @@ def _stamp_legacy_move_text(text: str, source: str, destination: str,
     if not changed:
         return None
     return "".join(lines)
+
+
+def _line_newline(raw: str) -> str:
+    if raw.endswith("\r\n"):
+        return "\r\n"
+    if raw.endswith("\n"):
+        return "\n"
+    return ""
+
+
+def _upgrade_prepared_move_text(text: str, source: str, destination: str,
+                                sha256: str, size: int) -> str | None:
+    """Return journal text with this source's prepared move written as done.
+
+    ``None`` when the open run has no prepared move for ``source``.
+    The first match becomes one done line. Later prepared matches for
+    the same source are dropped. Every other line is copied through.
+    """
+    source_key = path_identity(source)
+    lines = text.splitlines(keepends=True)
+    parsed: list[dict | None] = []
+    last_complete = -1
+    for index, line in enumerate(lines):
+        entry = _parse_journal_line(line)
+        parsed.append(entry)
+        if entry is not None and entry.get("run") == "complete":
+            last_complete = index
+    matches: list[int] = []
+    for index, entry in enumerate(parsed):
+        if index <= last_complete or entry is None:
+            continue
+        if entry.get("status") != "prepared" or entry.get("action") != "move":
+            continue
+        src = entry.get("source") or ""
+        if not isinstance(src, str) or not src:
+            continue
+        if path_identity(src) != source_key:
+            continue
+        matches.append(index)
+    if not matches:
+        return None
+    done = {
+        "action": "move",
+        "source": source,
+        "destination": destination,
+        "status": "done",
+        "sha256": sha256,
+        "size": size,
+    }
+    first = matches[0]
+    lines[first] = json.dumps(done) + _line_newline(lines[first])
+    for index in reversed(matches[1:]):
+        del lines[index]
+    return "".join(lines)
+
+
+def _atomic_replace_text(path: Path, text: str, suffix: str) -> bool:
+    """Fsync ``text`` over ``path``. The previous file stays if this fails."""
+    tmp = path.with_name(path.name + suffix)
+    try:
+        with open(tmp, "w", encoding="utf-8") as out:
+            out.write(text)
+            out.flush()
+            os.fsync(out.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
+def _destination_matches_hash(dest: Path, digest: str, size: int) -> bool:
+    try:
+        if not dest.is_file():
+            return False
+        if dest.stat().st_size != size:
+            return False
+        return file_sha256(dest) == digest
+    except OSError:
+        return False
+
+
+def promote_prepared_moves(dest_dir: Path | str) -> list[dict]:
+    """Mark prepared moves done when the rename already landed.
+
+    A prepared line was fsynced before ``os.replace``. When the source
+    name is gone and the destination still has that sha256 and size, the
+    line becomes ``done`` so Resume can seed Undo. The stored source,
+    destination, hash, and size are kept. They are not read from a
+    different file that showed up at the path.
+
+    A source that still exists is left prepared: the rename did not
+    happen, and Resume still has to move that file. A prepared line
+    whose source already has a done line is removed so the move is not
+    seeded twice. A finished journal is not modified.
+
+    Returns the moves newly marked done, in journal order. The file is
+    left unchanged when nothing qualifies.
+    """
+    path = journal_path_for(dest_dir)
+    if find_unfinished_journal(dest_dir) is None:
+        return []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    lines = text.splitlines(keepends=True)
+    parsed: list[dict | None] = []
+    last_complete = -1
+    for index, line in enumerate(lines):
+        entry = _parse_journal_line(line)
+        parsed.append(entry)
+        if entry is not None and entry.get("run") == "complete":
+            last_complete = index
+    done_sources: set[str] = set()
+    for index, entry in enumerate(parsed):
+        if index <= last_complete or entry is None:
+            continue
+        if entry.get("status") != "done":
+            continue
+        src = entry.get("source") or ""
+        if isinstance(src, str) and src:
+            done_sources.add(path_identity(src))
+
+    promoted: list[dict] = []
+    drop: set[int] = set()
+    changed = False
+    for index, entry in enumerate(parsed):
+        if index <= last_complete or entry is None:
+            continue
+        if entry.get("status") != "prepared" or entry.get("action") != "move":
+            continue
+        src = entry.get("source") or ""
+        dest = entry.get("destination") or ""
+        if not isinstance(src, str) or not isinstance(dest, str):
+            continue
+        if not src or not dest:
+            continue
+        source_key = path_identity(src)
+        if source_key in done_sources:
+            drop.add(index)
+            changed = True
+            continue
+        digest = _entry_sha256(entry)
+        size = _entry_size(entry)
+        if not digest or size < 0:
+            continue
+        try:
+            source_exists = Path(src).exists()
+        except OSError:
+            continue
+        if source_exists:
+            continue
+        if not _destination_matches_hash(Path(dest), digest, size):
+            continue
+        entry["status"] = "done"
+        lines[index] = json.dumps(entry) + _line_newline(lines[index])
+        done_sources.add(source_key)
+        promoted.append({
+            "action": "move",
+            "source": src,
+            "destination": dest,
+            "sha256": digest,
+            "size": size,
+        })
+        changed = True
+    if not changed:
+        return []
+    kept = [line for index, line in enumerate(lines) if index not in drop]
+    if not _atomic_replace_text(path, "".join(kept), ".promote"):
+        return []
+    return promoted
 
 
 def completed_operations(journal_path: Path | str) -> list[dict]:
@@ -481,7 +727,9 @@ def _known_cross_volume(source: Path, final: Path) -> bool:
         return False
 
 
-def atomic_move(source: Path, final: Path) -> tuple[str, bool]:
+def atomic_move(source: Path, final: Path, *,
+                before_rename: Optional[Callable[[str], None]] = None,
+                ) -> tuple[str, bool]:
     """Move with crash safety.
 
     Returns ``(sha256, unlink_source_after_journal)``.
@@ -490,10 +738,16 @@ def atomic_move(source: Path, final: Path) -> tuple[str, bool]:
     ``os.replace`` places the file at ``final`` and removes the source
     name in one step. The returned digest is that pre-rename hash, not
     a second full read of ``final``. The flag is false. The caller
-    journals after this returns. A crash in that gap leaves the file
-    only at ``final``. The source name is already gone; it is not still
-    there to resume from. Hashing before the rename keeps that gap to
-    the journal write.
+    journals after this returns.
+
+    ``before_rename`` is called with that digest after the hash and
+    before ``os.replace``, and is not called for a known cross-volume
+    move. The caller fsyncs the digest to the crash journal there. If
+    it raises, the source is not renamed. A kill after the rename and
+    before the done line then still has the hash on disk: the source
+    name is already gone, and Resume promotes the prepared line when
+    the destination bytes match. Without that fsync the file would sit
+    only at ``final`` and Undo could not put it back.
 
     Across volumes the devices already differ, or ``os.replace`` fails.
     The file is copied durably (``atomic_copy`` fsyncs the part file
@@ -518,6 +772,8 @@ def atomic_move(source: Path, final: Path) -> tuple[str, bool]:
     if _known_cross_volume(source, final):
         return atomic_copy(source, final), True
     digest = _sha256(source)
+    if before_rename is not None:
+        before_rename(digest)
     try:
         os.replace(source, final)  # same volume: truly atomic
     except OSError:
