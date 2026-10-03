@@ -5,6 +5,119 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from .plan import UNDO_STACK_LIMIT
+
+
+def finished_run_keeps_plan(summary: dict, *, journal_open: bool) -> bool:
+    """True when Organize must stay armed after this run.
+
+    Cancel and a per-file error leave the crash journal unfinished so
+    Resume can skip sources that already succeeded. The plan from the
+    scan that started the run is enough for that. A dry run writes no
+    journal of its own and still drops the plan, even when an older
+    journal is open. A clean finish writes ``{"run": "complete"}``, so
+    ``journal_open`` is false and Organize must not start those copies
+    again.
+    """
+    if summary.get("dry_run"):
+        return False
+    return bool(journal_open)
+
+
+def finished_run_offers_undo(summary: dict, *, keep_plan: bool) -> bool:
+    """True when the finish dialog may add an Undo button.
+
+    A dry run writes nothing. Undo of that in-memory log can delete or
+    relocate a file that was already in the destination, then persist a
+    fake operation log. An unfinished run keeps the plan so Resume is
+    the next step. Undo on that dialog reverses files the interrupted
+    run already finished while the crash journal is still open. A
+    successful real run still offers Undo. File → Undo last run is a
+    separate path and is not this flag.
+    """
+    if summary.get("dry_run"):
+        return False
+    return not keep_plan
+
+
+def finished_run_lines(summary: dict, *, folders: int, total_bytes: int,
+                       journal_open: bool = False) -> tuple[str, str]:
+    """Status-bar line and dialog body for a finished organize run.
+
+    ``summary['action']`` is ``"copy"`` or ``"move"``. Dry-run text uses
+    that verb. mtime-only files are mentioned separately from files that
+    had no date at all (those go to ``_undated``).
+
+    ``journal_open`` is true when the destination still has an unfinished
+    crash journal. Per-file ``summary['errors']`` then means the copy or
+    move did not finish, not that the file was unread and dropped for
+    good. The same flag covers a cancel. Both tell the user to Resume.
+    """
+    action = summary.get("action")
+    if action not in ("copy", "move"):
+        action = ("move" if summary.get("moved") and not summary.get("copied")
+                  else "copy")
+    past = "moved" if action == "move" else "copied"
+    dry = bool(summary.get("dry_run"))
+    resumable = finished_run_keeps_plan(summary, journal_open=journal_open)
+    done_n = int(summary.get("copied") or 0) + int(summary.get("moved") or 0)
+    if dry:
+        status = (
+            f"Dry run finished — nothing was written "
+            f"({done_n:,} would {action})."
+        )
+        text = (
+            f"Dry run complete — nothing was written.\n\n"
+            f"Would {action} {done_n:,} files "
+            f"({format_bytes(total_bytes)}) "
+            f"into {folders} folders"
+        )
+    elif resumable:
+        status = f"Stopped: {done_n} {past}. Organize again to Resume."
+        text = (
+            f"Stopped. {done_n} photos/videos {past} into {folders} folders."
+        )
+    else:
+        status = f"Finished: {done_n} {past}."
+        text = f"Done! {done_n} photos/videos {past} into {folders} folders."
+    details = []
+    if summary.get("skipped_duplicates"):
+        details.append(f"{summary['skipped_duplicates']} exact duplicates skipped")
+    if summary.get("undated"):
+        details.append(f"{summary['undated']} without a date (in _undated)")
+    if summary.get("uncertain"):
+        if summary.get("uncertain_aside", True):
+            where = "in _uncertain"
+        else:
+            where = "filed by that file date"
+        details.append(
+            f"{summary['uncertain']} with only a file date ({where})"
+        )
+    if summary.get("errors"):
+        # Not "couldn't be read (skipped)". A mid-copy OSError is counted
+        # here too, and the journal stays open so Resume can retry it.
+        n = int(summary["errors"])
+        noun = "file" if n == 1 else "files"
+        details.append(f"{n} {noun} could not be organized")
+    if summary.get("cancelled"):
+        details.append("the run was cancelled part-way")
+    if details:
+        text += "\n\n" + "\n".join(f"• {d}" for d in details)
+    if resumable:
+        text += (
+            "\n\nOrganize again to Resume. Files already organized "
+            "stay where they are.\n\n"
+            "Undo reverses the files this run already finished. "
+            f"The last {UNDO_STACK_LIMIT} organize runs in this folder "
+            "can be undone, newest first."
+        )
+    elif not dry:
+        text += (
+            f"\n\nThe last {UNDO_STACK_LIMIT} organize runs in this folder "
+            "can be undone, newest first."
+        )
+    return status, text
+
 
 def format_bytes(n: float) -> str:
     """Human size with 1 decimal: '812.5 KB', '3.9 MB', '48.2 GB'."""

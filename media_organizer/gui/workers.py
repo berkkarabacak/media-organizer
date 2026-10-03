@@ -23,11 +23,16 @@ class ScanWorker(QThread):
 
     Emits determinate progress: a fast pre-count pass establishes the total,
     then hashing (if duplicate-skip is on) + planning report files done.
+
+    Cancellation emits `cancelled` and does not emit `finished_plan`.
+    Duplicate hashing, metadata extraction, and plan assembly all return
+    early with a subset; that subset is discarded.
     """
 
     # done, total, current_name — total == 0 means "counting, indeterminate"
     progress = Signal(int, int, str)
-    finished_plan = Signal(list)          # list[PlannedFile]
+    finished_plan = Signal(list)          # list[PlannedFile] — complete scan only
+    cancelled = Signal()                   # scan stopped; no plan emitted
     failed = Signal(str)
 
     def __init__(self, options: OrganizeOptions, parent=None):
@@ -52,11 +57,17 @@ class ScanWorker(QThread):
                 last_emit[0] = now
                 self.progress.emit(done, total, name)
 
+            def give_up():
+                # find_duplicates / analyze_media_batch / build_plan stop
+                # early and return a subset. That subset is not a finished
+                # scan — offering it enables Organize on part of the library.
+                self.cancelled.emit()
+
             # Phase 0: list files (the walk doubles as the pre-count)
             self.progress.emit(0, 0, "Counting files…")
             files = list(scan_media_files(self.options))
             if is_cancelled():
-                self.finished_plan.emit([])
+                give_up()
                 return
             n = len(files)
             phases = (1 if self.options.skip_duplicates else 0) + 2
@@ -71,6 +82,9 @@ class ScanWorker(QThread):
                     progress=lambda i, _n: emit(i, grand_total, _n),
                     cancel=is_cancelled,
                 )
+                if is_cancelled():
+                    give_up()
+                    return
                 offset += n
 
             # Phase 2: metadata extraction (parallel thread pool)
@@ -80,6 +94,9 @@ class ScanWorker(QThread):
                 progress=lambda i, _n: emit(offset + i, grand_total, _n),
                 cancel=is_cancelled,
             )
+            if is_cancelled():
+                give_up()
+                return
             offset += n
 
             # Phase 3: plan assembly (pure, fast)
@@ -91,7 +108,13 @@ class ScanWorker(QThread):
                 progress=lambda i, _n: emit(offset + i, grand_total, _n),
                 cancel=is_cancelled,
             )
+            if is_cancelled():
+                give_up()
+                return
             emit(grand_total, grand_total, "", force=True)
+            if is_cancelled():
+                give_up()
+                return
             self.finished_plan.emit(plan)
         except Exception as exc:  # never crash the UI
             self.failed.emit(str(exc))
